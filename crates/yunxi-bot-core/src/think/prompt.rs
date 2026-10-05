@@ -29,7 +29,7 @@
 //! [`PromptLayout::fingerprint`] 让"前缀是否稳定"变成**可断言的东西**，
 //! 而不是一句写在文档里的叮嘱。见模块测试。
 
-use super::{Message, Role};
+use super::Message;
 
 /// 三段式提示词布局。
 #[derive(Debug, Clone, PartialEq)]
@@ -70,14 +70,8 @@ impl PromptLayout {
             return;
         }
         let question = std::mem::take(&mut self.volatile);
-        self.history.push(Message {
-            role: Role::User,
-            content: question,
-        });
-        self.history.push(Message {
-            role: Role::Assistant,
-            content: assistant.into(),
-        });
+        self.history.push(Message::user(question));
+        self.history.push(Message::assistant(assistant));
     }
 
     /// 设置本轮要问的问题。可以反复覆盖——它本来就是易变的。
@@ -103,18 +97,29 @@ impl PromptLayout {
     /// 拼成发给模型的消息列表。
     pub fn build(&self) -> Vec<Message> {
         let mut msgs = Vec::with_capacity(self.history.len() + 2);
-        msgs.push(Message {
-            role: Role::System,
-            content: self.stable.clone(),
-        });
+        msgs.push(Message::system(self.stable.clone()));
         msgs.extend(self.history.iter().cloned());
         if !self.volatile.is_empty() {
-            msgs.push(Message {
-                role: Role::User,
-                content: self.volatile.clone(),
-            });
+            msgs.push(Message::user(self.volatile.clone()));
         }
         msgs
+    }
+
+    /// 往历史里追加一条**原样**的消息（工具调用往返用）。
+    ///
+    /// 和 [`Self::record_reply`] 的区别：那个是"一问一答"的便捷写法，
+    /// 这个是"我自己管这一轮的消息序列"。工具调用需要后者——
+    /// 助手消息带 `tool_calls`、随后每条结果带 `tool_call_id`，
+    /// 顺序和字段都不能被改写。
+    ///
+    /// **它消费掉待问的问题**（如果有），这样工具往返不会把同一句话留在
+    /// 易变段又进历史——那会让下一轮的前缀对不上，缓存直接失效。
+    pub fn push_raw(&mut self, msg: Message) {
+        if !self.volatile.is_empty() {
+            let q = std::mem::take(&mut self.volatile);
+            self.history.push(Message::user(q));
+        }
+        self.history.push(msg);
     }
 
     /// 前缀的字符长度，用于估算 token 与成本。
@@ -144,6 +149,7 @@ pub fn build_persona(name: &str, persona: &str, rules: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Role;
     use super::*;
 
     fn persona() -> String {

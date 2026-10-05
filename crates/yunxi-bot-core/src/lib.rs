@@ -26,6 +26,7 @@ pub mod policy;
 pub mod runner;
 pub mod task;
 pub mod think;
+pub mod tool;
 pub mod trigger;
 pub mod win_job;
 #[cfg(windows)]

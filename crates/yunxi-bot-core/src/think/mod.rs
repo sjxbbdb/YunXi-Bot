@@ -43,6 +43,12 @@ pub enum Role {
     System,
     User,
     Assistant,
+    /// 工具返回。**只在带工具调用的一轮里出现。**
+    ///
+    /// 单独一个角色而不是塞进 `User`：工具返回的内容是**不可信数据**
+    /// （网页、文件、第三方 server 的输出），把它标成用户消息会让
+    /// "模型生成的内容不能作为授权依据"这条不变量失去载体。
+    Tool,
 }
 
 impl Role {
@@ -51,15 +57,29 @@ impl Role {
             Role::System => "system",
             Role::User => "user",
             Role::Assistant => "assistant",
+            Role::Tool => "tool",
         }
     }
 }
 
 /// 一条消息。
+///
+/// ## 工具调用为什么需要三个额外字段
+///
+/// OpenAI 兼容的工具调用协议要求：助手消息带回 `tool_calls`，随后每条工具
+/// 结果必须用 `role: "tool"` 且带上对应的 `tool_call_id`。少一个字段服务端
+/// 就报 400——**而不是"忽略工具结果"**，所以这里不能省。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
+    /// 工具结果的消息内容可以是空字符串（比如工具只返回结构化数据）。
     pub content: String,
+    /// 助手请求调用的工具。只出现在助手消息上。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<serde_json::Value>,
+    /// 工具结果对应的调用 id。只出现在工具消息上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
@@ -67,18 +87,44 @@ impl Message {
         Self {
             role: Role::System,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// 助手请求调用工具的那条消息。**必须原样回传**，否则服务端报 400。
+    pub fn assistant_tool_calls(tool_calls: Vec<serde_json::Value>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// 一条工具结果。**必须带 `tool_call_id`**，否则服务端报 400。
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(call_id.into()),
         }
     }
 }
