@@ -333,6 +333,16 @@ impl<D: Decider> DecisionEngine<D> {
 
         match self.decider.decide(req) {
             Ok(result) => {
+                // 校验放在引擎里，而不是某个 Decider 实现里。
+                //
+                // 理由：校验必须是**无条件必经之路**。如果把它塞进 LayaDecider，
+                // 那么换一个模型适配器（或测试桩）就会漏掉——而未校验的模型
+                // 返回值恰恰是最危险的东西（比如编出一个没声明的选项）。
+                if let Err(e) = laya::validate(req, &result) {
+                    self.consecutive_failures += 1;
+                    return self.degrade(&format!("模型返回非法结果：{e}"));
+                }
+
                 // 模型自己不确定 → 同样按降级处理
                 if let Some(min) = self.min_confidence {
                     let low = result

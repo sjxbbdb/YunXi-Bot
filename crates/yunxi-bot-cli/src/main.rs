@@ -68,6 +68,10 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --endpoint <URL>      决策模型 sidecar 地址
                             （默认 http://127.0.0.1:17870/decide）
 
+  yunxi-bot companion [选项]  演示陪伴层：模型判断 + 约束收紧
+      --demo                用桩模型演示约束如何把「开口」压下来（不需要真模型）
+      --endpoint <URL>      真实调用决策模型
+
   yunxi-bot help              显示本帮助
 ";
 
@@ -100,6 +104,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "approve" => cmd_approve(rest),
         "policy" => cmd_policy(),
         "decide" => cmd_decide(rest),
+        "companion" => cmd_companion(rest),
         "install-autostart" => cmd_autostart(AutostartAction::Install),
         "uninstall-autostart" => cmd_autostart(AutostartAction::Uninstall),
         "autostart-status" => cmd_autostart(AutostartAction::Status),
@@ -708,6 +713,144 @@ fn cmd_decide(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             Ok(0)
         }
     }
+}
+
+/// 陪伴层演示：完整走一遍「记忆 → 模型判断 → 约束收紧」。
+///
+/// `--demo` 用桩模型（总是说"该开口"），把重点放在**约束如何把它压下来**——
+/// 这是整个陪伴层最容易被实现反的地方（方向搞反就变成"模型说了算"）。
+fn cmd_companion(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::companion::{CompanionPolicy, companion_engine, decide_intervention};
+    use yunxi_bot_core::decide::{LayaDecider, StubDecider};
+    use yunxi_bot_core::ledger::{Event, EventKind};
+    use yunxi_bot_core::memory::{Memory, MemoryKind, Situation};
+
+    let demo = args.iter().any(|a| a == "--demo");
+
+    // 用几条记忆构造 state（体现"陪伴的温度来自连续性"）
+    let memory = Memory::from_events(&[
+        Event {
+            seq: 1,
+            at: 1_000,
+            kind: EventKind::MemoryRecorded,
+            span: None,
+            job: None,
+            data: serde_json::json!({"id":"f1","kind":"fact","text":"在准备 AI 岗位面试"}),
+        },
+        Event {
+            seq: 2,
+            at: 2_000,
+            kind: EventKind::MemoryRecorded,
+            span: None,
+            job: None,
+            data: serde_json::json!({"id":"p1","kind":"preference","text":"深夜不喜欢被打扰"}),
+        },
+        Event {
+            seq: 3,
+            at: 3_000,
+            kind: EventKind::MemoryRecorded,
+            span: None,
+            job: None,
+            data: serde_json::json!({"id":"r1","kind":"relationship","text":"一起把简历改完了"}),
+        },
+    ]);
+
+    println!("记忆 {} 条（事实/偏好/关系）", memory.len());
+    for k in [
+        MemoryKind::Fact,
+        MemoryKind::Preference,
+        MemoryKind::Relationship,
+    ] {
+        let items: Vec<&str> = memory
+            .recall(k, 10_000_000, 5)
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        if !items.is_empty() {
+            println!("  {:<4} {}", k.label(), items.join("；"));
+        }
+    }
+    println!();
+
+    let policy = CompanionPolicy::default();
+    println!(
+        "陪伴策略（使用者设定的硬事实，不交给模型判断）: 安静时段 {}:00–{}:00，每日上限 {} 次，最小间隔 {} 分钟",
+        policy.quiet_start_hour,
+        policy.quiet_end_hour,
+        policy.max_interventions_per_day,
+        policy.min_minutes_between_interventions
+    );
+    println!();
+
+    let endpoint = flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide");
+
+    // --demo：用"总是建议开口"的桩模型，专门检验约束是否真的能压住它
+    let mut stub_engine = demo.then(|| {
+        companion_engine(
+            StubDecider::succeeding()
+                .with_choice("intervention", "speak")
+                .with_noul("needs_support", 0.8)
+                .with_noul("is_anomaly", 0.1),
+        )
+    });
+    let mut real_engine = (!demo).then(|| companion_engine(LayaDecider::new(endpoint)));
+
+    let (h_time, h_model, h_action, h_note) = ("时刻", "模型建议", "最终动作", "说明");
+    println!("  {h_time:<6} {h_model:<10} {h_action:<10} {h_note}");
+    println!("  {}", "-".repeat(76));
+
+    let base = Situation {
+        quiet_hours: false,
+        minutes_since_last_interaction: 600,
+        unread_events: 3,
+        recent_failures: 0,
+        interventions_today: 0,
+        relationship_stage: "熟悉".into(),
+    };
+
+    for (hour, label) in [(3u8, "凌晨"), (9, "上午"), (14, "下午"), (23, "深夜")] {
+        let decision = if let Some(engine) = stub_engine.as_mut() {
+            decide_intervention(engine, &memory, &base, &policy, hour, 10_000_000)
+        } else if let Some(engine) = real_engine.as_mut() {
+            decide_intervention(engine, &memory, &base, &policy, hour, 10_000_000)
+        } else {
+            unreachable!()
+        };
+
+        let suggested = if decision.model_suggested_speak {
+            "开口"
+        } else if decision.degraded {
+            "（降级）"
+        } else {
+            "不开口"
+        };
+        let mark = if decision.action == yunxi_bot_core::companion::Intervention::Speak {
+            ""
+        } else {
+            " ← 被约束压住"
+        };
+        println!(
+            "  {:<6} {:<10} {:<10} {}{}",
+            format!("{hour:02}:00 {label}"),
+            suggested,
+            decision.action.label(),
+            decision.reason,
+            mark
+        );
+    }
+
+    println!();
+    if demo {
+        println!("说明：桩模型每一刻都建议「开口」。约束层把安静时段与每日上限");
+        println!("     压了回来——这就是「约束只能更保守」的直接演示。");
+    } else if real_engine
+        .as_ref()
+        .map(|e| e.circuit_open())
+        .unwrap_or(false)
+    {
+        println!("警告：决策模型连续失败已熔断。");
+    }
+    Ok(0)
 }
 
 fn cmd_policy() -> Result<i32, Box<dyn std::error::Error>> {

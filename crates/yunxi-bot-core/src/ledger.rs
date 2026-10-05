@@ -50,6 +50,11 @@ pub enum EventKind {
     /// `Watch` 触发器本轮观测到的 mtime，用于避免同一变更被重复触发。
     JobWatchObserved,
 
+    // —— 记忆（由 memory::Memory::from_events 投影）——
+    MemoryRecorded,
+    MemoryReinforced,
+    MemoryForgotten,
+
     // —— 审计对（必须位于边界内）——
     DecisionAsked,
     DecisionDecided,

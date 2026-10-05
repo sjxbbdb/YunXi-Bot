@@ -125,7 +125,8 @@ impl Decider for LayaDecider {
             model: wire.model.unwrap_or_else(|| "unknown".into()),
         };
 
-        validate(req, &result)?;
+        // 注意：**校验不在这里做**。它是引擎的无条件必经步骤
+        // （见 `DecisionEngine::decide`），放在适配器里会让别的适配器漏掉。
         Ok(result)
     }
 }
