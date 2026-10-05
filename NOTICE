@@ -1,0 +1,49 @@
+YunXi Bot
+Copyright 2026 sjxbbdb
+
+This product includes design and architectural references from the following
+projects. Where actual source code or substantive rewrites were migrated, the
+original copyright and license are preserved as required.
+
+--------------------------------------------------------------------------------
+1. YunXi Agent  —  https://github.com/sjxbbdb/YunXi-Agent
+   License: Apache-2.0
+   Referenced for: runtime facade traits (RuntimeBackend / RuntimeEventSink /
+   AgentTurn), tool registry & routing model (ToolRegistry / ToolSpec /
+   ToolDispatch), fail-closed approval policy model (ExecutionPolicy /
+   ApprovalRequirement / CommandRisk), process lifecycle events
+   (ExecLifecycleEvent), and the append-only rollout ledger pattern.
+   Copyright 2026 sjxbbdb.
+
+2. YunXi Next  —  https://github.com/sjxbbdb/YunXi-Next
+   License: not declared in upstream repository (author's own work)
+   Referenced for: small-trusted-kernel + process-isolated capability plugin
+   architecture. Copyright 2026 sjxbbdb.
+
+3. YunXi-Native  —  https://github.com/sjxbbdb/YunXi-Native
+   License: Apache-2.0
+   Referenced for: natural-language control plane interaction philosophy.
+   Copyright 2026 sjxbbdb.
+
+4. yunxi-agent-archlinux (YunXi Agent subproject)
+   Referenced for: per-user, on-demand daemon launched over a local socket,
+   with restrictive permissions on the runtime directory and socket.
+   Copyright 2026 sjxbbdb.
+
+5. YunXi Voice Runtime  —  https://github.com/sjxbbdb/YunXi-Voice-Runtime
+   Referenced for: cross-language sidecar pattern for local STT/TTS over
+   loopback HTTP. No source code migrated (private repository).
+   Copyright 2026 sjxbbdb.
+
+6. Miyu Agent  —  https://github.com/SHORiN-KiWATA/miyu-agent
+   License: MIT
+   Copyright (c) 2026 SHORiN-KIWATA
+   Referenced for: first-word classification / shell hook interception and the
+   on-demand daemon launch direction. Per MIT terms, this copyright notice and
+   license are retained. See also the upstream project's LICENSE.
+   No Miyu persona data, databases, platform credentials, or web assets are
+   included in this repository.
+
+--------------------------------------------------------------------------------
+Design ideas are not copyrightable; the attribution above exists so that any
+code actually migrated can be traced to its origin.

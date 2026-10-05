@@ -1,0 +1,28 @@
+# Rust 构建产物
+/target/
+
+# 运行数据（含台账，绝不入库）
+data/
+*.jsonl
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 锁文件与日志
+*.lock
+*.log
+
+# 本地配置与密钥
+.env
+.env.*
+*.key
+*.pem
+secrets/
+config.local.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

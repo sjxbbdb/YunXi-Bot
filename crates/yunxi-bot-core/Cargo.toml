@@ -1,0 +1,13 @@
+[package]
+name = "yunxi-bot-core"
+description = "YunXi Bot 内聚内核：任务、台账、触发、约束、决策"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/yunxi-bot-core", "crates/yunxi-bot-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+repository = "https://github.com/sjxbbdb/YunXi-Bot"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 唯一的运行时依赖。理由：cron 必须按【本地时间】解析，
+# 而 std 不提供本地时区；个人助理的"每天早上 9 点"不能按 UTC 算。
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+yunxi-bot-core = { path = "crates/yunxi-bot-core" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
