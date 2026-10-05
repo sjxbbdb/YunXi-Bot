@@ -48,8 +48,14 @@ use crate::decide::Decider;
 use crate::policy::SandboxMode;
 
 pub mod files;
+pub mod runner;
 pub mod system;
 pub mod web;
+
+pub use runner::{
+    Approval, ApprovalRequest, Approver, DEFAULT_MAX_ROUNDS, RefusingApprover, ToolCallRecord,
+    ToolLoopError, ToolRunOutcome, ToolRunner,
+};
 
 /// 工具的能力类别。**审批策略的唯一依据。**
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -123,7 +129,9 @@ impl ToolOutput {
 }
 
 /// 工具失败。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` 是为了能进台账：**事后要能查清机器尝试过什么**。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolError {
     UnknownTool(String),
     /// 参数不合法。**带上实际收到的参数字符串**，否则没法排查模型给错了什么。
@@ -471,7 +479,10 @@ impl ToolPolicy {
 }
 
 /// 审批判定。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` 是为了能进台账：**审批决定必须留痕**，否则事后无法解释
+/// "为什么这个动作被放行了"——而那是安全审计里最需要回答的问题。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GateDecision {
     Allow {
         reason: String,
@@ -568,16 +579,28 @@ pub fn gate(
         };
     }
 
-    // 只读 + 有粒度 + 在工作区内 → 免问。照抄 Claude Code 的规则。
+    // 只读免问。照抄 Claude Code 的规则：`Read`/`Grep`/`Glob` 在工作区内不问。
+    //
+    // 两种情况都放行：
+    // - **有粒度**（文件工具）：粒度在工作区内 → 免问；出界 → 继续往下走。
+    // - **没有粒度**（比如 `now` 读系统时钟）：没有"界"可越，本身就是纯本地无副作用。
+    //   要求它每次审批是荒谬的摩擦，而且不会带来任何安全性——
+    //   声明成 `ReadOnly` 的工具按定义就没有副作用可言。
     if cap.is_inert() && policy.inert_inside_cwd_is_free {
-        if let Some(p) = spec.as_deref() {
-            let path = Path::new(p);
-            if ctx.inside_cwd(path) {
+        match spec.as_deref() {
+            None => {
                 return GateDecision::Allow {
-                    reason: format!("只读且在工作区内: {p}"),
+                    reason: "纯只读，无副作用".to_string(),
                 };
             }
-            // 出界：继续往下走，让本地决策模型或人来看
+            Some(p) => {
+                if ctx.inside_cwd(Path::new(p)) {
+                    return GateDecision::Allow {
+                        reason: format!("只读且在工作区内: {p}"),
+                    };
+                }
+                // 出界：继续往下走，让本地决策模型或人来看
+            }
         }
     }
 
@@ -993,6 +1016,23 @@ mod tests {
             deny: Vec::new(),
             inert_inside_cwd_is_free: true,
         }
+    }
+
+    #[test]
+    fn readonly_without_a_path_is_free() {
+        // 比如 `now` 读系统时钟：没有"界"可越，纯本地无副作用。
+        // 要求它每次审批是荒谬的摩擦，而且换不来任何安全性。
+        let t = FakeTool::new("now", Capability::ReadOnly);
+        let d = gate(&t, &json!({}), &ToolPolicy::default(), &ctx(), None);
+        assert!(d.is_allow(), "无路径的只读工具应免问: {d:?}");
+    }
+
+    #[test]
+    fn readonly_without_a_path_still_asks_under_deny_all() {
+        // 但 deny_all 策略下什么都问——这是"最保守起点"该有的样子
+        let t = FakeTool::new("now", Capability::ReadOnly);
+        let d = gate(&t, &json!({}), &ToolPolicy::deny_all(), &ctx(), None);
+        assert!(!d.is_allow(), "{d:?}");
     }
 
     #[test]
