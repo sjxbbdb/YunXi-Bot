@@ -6,13 +6,16 @@
 //! 和 `cmd_resume` 里就会各写一份、迟早漂移。**两份不一致的表现是
 //! "同一个任务在 `do` 和 `resume` 里行为不同"**，那种 bug 极难查。
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use yunxi_bot_core::tool::files::{
     EditFileTool, ListDirTool, ReadFileTool, SearchFilesTool, WriteFileTool,
 };
 use yunxi_bot_core::tool::system::{AskFn, AskUserTool, NowTool, RunCommandTool};
-use yunxi_bot_core::tool::web::{DuckDuckGoLite, WebFetchTool, WebSearchTool};
+use yunxi_bot_core::tool::web::{
+    BochaKey, BochaSearch, DuckDuckGoLite, SearchProvider, WebFetchTool, WebSearchTool,
+};
 use yunxi_bot_core::tool::{Rule, ToolPolicy, ToolRegistry};
 
 use crate::approval::{StdinApprover, parse_rule};
@@ -62,6 +65,35 @@ fn stdin_ask(question: &str, options: &[String]) -> Option<String> {
     Some(answer)
 }
 
+/// 挑搜索后端。
+///
+/// **有 key 就用博查，没有才回落 DuckDuckGo Lite。** 顺序不能反：
+/// DDG 那条路是抓 HTML 的，实测当天就已经反爬 202 / 走代理 400；
+/// 而博查是有 key、有服务条款的正式接口。**稳定性不是靠解析得巧，
+/// 是靠有一条正式约定。**
+///
+/// 但**回落必须存在**：一个能用的兜底比一个用不了的优选更有价值，
+/// 没配 key 的人不该连搜索都没有。
+///
+/// 密钥位置与 Agnes / DeepSeek 同一套约定：`<home>/secrets/bocha.key`，
+/// 在仓库之外，权限只给当前用户。
+fn search_provider(home: &Path) -> Box<dyn SearchProvider> {
+    let key_path = home.join("secrets").join("bocha.key");
+    match BochaKey::load(&key_path) {
+        Ok(k) => {
+            println!("搜索      : 博查（带 key，直连不需要代理）");
+            Box::new(BochaSearch::new(k))
+        }
+        Err(e) => {
+            println!("搜索      : DuckDuckGo Lite（抓 HTML，**会失效**）");
+            println!("           没读到博查密钥：{e}");
+            println!("           想稳就去 https://open.bochaai.com/ 申请，存到");
+            println!("           {}", key_path.display());
+            Box::new(DuckDuckGoLite::new())
+        }
+    }
+}
+
 /// 默认工具集。
 ///
 /// 十个工具分三类，都能在 `docs/工具层调研与设计.md` 里找到"为什么是它"：
@@ -71,7 +103,7 @@ fn stdin_ask(question: &str, options: &[String]) -> Option<String> {
 /// | 信息 | `now` `web_fetch` `web_search` | 只读 / 网络 |
 /// | 文件 | `read_file` `list_dir` `search_files` `write_file` `edit_file` | 只读 / 写入 |
 /// | 动作 | `run_command` `ask_user` | 执行 / 只读 |
-pub fn default_registry() -> Result<ToolRegistry, String> {
+pub fn default_registry(home: &Path) -> Result<ToolRegistry, String> {
     let mut r = ToolRegistry::new();
     let mut add = |t: Arc<dyn yunxi_bot_core::tool::Tool>| -> Result<(), String> {
         r.register(t).map_err(|e| e.to_string())
@@ -80,9 +112,7 @@ pub fn default_registry() -> Result<ToolRegistry, String> {
     // —— 信息 ——
     add(Arc::new(NowTool))?;
     add(Arc::new(WebFetchTool::new()))?;
-    add(Arc::new(WebSearchTool::new(
-        Box::new(DuckDuckGoLite::new()),
-    )))?;
+    add(Arc::new(WebSearchTool::new(search_provider(home))))?;
 
     // —— 文件 ——
     add(Arc::new(ReadFileTool))?;
@@ -162,7 +192,7 @@ mod tests {
     #[test]
     fn all_ten_tools_register_without_name_clashes() {
         // 重名会被注册表拒绝，所以这条测试同时守着"名字没撞"
-        let r = default_registry().expect("默认工具集应能注册");
+        let r = default_registry(&std::env::temp_dir()).expect("默认工具集应能注册");
         assert_eq!(r.len(), 10, "工具数变了要同步更新这个断言：{:?}", r.names());
         for n in [
             "now",
@@ -183,8 +213,8 @@ mod tests {
     #[test]
     fn registry_order_is_stable() {
         // 工具清单进请求体，顺序不稳定会让前缀缓存作废
-        let a = default_registry().unwrap().specs();
-        let b = default_registry().unwrap().specs();
+        let a = default_registry(&std::env::temp_dir()).unwrap().specs();
+        let b = default_registry(&std::env::temp_dir()).unwrap().specs();
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
             serde_json::to_string(&b).unwrap()
@@ -194,7 +224,7 @@ mod tests {
     #[test]
     fn only_read_and_network_tools_are_not_state_changing() {
         // 这条把"哪些工具会改状态"变成可检查的，而不是靠人记得
-        let r = default_registry().unwrap();
+        let r = default_registry(&std::env::temp_dir()).unwrap();
         let mut outbound = 0;
         for (name, cap) in r.capabilities() {
             match name {

@@ -154,6 +154,21 @@ pub(crate) trait HttpClient: Send + Sync {
     /// `Err` 只表示**传输层**失败（DNS、TLS、超时、连接被拒）。
     /// 有应答但状态码非 2xx 仍然返回 `Ok`，怎么解读交给调用方。
     fn get(&self, url: &str) -> Result<HttpResponse, String>;
+
+    /// 发一个 JSON POST。
+    ///
+    /// **有默认实现（直接报不支持）是为了不逼所有测试替身都实现它。**
+    /// 抓 HTML 那条路只需要 GET；只有带 key 的搜索 API 才要 POST。
+    /// 默认报错而不是静默返回空，是因为"这个替身不支持 POST"和
+    /// "POST 成功了但没结果"必须能被区分——后者会让测试通过得毫无意义。
+    fn post_json(
+        &self,
+        _url: &str,
+        _body: &str,
+        _headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, String> {
+        Err("这个 HTTP 实现不支持 POST（测试替身？）".to_string())
+    }
 }
 
 /// 真的走网络的实现。**只有它在碰 ureq。**
@@ -198,6 +213,34 @@ impl HttpClient for UreqHttpClient {
             // 4xx/5xx 走的是这条分支。**它仍然是一次有效应答**：
             // 状态码本身就是给模型的信号，丢掉它模型就只能瞎猜要不要重试。
             // 错误页的正文读不出来也不影响判断，所以失败时留空串。
+            Err(ureq::Error::Status(code, resp)) => Ok(HttpResponse {
+                status: code,
+                body: resp.into_string().unwrap_or_default(),
+            }),
+            Err(ureq::Error::Transport(t)) => Err(format!("连接失败: {t}")),
+        }
+    }
+
+    fn post_json(
+        &self,
+        url: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<HttpResponse, String> {
+        let mut req = self.agent.post(url).set("Content-Type", "application/json");
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        match req.send_string(body) {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp
+                    .into_string()
+                    .map_err(|e| format!("响应体读取失败（超过 10 MB 或传输中断）: {e}"))?;
+                Ok(HttpResponse { status, body: text })
+            }
+            // 与 get 同理：状态码是给模型的信号，不能当成传输失败吞掉。
+            // 这里尤其重要——401「key 不对」和 429「额度用完了」要能分辨。
             Err(ureq::Error::Status(code, resp)) => Ok(HttpResponse {
                 status: code,
                 body: resp.into_string().unwrap_or_default(),
@@ -1109,6 +1152,215 @@ impl SearchProvider for DuckDuckGoLite {
     }
 }
 
+// ============================================================================
+// 博查：带 key 的搜索后端（默认推荐）
+// ============================================================================
+
+/// 博查的 API 端点。
+///
+/// **实测直连可用**（不带 key 返回 401 `Invalid API KEY`，说明接口活着），
+/// 国内不需要代理。它是 DeepSeek 联网搜索的官方合作伙伴。
+const BOCHA_ENDPOINT: &str = "https://api.bochaai.com/v1/web-search";
+
+/// 博查 API key。
+///
+/// `Debug` 手写成**只显示前 6 位**：这个类型会出现在日志和错误信息里，
+/// 一个会打印自己的密钥和没有密钥保护是一样的。
+pub struct BochaKey(String);
+
+impl BochaKey {
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into().trim().to_string())
+    }
+
+    /// 从 `<home>/secrets/bocha.key` 读。
+    ///
+    /// 与 Agnes / DeepSeek 的密钥同一套位置约定：**都在仓库之外**，
+    /// 靠 `.gitignore` 的 `*.key` 兜底，权限只给当前用户。
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let s = std::fs::read_to_string(path)
+            .map_err(|e| format!("读不到博查密钥 {}: {e}", path.display()))?;
+        let k = Self::new(s);
+        if k.is_empty() {
+            return Err(format!("博查密钥是空的: {}", path.display()));
+        }
+        Ok(k)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for BochaKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let head: String = self.0.chars().take(6).collect();
+        write!(f, "BochaKey({head}…已隐藏)")
+    }
+}
+
+/// 博查搜索。
+///
+/// ## 为什么它是默认推荐，而 DuckDuckGo Lite 只是兜底
+///
+/// [`DuckDuckGoLite`] 是**抓 HTML** 的：对方改一次版就失效，实测当天就已经
+/// 反爬 202 / 走代理 400。而博查是有 key、有服务条款的正式接口——
+/// **稳定性不是靠解析得巧，是靠有一条正式约定**。
+///
+/// 但博查要钱、要实名，所以没有 key 时仍然回落到 DDG：一个能用的兜底
+/// 比一个用不了的优选更有价值。
+pub struct BochaSearch {
+    key: BochaKey,
+    client: Box<dyn HttpClient>,
+}
+
+impl BochaSearch {
+    /// 用真实网络客户端构造。
+    pub fn new(key: BochaKey) -> Self {
+        Self {
+            key,
+            client: Box::new(UreqHttpClient::new()),
+        }
+    }
+
+    /// 注入 HTTP 实现。**测试用**——不注入的话测试就要发真实网络请求，
+    /// 而那种测试随后会被标成 `#[ignore]`，最后等于没有测试。
+    ///
+    /// `#[cfg(test)]` 让"测试专用"这句话由编译器执行，比写在注释里可靠：
+    /// 注释会过期，编译错误不会。
+    #[cfg(test)]
+    pub(crate) fn with_http(key: BochaKey, client: Box<dyn HttpClient>) -> Self {
+        Self { key, client }
+    }
+}
+
+/// 解析博查的响应体。**纯函数，便于用固定报文测。**
+///
+/// ## 三种"没有结果"必须分开
+///
+/// | 情况 | 含义 | 返回 |
+/// |---|---|---|
+/// | `code != 200` | 请求被拒（key 不对、额度用完） | `Err` + 对方的原话 |
+/// | 有 `webPages.value` 但为空数组 | **真的没搜到** | `Ok(vec![])` |
+/// | 没有 `data.webPages` 这个结构 | 接口契约变了 | `Err` |
+///
+/// 第三行最重要：把它压成空结果会让"该修了"伪装成"没搜到"，
+/// 而使用者对这两件事的反应完全不同。
+fn parse_bocha(body: &str, n: usize) -> Result<Vec<SearchHit>, String> {
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| format!("博查返回的不是 JSON（接口可能变了）: {e}"))?;
+
+    // code 不是 200 时对方会带 msg，**原样转述**——
+    // "Invalid API KEY" 和"余额不足"要能分辨，糊成一句"搜索失败"就没法排查。
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+    if code != 200 {
+        let msg = v
+            .get("msg")
+            .and_then(|m| m.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("（对方没给说明）");
+        return Err(format!("博查拒绝了这次请求（code={code}）：{msg}"));
+    }
+
+    let Some(pages) = v.get("data").and_then(|d| d.get("webPages")) else {
+        // data 存在但结构变了；或者干脆没有 data
+        return Err(format!(
+            "博查的响应里没有 data.webPages（接口契约可能变了）。原始响应开头：{}",
+            body.chars().take(200).collect::<String>()
+        ));
+    };
+    let Some(values) = pages.get("value").and_then(|x| x.as_array()) else {
+        return Err("博查的 webPages 里没有 value 数组（接口契约可能变了）".to_string());
+    };
+
+    // 到这里才敢说"真的没有结果"
+    let hits = values
+        .iter()
+        .filter_map(|item| {
+            let url = item.get("url").and_then(|u| u.as_str())?.trim();
+            if url.is_empty() {
+                return None;
+            }
+            // summary 通常比 snippet 长（实测两者常相同，但 summary 开启时更全），
+            // 优先用它——给模型的上下文越完整，它越不需要再抓一次页面。
+            let snippet = item
+                .get("summary")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| item.get("snippet").and_then(|s| s.as_str()))
+                .unwrap_or_default();
+            Some(SearchHit {
+                title: item
+                    .get("name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or(url)
+                    .trim()
+                    .to_string(),
+                url: url.to_string(),
+                // 摘要可能很长；单条压到 300 字符，避免一条结果吃掉整个上下文。
+                // 用 chars().take 而不是字节切——按字节切会落在汉字中间直接 panic。
+                snippet: snippet.trim().chars().take(300).collect(),
+            })
+        })
+        .take(n)
+        .collect();
+
+    Ok(hits)
+}
+
+impl SearchProvider for BochaSearch {
+    fn name(&self) -> &'static str {
+        "博查"
+    }
+
+    fn search(&self, q: &str, n: usize) -> Result<Vec<SearchHit>, String> {
+        if self.key.is_empty() {
+            return Err("博查密钥为空".to_string());
+        }
+        // 按需求条数要，但**多要一点**：解析时可能丢掉没有 url 的条目，
+        // 只按 n 要会让最终结果比 n 少。上限 50 是接口允许的最大值。
+        let want = (n.saturating_mul(2)).clamp(n.min(1), 50);
+        let payload = serde_json::json!({
+            "query": q,
+            "count": want,
+            "summary": true,
+        })
+        .to_string();
+
+        let auth = format!("Bearer {}", self.key.expose());
+        let resp = self
+            .client
+            .post_json(BOCHA_ENDPOINT, &payload, &[("Authorization", &auth)])?;
+
+        if !resp.is_success() {
+            // 401/403 = 密钥或额度问题，**重试无用**，要让人去改配置；
+            // 429/5xx = 稍后可能好。这个区分决定模型是换路还是放弃。
+            return Err(match resp.status {
+                401 | 403 => format!(
+                    "HTTP {}：博查拒绝了密钥（密钥不对、未实名、或额度用完）。\
+                     这不是重试能解决的，需要检查 secrets/bocha.key 或去 open.bochaai.com 充值。",
+                    resp.status
+                ),
+                429 => format!(
+                    "HTTP 429：博查限流或额度用尽，稍后可重试。{}",
+                    resp.body.chars().take(200).collect::<String>()
+                ),
+                500..=599 => format!("HTTP {}：博查服务端出问题，可以稍后重试", resp.status),
+                other => format!(
+                    "HTTP {other}：{}",
+                    resp.body.chars().take(200).collect::<String>()
+                ),
+            });
+        }
+
+        parse_bocha(&resp.body, n)
+    }
+}
+
 /// 搜索端点非 2xx 时给一句能指导下一步的话。
 ///
 /// **不能照搬 [`describe_status`] 的"参数不对，重试无用"**：实测走代理时
@@ -1524,10 +1776,300 @@ mod tests {
             }
             Err(format!("假 HTTP 没有配这条路由: {url}"))
         }
+
+        /// POST 复用同一套路由。记录里带上请求体，好断言参数发对了。
+        ///
+        /// **头也要能断言**：博查把 key 放在 `Authorization` 里，
+        /// 不检查头就测不出"key 到底发出去了没有"。
+        fn post_json(
+            &self,
+            url: &str,
+            body: &str,
+            headers: &[(&str, &str)],
+        ) -> Result<HttpResponse, String> {
+            let auth = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| *v)
+                .unwrap_or("（无 Authorization 头）");
+            self.seen
+                .lock()
+                .unwrap()
+                .push(format!("POST {url} auth={auth} body={body}"));
+            for route in &self.routes {
+                if url.starts_with(route.prefix.as_str()) {
+                    return match &route.reply {
+                        Ok(resp) => Ok(HttpResponse {
+                            status: resp.status,
+                            body: resp.body.clone(),
+                        }),
+                        Err(message) => Err(message.clone()),
+                    };
+                }
+            }
+            Err(format!("假 HTTP 没有配这条路由: {url}"))
+        }
     }
 
     fn seen_urls(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
         seen.lock().unwrap().clone()
+    }
+
+    // ---- 博查 ----
+
+    /// 按实测拿到的真实响应形状构造报文。
+    fn bocha_body(items: &[(&str, &str, &str)]) -> String {
+        let value: Vec<serde_json::Value> = items
+            .iter()
+            .map(|(name, url, summary)| {
+                serde_json::json!({
+                    "id": format!("https://api.bochaai.com/v1/#WebPages.0"),
+                    "name": name,
+                    "url": url,
+                    "displayUrl": url,
+                    "snippet": summary,
+                    "summary": summary,
+                    "siteName": "示例站",
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "code": 200,
+            "log_id": "test-log",
+            "msg": null,
+            "data": {
+                "_type": "SearchResponse",
+                "queryContext": { "originalQuery": "x" },
+                "webPages": {
+                    "webSearchUrl": "https://bocha.cn/search?q=x",
+                    "totalEstimatedMatches": value.len(),
+                    "value": value,
+                    "someResultsRemoved": false,
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn bocha_tool(body: &str, status: u16) -> (BochaSearch, Arc<Mutex<Vec<String>>>) {
+        let fake = FakeHttp::new(vec![FakeRoute::ok("https://api.bochaai.com", status, body)]);
+        let handle = fake.handle();
+        (
+            BochaSearch::with_http(BochaKey::new("sk-test"), Box::new(fake)),
+            handle,
+        )
+    }
+
+    #[test]
+    fn bocha_parses_real_response_shape() {
+        let body = bocha_body(&[
+            ("标题一", "https://a.example/1", "摘要一"),
+            ("标题二", "https://b.example/2", "摘要二"),
+        ]);
+        let (p, _) = bocha_tool(&body, 200);
+        let hits = p.search("测试", 8).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "标题一");
+        assert_eq!(hits[0].url, "https://a.example/1");
+        assert_eq!(hits[0].snippet, "摘要一");
+    }
+
+    #[test]
+    fn bocha_sends_the_key_in_the_authorization_header() {
+        // 不检查头就测不出 key 到底发出去了没有
+        let (p, seen) = bocha_tool(&bocha_body(&[]), 200);
+        let _ = p.search("测试", 3);
+        let reqs = seen_urls(&seen);
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].starts_with("POST https://api.bochaai.com/v1/web-search"));
+        assert!(
+            reqs[0].contains("auth=Bearer sk-test"),
+            "key 没发出去: {}",
+            reqs[0]
+        );
+        // 参数里要有 query
+        assert!(reqs[0].contains(r#""query":"测试""#), "{}", reqs[0]);
+    }
+
+    #[test]
+    fn bocha_empty_results_are_not_an_error() {
+        // 真的没搜到 ≠ 出故障。压成 Err 会让模型以为工具坏了。
+        let (p, _) = bocha_tool(&bocha_body(&[]), 200);
+        let hits = p.search("一个搜不到的词", 5).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn bocha_non_200_code_carries_the_providers_own_message() {
+        // "key 不对" 和 "余额不足" 要能分辨，糊成一句"搜索失败"就没法排查
+        let body = serde_json::json!({
+            "code": 403,
+            "msg": "余额不足，请充值",
+            "data": null
+        })
+        .to_string();
+        let (p, _) = bocha_tool(&body, 200);
+        let err = p.search("x", 3).unwrap_err();
+        assert!(err.contains("余额不足"), "{err}");
+        assert!(err.contains("403"), "{err}");
+    }
+
+    #[test]
+    fn bocha_missing_webpages_is_an_error_not_an_empty_result() {
+        // **最重要的一条**：接口契约变了必须报出来。
+        // 压成空结果会让"该修了"伪装成"没搜到"，而使用者对这两件事的反应完全不同。
+        let body = serde_json::json!({ "code": 200, "data": { "_type": "其它东西" } }).to_string();
+        let (p, _) = bocha_tool(&body, 200);
+        let err = p.search("x", 3).unwrap_err();
+        assert!(err.contains("data.webPages"), "{err}");
+        assert!(err.contains("契约"), "{err}");
+    }
+
+    #[test]
+    fn bocha_non_json_is_an_error() {
+        let (p, _) = bocha_tool("<html>反爬挑战页</html>", 200);
+        let err = p.search("x", 3).unwrap_err();
+        assert!(err.contains("不是 JSON"), "{err}");
+    }
+
+    #[test]
+    fn bocha_401_tells_the_human_what_to_do() {
+        // 401 重试无用，错误信息必须把人引到配置上，而不是让模型反复重试
+        let body = serde_json::json!({ "code": 401, "msg": "Invalid API KEY" }).to_string();
+        let (p, _) = bocha_tool(&body, 401);
+        let err = p.search("x", 3).unwrap_err();
+        assert!(err.contains("401"), "{err}");
+        assert!(err.contains("bocha.key"), "要指出改哪里: {err}");
+        assert!(err.contains("不是重试能解决"), "要明确说别重试: {err}");
+    }
+
+    #[test]
+    fn bocha_5xx_says_retry_later() {
+        let (p, _) = bocha_tool("", 503);
+        let err = p.search("x", 3).unwrap_err();
+        assert!(err.contains("稍后重试"), "{err}");
+    }
+
+    #[test]
+    fn bocha_respects_the_result_limit() {
+        let items: Vec<(&str, &str, &str)> = (0..10)
+            .map(|_| ("标题", "https://x.example/1", "摘要"))
+            .collect();
+        let (p, _) = bocha_tool(&bocha_body(&items), 200);
+        assert_eq!(p.search("x", 3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn bocha_skips_items_without_a_url() {
+        // 没有 url 的结果对模型没用——它没法接着抓
+        let body = serde_json::json!({
+            "code": 200,
+            "data": { "webPages": { "value": [
+                { "name": "有 url", "url": "https://a.example/1" },
+                { "name": "没 url" },
+                { "name": "空 url", "url": "   " },
+            ]}}
+        })
+        .to_string();
+        let (p, _) = bocha_tool(&body, 200);
+        let hits = p.search("x", 8).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "有 url");
+    }
+
+    /// 回归：**按字节切摘要会在中文上 panic。**
+    ///
+    /// web-writer 在真机探针里踩到过这个（DDG 那条路），本地 ASCII 夹具测不出来。
+    /// 所以这条夹具故意用纯中文长摘要。
+    #[test]
+    fn bocha_truncates_long_chinese_snippets_by_chars_not_bytes() {
+        let long: String = "这是一段很长的中文摘要".repeat(60); // 600 字符 / 1800 字节
+        let body = serde_json::json!({
+            "code": 200,
+            "data": { "webPages": { "value": [
+                { "name": "标题", "url": "https://a.example/1", "summary": long },
+            ]}}
+        })
+        .to_string();
+        let (p, _) = bocha_tool(&body, 200);
+        let hits = p.search("x", 8).unwrap();
+        assert_eq!(hits[0].snippet.chars().count(), 300, "应按字符截断到 300");
+    }
+
+    #[test]
+    fn bocha_prefers_summary_over_snippet() {
+        let body = serde_json::json!({
+            "code": 200,
+            "data": { "webPages": { "value": [
+                { "name": "标题", "url": "https://a.example/1",
+                  "snippet": "短", "summary": "更长更完整的摘要" },
+            ]}}
+        })
+        .to_string();
+        let (p, _) = bocha_tool(&body, 200);
+        assert_eq!(p.search("x", 1).unwrap()[0].snippet, "更长更完整的摘要");
+    }
+
+    #[test]
+    fn bocha_falls_back_to_snippet_when_summary_is_missing() {
+        let body = serde_json::json!({
+            "code": 200,
+            "data": { "webPages": { "value": [
+                { "name": "标题", "url": "https://a.example/1", "snippet": "只有摘要" },
+            ]}}
+        })
+        .to_string();
+        let (p, _) = bocha_tool(&body, 200);
+        assert_eq!(p.search("x", 1).unwrap()[0].snippet, "只有摘要");
+    }
+
+    #[test]
+    fn bocha_empty_key_is_rejected_before_any_request() {
+        let fake = FakeHttp::new(vec![]);
+        let seen = fake.handle();
+        let p = BochaSearch::with_http(BochaKey::new(""), Box::new(fake));
+        assert!(p.search("x", 3).is_err());
+        assert!(seen_urls(&seen).is_empty(), "密钥为空时不该发起请求");
+    }
+
+    #[test]
+    fn bocha_key_never_prints_itself() {
+        // 这个类型会出现在日志和错误里；会打印自己的密钥等于没有密钥保护
+        let k = BochaKey::new("sk-abcdefghijklmnop");
+        let shown = format!("{k:?}");
+        assert!(
+            !shown.contains("abcdefghijklmnop"),
+            "Debug 泄露了原文: {shown}"
+        );
+        assert!(shown.contains("sk-abc"), "应保留可辨识前缀: {shown}");
+    }
+
+    #[test]
+    fn bocha_key_trims_whitespace() {
+        // 从文件读出来的 key 常带换行；带换行会让请求头非法
+        let k = BochaKey::new("  sk-x\n");
+        assert_eq!(k.expose(), "sk-x");
+    }
+
+    #[test]
+    fn bocha_provider_reports_its_name() {
+        // 结果变差时第一件事是确认是谁给的
+        let (p, _) = bocha_tool(&bocha_body(&[]), 200);
+        assert_eq!(p.name(), "博查");
+    }
+
+    #[test]
+    fn bocha_asks_for_more_than_needed_but_caps_at_50() {
+        // 解析时可能丢掉没有 url 的条目，只按 n 要会让结果比 n 少
+        let (p, seen) = bocha_tool(&bocha_body(&[]), 200);
+        let _ = p.search("x", 8);
+        let req = &seen_urls(&seen)[0];
+        assert!(req.contains(r#""count":16"#), "应该多要一点: {req}");
+
+        let (p2, seen2) = bocha_tool(&bocha_body(&[]), 200);
+        let _ = p2.search("x", 40);
+        let req2 = &seen_urls(&seen2)[0];
+        assert!(req2.contains(r#""count":50"#), "上限是 50: {req2}");
     }
 
     fn ctx() -> ToolContext {

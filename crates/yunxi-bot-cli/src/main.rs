@@ -1391,7 +1391,8 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             chat_handler::default_rules(),
         );
         // 工具 + 审批。**这是模型第一次真的能对世界动手。**
-        let tools = tooling::default_registry().map_err(|e| format!("工具注册失败: {e}"))?;
+        let tools =
+            tooling::default_registry(&default_home()).map_err(|e| format!("工具注册失败: {e}"))?;
         println!("工具      : {} 个（`yunxi-bot tools` 看清单）", tools.len());
         handler = handler
             .with_tools(tools)
@@ -1448,7 +1449,7 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 fn cmd_tools(_args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::tool::Capability;
 
-    let r = tooling::default_registry().map_err(|e| format!("工具注册失败: {e}"))?;
+    let r = tooling::default_registry(&default_home()).map_err(|e| format!("工具注册失败: {e}"))?;
     println!("共 {} 个工具：", r.len());
     println!();
     println!("{:<14} {:<8} 默认是否免问", "工具", "能力");
@@ -1617,7 +1618,8 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     );
     // 续跑时也要挂上同一套工具与策略——否则"同一个任务在 do 和 resume 里
     // 行为不同"，那种 bug 极难查
-    let tools = tooling::default_registry().map_err(|e| format!("工具注册失败: {e}"))?;
+    let tools =
+        tooling::default_registry(&default_home()).map_err(|e| format!("工具注册失败: {e}"))?;
     handler = handler
         .with_tools(tools)
         .with_approver(tooling::approver_from_args(args))
