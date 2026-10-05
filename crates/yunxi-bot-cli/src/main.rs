@@ -89,8 +89,13 @@ fn main() {
     // 报告可以撒谎，文件系统状态不会。
     #[cfg(windows)]
     if args.first().map(String::as_str) == Some("__canary-write") {
+        // 把每一步的真实结果打到 stdout：父进程靠"文件是否真的存在"判定隔离，
+        // 这里的结果用来诊断**为什么**失败。静默忽略错误会让排查无从下手。
         for p in &args[1..] {
-            let _ = std::fs::write(p, b"canary");
+            match std::fs::write(p, b"canary") {
+                Ok(()) => println!("OK   {p}"),
+                Err(e) => println!("FAIL {p} -> {e} (kind={:?})", e.kind()),
+            }
         }
         std::process::exit(0);
     }
@@ -581,21 +586,29 @@ fn cmd_isolation_check() -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::exec;
     use yunxi_bot_core::win_token;
 
-    let base = std::env::temp_dir().join(format!("yunxi-isocheck-{}", std::process::id()));
+    // 授权区必须是**低完整性**目录：低完整性子进程写不进中完整性对象，
+    // 所以"允许写"的位置要用系统预置的 AppData\LocalLow。
+    let low_root =
+        win_token::low_integrity_root().ok_or("取不到用户目录，无法定位低完整性可写区")?;
+    let base = low_root.join(format!("YunXiBot-isocheck-{}", std::process::id()));
     let allowed = base.join("allowed");
-    let denied = base.join("denied");
-    std::fs::create_dir_all(&allowed)?;
+    // 反例放在中完整性的 TEMP：低完整性子进程**不应该**写得进去
+    let medium = std::env::temp_dir().join(format!("yunxi-isocheck-{}", std::process::id()));
+    let denied = medium.join("denied");
     std::fs::create_dir_all(&denied)?;
 
     println!(
         "平台报告可用隔离级别 : {}",
         exec::available_isolation().describe()
     );
+    println!("授权区（低完整性）   : {}", allowed.display());
+    println!("禁止区（中完整性）   : {}", denied.display());
     println!();
     println!("正在运行写入隔离开自检（会真的起一个受限子进程）...");
 
     let result = win_token::verify_write_isolation(&allowed, &denied);
     let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&medium);
 
     match result {
         Ok(report) => {

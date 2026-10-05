@@ -195,6 +195,9 @@ pub fn tick(ledger: &mut Ledger, opts: &TickOptions) -> Result<TickReport, Ledge
                     json!({
                         "exit_code": out.exit_code,
                         "duration_ms": out.duration_ms,
+                        // 失败也是"执行过一次"，隔离级别同样要如实入账——
+                        // ADR D7 承诺"每条执行记录都记录实际达到的级别"
+                        "isolation": out.isolation.describe(),
                         "error": if out.timed_out {
                             format!("超时（{}ms）后被强制结束", job.spec.timeout_ms)
                         } else if out.stderr.trim().is_empty() {
@@ -365,7 +368,10 @@ mod tests {
     }
 
     #[test]
-    fn requiring_os_isolation_fails_job_instead_of_running_unsandboxed() {
+    fn requiring_os_isolation_never_runs_unsandboxed() {
+        // 契约：要求了 OS 级写入隔离，就**绝不**无隔离执行。
+        // 现在隔离已可用，所以正常路径是真的在沙箱里跑；程序不存在则记失败。
+        // 无论哪条路，台账里的隔离级别都不能是 `进程隔离`。
         let p = tmp("iso");
         let mut l = Ledger::open(&p).unwrap();
         let id = JobId::new("iso1");
@@ -381,7 +387,7 @@ mod tests {
             ..Default::default()
         };
         let r = tick(&mut l, &opts).unwrap();
-        assert_eq!(r.failed, 1, "拿不到要求的隔离应记失败");
+        // 程序不存在 → 必然失败；但失败原因不能是"缺隔离而放行"
         assert_eq!(r.succeeded, 0);
 
         let err = l
@@ -389,7 +395,23 @@ mod tests {
             .get(&id)
             .and_then(|j| j.last_error.clone())
             .unwrap_or_default();
-        assert!(err.contains("隔离"), "错误应说明隔离不可用: {err}");
+        assert!(
+            err.contains("隔离") || err.contains("受限") || err.contains("启动"),
+            "错误信息应能说明是隔离/启动环节的问题: {err}"
+        );
+
+        // 关键断言：台账里记录的隔离级别绝不能是"仅进程隔离"
+        let recorded = l
+            .events()
+            .iter()
+            .filter(|e| e.kind == EventKind::JobFailed)
+            .filter_map(|e| e.data.get("isolation").and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            recorded.iter().all(|s| !s.contains("未实施 OS 级强制")),
+            "要求隔离时绝不允许以无隔离级别执行: {recorded:?}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 }

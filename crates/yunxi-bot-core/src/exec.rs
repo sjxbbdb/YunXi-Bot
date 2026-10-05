@@ -96,12 +96,14 @@ pub enum IsolationLevel {
     /// **不含文件系统写入隔离**——子进程仍以当前用户身份运行，能写用户能写的
     /// 任何位置。不要把它当作沙箱。
     WindowsJobObject,
-    /// Windows：受限令牌 + 能力 SID 的写入隔离。
+    /// Windows：受限令牌 + **低完整性级别**的写入隔离。
     ///
-    /// **尚未实现。** 这是 ADR D7 的目标形态，需要 `CreateRestrictedToken` +
-    /// `CreateProcessAsUser` + 能力 SID 构造。在它真正可用之前，
-    /// [`IsolationRequirement::RequireOsWriteIsolation`] 会**拒绝执行**，
-    /// 而不是退回无隔离运行。
+    /// 机制是把令牌的完整性降到 Low：低完整性子进程**写不进**任何中完整性对象
+    /// （用户目录里的文件全是中完整性），可写区仅限低完整性沙箱。
+    ///
+    /// 早期设计用的是"受限令牌 + 能力 SID 限制列表"，已被四种变体对照实测证伪
+    /// （限制列表只要非空，子进程就以 `STATUS_DLL_INIT_FAILED` 结束），
+    /// 详见 [`crate::win_token`] 的模块文档。
     WindowsRestrictedToken,
 }
 
@@ -112,7 +114,7 @@ impl IsolationLevel {
             IsolationLevel::WindowsJobObject => {
                 "Windows Job Object（进程树回收 + 资源上限；不含写入隔离）"
             }
-            IsolationLevel::WindowsRestrictedToken => "Windows 受限令牌 + 能力 SID 写入隔离",
+            IsolationLevel::WindowsRestrictedToken => "Windows 受限令牌（低完整性）写入隔离",
         }
     }
 
@@ -209,16 +211,13 @@ impl std::error::Error for ExecError {}
 
 /// 当前平台能提供的隔离级别。
 ///
-/// 如实反映现实：
-/// - Windows：提供 Job Object（进程树回收 + 资源上限），**但不提供写入隔离**；
-/// - 其他平台：只有进程隔离。
-///
-/// 写入隔离（`WindowsRestrictedToken`）尚未实现，因此
-/// [`IsolationRequirement::RequireOsWriteIsolation`] 至今仍然会拒绝执行。
+/// Windows 上可提供到 `WindowsRestrictedToken`（低完整性令牌的写入隔离）。
+/// **但"可用"不等于"已验证"**：真正要执行时需要 OS 级写入隔离时，
+/// [`run_command`] 会先跑一次自检并缓存结果，只有实测通过才放行。
 pub fn available_isolation() -> IsolationLevel {
     #[cfg(windows)]
     {
-        IsolationLevel::WindowsJobObject
+        IsolationLevel::WindowsRestrictedToken
     }
     #[cfg(not(windows))]
     {
@@ -281,6 +280,40 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
     }
 
     let started = Instant::now();
+
+    // —— Windows：要求写入隔离时走低完整性令牌路径 ——
+    //
+    // 注意这里**先跑一次实测自检**（进程内缓存）。"代码里有这个功能"不等于
+    // "在这台机器上真的能隔离"，失败契约要求后者。
+    #[cfg(windows)]
+    if opts.isolation == IsolationRequirement::RequireOsWriteIsolation {
+        if !crate::win_token::write_isolation_verified() {
+            return Err(ExecError::IsolationUnavailable {
+                required: opts.isolation,
+                actual: IsolationLevel::WindowsJobObject,
+            });
+        }
+        let token = crate::win_token::RestrictedToken::create()
+            .map_err(|e| ExecError::Spawn(format!("建立受限令牌失败: {e}")))?;
+        // 低完整性子进程唯一能写的地方。
+        // 工作目录因此被设为沙箱——**读**不受限，任务仍可用绝对路径读输入。
+        let sandbox = crate::win_token::sandbox_dir()
+            .map_err(|e| ExecError::Spawn(format!("准备沙箱目录失败: {e}")))?;
+        let env: Vec<(String, String)> = strip_credentials(std::env::vars()).into_iter().collect();
+
+        let out =
+            crate::win_token::run_restricted(&token, command, &sandbox, &env, opts.timeout_ms)
+                .map_err(|e| ExecError::Spawn(format!("受限执行失败: {e}")))?;
+
+        return Ok(ExecOutcome {
+            exit_code: out.exit_code,
+            stdout: truncate(out.stdout),
+            stderr: truncate(out.stderr),
+            timed_out: false,
+            duration_ms: started.elapsed().as_millis() as u64,
+            isolation: IsolationLevel::WindowsRestrictedToken,
+        });
+    }
 
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..])
@@ -438,17 +471,29 @@ mod tests {
     }
 
     #[test]
-    fn required_isolation_is_refused_when_unavailable() {
-        // 这是"绝不无隔离派生"的直接验证：拿不到就不跑
+    fn required_isolation_reports_the_real_level() {
+        // 要求 OS 级写入隔离时：
+        // - 若自检通过 → 走受限路径，如实报告 WindowsRestrictedToken；
+        // - 若自检不通过 → 在**派生之前**拒绝，绝不无隔离执行。
+        //
+        // 两条路都不允许"悄悄降级成普通进程执行"。
         let opts = ExecOptions {
             isolation: IsolationRequirement::RequireOsWriteIsolation,
             ..Default::default()
         };
-        let err = run_command(&["definitely-not-a-real-program".into()], &opts).unwrap_err();
-        assert!(
-            matches!(err, ExecError::IsolationUnavailable { .. }),
-            "应在派生之前就拒绝，而不是尝试执行后失败: {err}"
-        );
+        let result = run_command(&["definitely-not-a-real-program".into()], &opts);
+
+        match result {
+            Err(ExecError::IsolationUnavailable { .. }) => {
+                // 自检没过：拒绝执行，这是正确行为
+            }
+            Err(ExecError::Spawn(_)) => {
+                // 自检过了，走到了启动阶段（程序不存在所以失败）——
+                // 说明隔离路径确实被走通了
+            }
+            Err(other) => panic!("不符合任何一种预期失败: {other}"),
+            Ok(out) => panic!("不存在的程序不应执行成功；isolation={:?}", out.isolation),
+        }
     }
 
     #[cfg(windows)]

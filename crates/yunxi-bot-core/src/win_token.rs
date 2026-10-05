@@ -1,74 +1,69 @@
-//! Windows 受限令牌 + 能力 SID 的文件系统写入隔离。
+//! Windows 写入隔离：受限令牌 + 低完整性级别。
 //!
-//! ## 机制
+//! ## 机制（最终采用）
 //!
-//! 1. 生成一个随机**能力 SID**（`S-1-4-<rand>-<rand>`）；
-//! 2. 在**允许写入**的目录上给该 SID 加一条写 ACE；
-//! 3. 用 `CreateRestrictedToken` 把该 SID 放进**限制 SID 列表**；
+//! 1. `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` 造一个受限令牌；
+//! 2. `DuplicateTokenEx` 转成主令牌；
+//! 3. **`SetTokenInformation(TokenIntegrityLevel)` 把完整性降到 Low**；
 //! 4. 用 `CreateProcessAsUserW` 以该令牌启动子进程。
 //!
-//! 受限令牌的访问检查要做两遍：一遍用令牌的正常 SID，一遍**只用限制 SID**。
-//! 两遍都通过才放行。限制列表里只有能力 SID，因此对象必须给能力 SID 授权，
-//! 子进程才写得进去——**没授权的路径一律写不进**。这就是写入隔离。
+//! 写入隔离来自第 3 步。Windows 的强制完整性控制（MIC）规定：
+//!
+//! - **读**不受影响 → 进程能正常启动、正常运行；
+//! - **写**只能写完整性级别 ≤ 自己的对象 → 用户目录里的文件都是中完整性，
+//!   一律写不进去。
+//!
+//! 可写区是系统预置的 `%USERPROFILE%\AppData\LocalLow`——它本身就是低完整性目录，
+//! 而新对象会**继承**父目录的标签，所以在其下建目录不需要任何特权。
+//!
+//! ## 走过并被证伪的路线：能力 SID 限制列表
+//!
+//! 最初按"受限令牌 + 能力 SID（`S-1-4-x-y`）限制列表"实现：铸造能力 SID、
+//! 给工作目录加写 ACE、把它放进 `CreateRestrictedToken` 的限制列表。
+//! 代码全部写通，但**四种变体对照实测**都失败：
+//!
+//! | 限制列表 | flags | 结果 |
+//! |---|---|---|
+//! | **空** | `DISABLE_MAX_PRIVILEGE` | ✅ 子进程正常运行 |
+//! | `Everyone` | `DISABLE_MAX_PRIVILEGE` | ❌ `STATUS_DLL_INIT_FAILED` |
+//! | `Everyone` + 能力 SID | `DISABLE_MAX_PRIVILEGE` | ❌ 同上 |
+//! | `Everyone` | `+ WRITE_RESTRICTED` | ❌ 同上 |
+//!
+//! **限制列表只要非空，子进程就无法完成初始化**（`0xC0000142`）。
+//! 根因：限制列表对读写一视同仁，而进程启动本身就需要访问只授权给用户 SID 的
+//! 对象（注册表 `HKCU`、窗口站等）。`WRITE_RESTRICTED` 把限制收窄到写，
+//! 但进程启动**确实要写**，所以仍然过不去。
+//!
+//! 另一条试过的路是给目录**打**低完整性标签，失败于 `ERROR_ACCESS_DENIED (5)`：
+//! 完整性标签存在 SACL 里，改 SACL 需要 `SeSecurityPrivilege`（管理员）。
+//! 这正是最终方案改用系统预置 `LocalLow` 的原因——它已经标好了。
 //!
 //! ## 为什么必须自检
 //!
-//! 上面这套 FFI 有太多地方可以"错了但不报错"：SID 权限位算错、ACE 没真正写进去、
-//! 令牌没带限制列表……任何一种都会产出**看起来实现了隔离、实际毫无限制**的代码。
+//! 上面这套 FFI 有太多地方可以"错了但不报错"。所以本模块提供
+//! [`verify_write_isolation`]：真起一个 canary 子进程，让它分别尝试写
+//! **允许**与**禁止**的路径，只有"允许的写成功、禁止的写失败"才算通过。
 //!
-//! 所以本模块提供 [`verify_write_isolation`]：真起一个 canary 子进程，
-//! 让它分别尝试写**允许**与**禁止**的路径，只有"允许的写成功、禁止的写失败"
-//! 才算通过。**隔离声明由这次实测背书**，通过不了就如实回落、让上层拒绝执行。
+//! **[`write_isolation_verified`] 是失败契约的执行点**：要求 OS 级写入隔离时，
+//! 不会因为"代码里有这个功能"就放行，而是要求自检真的跑过一次并成功。
 //!
-//! ## ⚠️ 当前状态：**不可用**，且已实测确认
-//!
-//! 截至本次实现，写入隔离**没有达到可用状态**。因此
-//! [`crate::exec::available_isolation`] **不会**返回
-//! `WindowsRestrictedToken`，`--require-os-isolation` 至今仍然拒绝执行。
-//! 这不是缺陷，是失败契约在正常工作。
-//!
-//! ### 已经做对的部分
-//!
-//! - 能力 SID 铸造、目录写 ACE 授予、受限令牌创建 —— 全部成功；
-//! - 受限进程启动（含管道重定向、剥离凭证的环境块）—— 成功；
-//! - 自检脚手架 —— 能如实报告"隔离未生效"。
-//!
-//! ### 卡在哪里（实测记录）
-//!
-//! | 变体 | 限制列表 | flags | 结果 |
-//! |---|---|---|---|
-//! | D | **空** | `DISABLE_MAX_PRIVILEGE` | ✅ `cmd.exe` 正常运行 |
-//! | E | `Everyone` | `DISABLE_MAX_PRIVILEGE` | ❌ `STATUS_DLL_INIT_FAILED` |
-//! | F | `Everyone` + 能力 SID | `DISABLE_MAX_PRIVILEGE` | ❌ 同上 |
-//! | G | `Everyone` | `DISABLE_MAX_PRIVILEGE \| WRITE_RESTRICTED` | ❌ 同上 |
-//!
-//! **结论：在本机 Windows 上，限制列表只要非空，子进程就无法完成初始化**
-//! （退出码 `0xC0000142`）。`WRITE_RESTRICTED` 也挡不住。
-//!
-//! 推断的原因：`WRITE_RESTRICTED` 确实在限制写，而**正常的进程启动本身就需要写**
-//! ——注册表 `HKCU`、用户配置文件等。这些位置的 DACL 只授权给用户 SID，
-//! 能力 SID 在那里没有 ACE，于是初始化失败。
-//!
-//! 也就是说，下一步需要把能力 SID 也授予**进程启动所必需的那些写位置**
-//! （注册表键需要走 `SetSecurityInfo` 而非 `SetNamedSecurityInfoW`），
-//! 而不是只授予工作目录。那是一个独立的工作量。
-//!
-//! ### 已经排掉的坑
+//! ## 自检抓出来的错误（每一个都能安静地跑下去）
 //!
 //! - `CreateRestrictedToken` 真实签名有 **9 个参数**，少声明中间两个会让调用
-//!   错位读到栈上垃圾（表现为 Win32 错误 534）；
+//!   错位读到栈上垃圾（表现为 Win32 错误 534「算术结果超过 32 位」）；
 //! - 限制 SID 入参是 `SID_AND_ATTRIBUTES` **结构体数组**，不是 SID 指针数组；
-//! - `TRUSTEE_W` 必须含 `TrusteeType` 且字段顺序与 Win32 一致，否则
-//!   `SetEntriesInAclW` 返回 `ERROR_INVALID_PARAMETER (87)`；
-//! - `GetNamedSecurityInfoW` 拒绝带结尾反斜杠的路径（同样是 87）；
-//! - 空环境块是非法的（`CreateProcess` 返回 87）；
-//! - `advapi32` 必须显式 `#[link]`，否则 `FreeSid` 链接失败。
+//! - `TRUSTEE_W` 必须含 `TrusteeType` 且字段顺序与 Win32 一致（否则 87）；
+//! - `GetNamedSecurityInfoW` 拒绝带结尾反斜杠的路径（87）；
+//! - 空环境块对 `CreateProcess` 非法（87）；
+//! - `advapi32` 必须显式 `#[link]`，否则 `FreeSid` 链接失败；
+//! - **canary 不能用 `current_exe()`**：在 `cargo test` 下那是测试二进制，
+//!   它会把 `__canary-write` 当成测试名过滤器跑 0 个测试然后正常退出，
+//!   让自检得出"两条路径都没写成"的**假结论**。见 [`locate_canary`]。
 //!
 //! ## 它不保证什么
 //!
 //! - **不限制读取。** 子进程仍能读该用户能读的任何东西。本机制只管写入。
 //! - **不限制网络。** 需要网络隔离得另加防火墙规则或 AppContainer。
-
 #![cfg(windows)]
 
 use std::ffi::c_void;
@@ -87,35 +82,21 @@ const TOKEN_ALL_FOR_LAUNCH: u32 = TOKEN_ASSIGN_PRIMARY
 
 const DISABLE_MAX_PRIVILEGE: u32 = 0x0001;
 
-/// `WRITE_RESTRICTED`——**这个机制的核心开关**。
-///
-/// 没有它时，受限令牌的访问检查对**读写一视同仁**：进程连读自己的 exe、
-/// 读注册表 HKCU、访问窗口站都要过限制列表那一关。而那些对象的 DACL 只授权给
-/// 用户 SID（不含 `Everyone`），于是子进程直接以 `STATUS_DLL_INIT_FAILED`
-/// （实测退出码 `0xC0000142`）死掉——**任何**非空限制列表都会这样。
-///
-/// 带上它之后语义变成：
-///
-/// - **读**：用令牌的正常 SID 判定 → 进程能正常启动、能读它本来就能读的东西；
-/// - **写**：只用限制 SID 判定 → 只有在被授予能力 SID 的目录里才写得进去。
-///
-/// 这正是"写入隔离"想要的形状，也解释了为什么限制列表里**只需要**能力 SID。
-const WRITE_RESTRICTED: u32 = 0x0008;
+/// `TokenIntegrityLevel` 信息类。
+const TOKEN_INTEGRITY_LEVEL: u32 = 25;
+
+/// 完整性 SID 的权威：`SECURITY_MANDATORY_LABEL_AUTHORITY` = {0,0,0,0,0,16}。
+const MANDATORY_LABEL_AUTHORITY: SidIdentifierAuthority = SidIdentifierAuthority {
+    value: [0, 0, 0, 0, 0, 16],
+};
+
+/// `SECURITY_MANDATORY_LOW_RID` = 0x1000。
+const MANDATORY_LOW_RID: u32 = 0x1000;
+
+/// `SE_GROUP_INTEGRITY`——完整性 SID 必须带这个属性，否则 `SetTokenInformation` 会拒绝。
+const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
 const SECURITY_IMPERSONATION: u32 = 2;
 const TOKEN_PRIMARY: u32 = 1;
-
-const SE_FILE_OBJECT: u32 = 1;
-const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
-
-const TRUSTEE_IS_SID: u32 = 0;
-const TRUSTEE_IS_UNKNOWN: u32 = 0;
-const NO_MULTIPLE_TRUSTEE: u32 = 0;
-const GRANT_ACCESS: u32 = 1;
-const SUB_CONTAINERS_AND_OBJECTS_INHERIT: u32 = 0x3;
-
-const FILE_GENERIC_READ: u32 = 0x0012_0089;
-const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
-const FILE_GENERIC_EXECUTE: u32 = 0x0012_00A0;
 
 const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
 const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
@@ -133,40 +114,11 @@ struct SidIdentifierAuthority {
     value: [u8; 6],
 }
 
-/// `SECURITY_NON_UNIQUE_AUTHORITY` = {0,0,0,0,0,4}，本地自铸标识符用它。
-const NON_UNIQUE_AUTHORITY: SidIdentifierAuthority = SidIdentifierAuthority {
-    value: [0, 0, 0, 0, 0, 4],
-};
-
 #[repr(C)]
 struct SecurityAttributes {
     n_length: u32,
     lp_security_descriptor: *mut c_void,
     b_inherit_handle: i32,
-}
-
-/// `TRUSTEE_W`。
-///
-/// ⚠️ 字段顺序与数量必须与 Win32 完全一致：
-/// `pMultipleTrustee, MultipleTrusteeOperation, TrusteeForm, TrusteeType, ptstrName`。
-/// 少一个 `TrusteeType` 或把 `ptstrName` 提前，都会让后续字段错位——
-/// 实测表现为 `SetEntriesInAclW` 返回 `ERROR_INVALID_PARAMETER (87)`。
-#[repr(C)]
-struct TrusteeW {
-    p_multiple_trustee: *mut c_void,
-    multiple_trustee_operation: u32,
-    trustee_form: u32,
-    trustee_type: u32,
-    /// `TrusteeForm` 为 `TRUSTEE_IS_SID` 时，这里实际是 `PSID`（不是字符串）。
-    p_trustee_name: *mut c_void,
-}
-
-#[repr(C)]
-struct ExplicitAccessW {
-    grf_access_permissions: u32,
-    grf_access_mode: u32,
-    grf_inheritance: u32,
-    trustee: TrusteeW,
 }
 
 #[repr(C)]
@@ -288,48 +240,21 @@ unsafe extern "system" {
         sub7: u32,
         sid: *mut *mut c_void,
     ) -> i32;
+    fn SetTokenInformation(token: *mut c_void, class: u32, info: *mut c_void, len: u32) -> i32;
     fn FreeSid(sid: *mut c_void) -> *mut c_void;
-    fn GetNamedSecurityInfoW(
-        name: *const u16,
-        ty: u32,
-        info: u32,
-        owner: *mut *mut c_void,
-        group: *mut *mut c_void,
-        dacl: *mut *mut c_void,
-        sacl: *mut *mut c_void,
-        sd: *mut *mut c_void,
-    ) -> u32;
-    fn SetNamedSecurityInfoW(
-        name: *mut u16,
-        ty: u32,
-        info: u32,
-        owner: *mut c_void,
-        group: *mut c_void,
-        dacl: *mut c_void,
-        sacl: *mut c_void,
-    ) -> u32;
-    fn SetEntriesInAclW(
-        count: u32,
-        entries: *const ExplicitAccessW,
-        old_acl: *mut c_void,
-        new_acl: *mut *mut c_void,
-    ) -> u32;
 }
 
 unsafe extern "system" {
-    fn LocalFree(mem: *mut c_void) -> *mut c_void;
     fn GetEnvironmentStringsW() -> *mut u16;
     fn FreeEnvironmentStringsW(env: *mut u16) -> i32;
 }
 
 #[derive(Debug)]
 pub enum TokenError {
-    /// 能力 SID 创建失败
+    /// 完整性 SID 创建失败
     Sid(u32),
-    /// 令牌创建/复制失败
+    /// 令牌创建/复制/降级失败
     Token(u32),
-    /// ACL 授予失败
-    Acl(u32),
     /// 进程启动失败
     Spawn(u32),
     /// 参数非法
@@ -339,9 +264,8 @@ pub enum TokenError {
 impl std::fmt::Display for TokenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TokenError::Sid(c) => write!(f, "创建能力 SID 失败（Win32 错误 {c}）"),
-            TokenError::Token(c) => write!(f, "创建受限令牌失败（Win32 错误 {c}）"),
-            TokenError::Acl(c) => write!(f, "设置目录 ACL 失败（Win32 错误 {c}）"),
+            TokenError::Sid(c) => write!(f, "创建完整性 SID 失败（Win32 错误 {c}）"),
+            TokenError::Token(c) => write!(f, "创建或降级受限令牌失败（Win32 错误 {c}）"),
             TokenError::Spawn(c) => write!(f, "启动受限子进程失败（Win32 错误 {c}）"),
             TokenError::Invalid(m) => write!(f, "参数非法: {m}"),
         }
@@ -354,55 +278,42 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// 把路径整理成 Win32 安全 API 能接受的形状。
+/// 低完整性 SID（`S-1-16-4096`）。
 ///
-/// **结尾反斜杠必须去掉**：`GetNamedSecurityInfoW` 对 `D:\temp\` 这样的路径
-/// 直接返回 `ERROR_INVALID_PARAMETER (87)`（实测）。但根目录 `C:\` 要保留，
-/// 否则会变成毫无意义的 `C:`。
-fn for_security_api(path: &std::path::Path) -> String {
-    let s = path.to_string_lossy().to_string();
-    let trimmed = s.trim_end_matches(['\\', '/']);
-    match trimmed.len() {
-        // "C:" → "C:\"
-        2 if trimmed.ends_with(':') => format!("{trimmed}\\"),
-        // 全是分隔符（例如 "\"）：原样返回
-        0 => s,
-        _ => trimmed.to_string(),
-    }
-}
-
-/// 能力 SID：一枚本地随机铸造的标识符，仅用于"这个文件允许这个子进程写"。
-pub struct CapabilitySid {
+/// ## 这才是 Windows 上做写入隔离的正确机制
+///
+/// 早先版本用受限令牌的**限制 SID 列表**做隔离，实测撞死在
+/// `STATUS_DLL_INIT_FAILED`：限制列表对**读写一视同仁**，而进程启动本身
+/// 就需要读注册表、读窗口站等只授权给用户 SID 的对象，于是任何非空限制列表
+/// 都会让子进程起不来。
+///
+/// **完整性级别只挡写、不挡读**（Windows 的强制完整性控制 MIC 就是这样定义的）：
+///
+/// - 低完整性进程**读**任何东西都不受影响 → 进程能正常启动、正常运行；
+/// - **写**只能写完整性级别 ≤ 自己的对象 → 用户目录里的文件都是中完整性，
+///   一律写不进去。
+///
+/// 想让某个目录可写，就给它打上低完整性标签（见 [`label_low`]）。
+struct LowIntegritySid {
     sid: *mut c_void,
 }
 
-// SID 是分配在堆上的不可变数据，跨线程共享只读访问是安全的
-unsafe impl Send for CapabilitySid {}
-unsafe impl Sync for CapabilitySid {}
+/// `TOKEN_MANDATORY_LABEL`：`SetTokenInformation` 用的载荷。
+#[repr(C)]
+struct TokenMandatoryLabel {
+    label: SidAndAttributes,
+}
 
-impl CapabilitySid {
-    /// 铸造一枚随机能力 SID。
-    ///
-    /// 用时间与 pid 混合出随机子授权号——**不需要密码学强度**：
-    /// 这枚 SID 的用途是"标记一批允许写入的目录"，猜中它并不能绕过隔离
-    /// （攻击者还需要以该用户身份运行，那时他本来就能写）。
-    pub fn mint() -> Result<Self, TokenError> {
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let pid = std::process::id() as u64;
-        let sub0 = (t & 0xFFFF_FFFF) as u32;
-        let sub1 = ((t >> 32) as u32) ^ (pid as u32).rotate_left(13);
-
+impl LowIntegritySid {
+    fn new() -> Result<Self, TokenError> {
         let mut sid: *mut c_void = std::ptr::null_mut();
-        // SAFETY: authority 与子授权号都是普通整数；sid 由 API 分配，Drop 里释放
+        // SAFETY: Mandatory Label 权威 + 1 个子授权号 0x1000 = S-1-16-4096（Low）
         let ok = unsafe {
             AllocateAndInitializeSid(
-                &NON_UNIQUE_AUTHORITY,
-                2,
-                sub0,
-                sub1,
+                &MANDATORY_LABEL_AUTHORITY,
+                1,
+                MANDATORY_LOW_RID,
+                0,
                 0,
                 0,
                 0,
@@ -417,18 +328,9 @@ impl CapabilitySid {
         }
         Ok(Self { sid })
     }
-
-    fn as_ptr(&self) -> *mut c_void {
-        self.sid
-    }
-
-    /// 字符串形式，仅用于诊断输出。
-    pub fn to_string_form(&self) -> String {
-        format!("S-1-4-<本地铸造的能力 SID @{:p}>", self.sid)
-    }
 }
 
-impl Drop for CapabilitySid {
+impl Drop for LowIntegritySid {
     fn drop(&mut self) {
         if !self.sid.is_null() {
             unsafe { FreeSid(self.sid) };
@@ -436,77 +338,59 @@ impl Drop for CapabilitySid {
     }
 }
 
-/// 给 `path` 目录加上一条"允许该能力 SID 读写执行"的继承 ACE。
+/// 低完整性可写区的根。
 ///
-/// 继承标志是 `SUB_CONTAINERS_AND_OBJECTS_INHERIT`：子目录与文件一并继承，
-/// 否则子进程只能写目录本身、写不了里面的文件。
-pub fn grant_write(sid: &CapabilitySid, path: &std::path::Path) -> Result<(), TokenError> {
-    let name = wide(&for_security_api(path));
-
-    let mut old_dacl: *mut c_void = std::ptr::null_mut();
-    let mut sd: *mut c_void = std::ptr::null_mut();
-    // SAFETY: 取目录 DACL；sd 由 API 分配，用后 LocalFree
-    let rc = unsafe {
-        GetNamedSecurityInfoW(
-            name.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut old_dacl,
-            std::ptr::null_mut(),
-            &mut sd,
-        )
-    };
-    if rc != 0 {
-        return Err(TokenError::Acl(rc));
-    }
-
-    let entry = ExplicitAccessW {
-        grf_access_permissions: FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
-        grf_access_mode: GRANT_ACCESS,
-        grf_inheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        trustee: TrusteeW {
-            p_multiple_trustee: std::ptr::null_mut(),
-            multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
-            trustee_form: TRUSTEE_IS_SID,
-            trustee_type: TRUSTEE_IS_UNKNOWN,
-            p_trustee_name: sid.as_ptr(),
-        },
-    };
-
-    let mut new_dacl: *mut c_void = std::ptr::null_mut();
-    // SAFETY: entry 指向有效的 SID；old_dacl 来自上面的查询
-    let rc = unsafe { SetEntriesInAclW(1, &entry, old_dacl, &mut new_dacl) };
-    if rc != 0 {
-        unsafe { LocalFree(sd) };
-        return Err(TokenError::Acl(rc));
-    }
-
-    // SAFETY: new_dacl 由 SetEntriesInAclW 分配；name 是可变缓冲区的指针
-    let rc = unsafe {
-        SetNamedSecurityInfoW(
-            name.as_ptr() as *mut u16,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            new_dacl,
-            std::ptr::null_mut(),
-        )
-    };
-
-    unsafe {
-        LocalFree(new_dacl);
-        LocalFree(sd);
-    }
-    if rc != 0 {
-        return Err(TokenError::Acl(rc));
-    }
-    Ok(())
+/// Windows 为低完整性进程准备了 `%USERPROFILE%\AppData\LocalLow`，**它本身就是
+/// 低完整性目录**（`Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)`）。
+///
+/// 这一点很关键：给一个已存在的目录**打**低完整性标签需要 `SeSecurityPrivilege`
+/// （实测普通用户下返回 `ERROR_ACCESS_DENIED (5)`，因为完整性标签存在 SACL 里），
+/// 而直接使用这个系统预置的位置则**完全不需要管理员权限**。
+pub fn low_integrity_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(|p| std::path::PathBuf::from(p).join("AppData").join("LocalLow"))
 }
 
-/// 受限令牌：当前进程令牌的受限副本，限制列表里只有那枚能力 SID。
+/// 低完整性沙箱目录：低完整性子进程**唯一**能写的地方。
+///
+/// 由中完整性的父进程创建在 `LocalLow` 下，因此目录会继承低完整性标签
+/// （实测 `Mandatory Label\Low Mandatory Level:(I)(OI)(CI)(NW)`）。
+pub fn sandbox_dir() -> Result<std::path::PathBuf, TokenError> {
+    let root = low_integrity_root()
+        .ok_or_else(|| TokenError::Invalid("取不到用户目录，无法定位低完整性可写区".into()))?;
+    let dir = root.join("YunXiBot").join("sandbox");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| TokenError::Invalid(format!("建沙箱目录失败: {e}")))?;
+    Ok(dir)
+}
+
+/// 写入隔离是否**经过实测验证**。结果在进程内缓存。
+///
+/// 这是失败契约的执行点：要求 OS 级写入隔离时，不会因为"代码里有这个功能"
+/// 就放行，而是要求自检**真的跑过一次并成功**。自检会起一个受限子进程去写
+/// 允许与禁止的两条路径，只有"允许的能写、禁止的写不了"才算通过。
+pub fn write_isolation_verified() -> bool {
+    static VERIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| {
+        let Some(root) = low_integrity_root() else {
+            return false;
+        };
+        let base = root.join(format!("YunXiBot-verify-{}", std::process::id()));
+        let allowed = base.join("allowed");
+        let medium = std::env::temp_dir().join(format!("yunxi-verify-{}", std::process::id()));
+        let denied = medium.join("denied");
+
+        let ok = verify_write_isolation(&allowed, &denied)
+            .map(|r| r.is_effective())
+            .unwrap_or(false);
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&medium);
+        ok
+    })
+}
+
+/// 受限令牌：当前进程令牌的受限副本，完整性级别降到 **Low**。
 pub struct RestrictedToken {
     handle: *mut c_void,
 }
@@ -516,7 +400,7 @@ unsafe impl Sync for RestrictedToken {}
 
 impl RestrictedToken {
     /// 以当前进程令牌为基础，铸造带能力 SID 限制的令牌。
-    pub fn create(sid: &CapabilitySid) -> Result<Self, TokenError> {
+    pub fn create() -> Result<Self, TokenError> {
         let mut base: *mut c_void = std::ptr::null_mut();
         // SAFETY: 取当前进程令牌
         let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_FOR_LAUNCH, &mut base) };
@@ -524,30 +408,23 @@ impl RestrictedToken {
             return Err(TokenError::Token(unsafe { GetLastError() }));
         }
 
-        // 限制列表只需要能力 SID。
+        // **刻意不带限制 SID 列表。**
         //
-        // 读走正常令牌，不需要 Everyone 兜底；写只认限制 SID，
-        // 所以在未授予能力 SID 的目录里一律写不进去。
-        //
-        // （早先版本把 Everyone 也放进来，那是基于"读也要过限制检查"的错误
-        // 假设；实测证明那种组合下子进程根本起不来。）
-        let restrict_entries = [SidAndAttributes {
-            sid: sid.as_ptr(),
-            attributes: 0,
-        }];
-
+        // 实测：限制列表只要非空，子进程就以 `STATUS_DLL_INIT_FAILED` 结束——
+        // 因为限制列表对读写一视同仁，而进程启动本身就需要访问那些只授权给
+        // 用户 SID 的对象。写入隔离改由**完整性级别**承担（见下）。
         let mut restricted: *mut c_void = std::ptr::null_mut();
-        // SAFETY: 未用到的计数传 0 且指针传 null；restrict 数组有 1 项
+        // SAFETY: 所有计数为 0 且指针为 null，即不设任何限制列表
         let ok = unsafe {
             CreateRestrictedToken(
                 base,
-                DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
+                DISABLE_MAX_PRIVILEGE,
                 0,
                 std::ptr::null(),
                 0,
                 std::ptr::null(),
-                restrict_entries.len() as u32,
-                restrict_entries.as_ptr(),
+                0,
+                std::ptr::null(),
                 &mut restricted,
             )
         };
@@ -572,6 +449,33 @@ impl RestrictedToken {
         unsafe { CloseHandle(restricted) };
         if ok == 0 {
             return Err(TokenError::Token(unsafe { GetLastError() }));
+        }
+
+        // —— 关键一步：把完整性级别降到 Low ——
+        //
+        // 这一步才是真正产生写入隔离的地方：低完整性进程写不进任何
+        // 中完整性的对象（用户目录里的文件默认都是中完整性），
+        // 而**读不受影响**，所以进程能正常启动运行。
+        let low = LowIntegritySid::new()?;
+        let mut label = TokenMandatoryLabel {
+            label: SidAndAttributes {
+                sid: low.sid,
+                attributes: SE_GROUP_INTEGRITY,
+            },
+        };
+        // SAFETY: label 是 #[repr(C)] 的 TOKEN_MANDATORY_LABEL，长度取实际大小
+        let ok = unsafe {
+            SetTokenInformation(
+                primary,
+                TOKEN_INTEGRITY_LEVEL,
+                &mut label as *mut _ as *mut c_void,
+                std::mem::size_of::<TokenMandatoryLabel>() as u32,
+            )
+        };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            unsafe { CloseHandle(primary) };
+            return Err(TokenError::Token(code));
         }
 
         Ok(Self { handle: primary })
@@ -873,6 +777,54 @@ impl IsolationReport {
     }
 }
 
+/// 定位真正实现了 `__canary-write` 的那个可执行文件。
+///
+/// ⚠️ **不能用 `current_exe()` 了事。** 在 `cargo test` 下它返回的是**测试二进制**
+/// （`target/debug/deps/yunxi_bot_core-<hash>.exe`），那个程序不认识
+/// `__canary-write`，会把它当成测试名过滤器、跑 0 个测试然后正常退出——
+/// 于是自检会得到"两条路径都没写成"的**假结论**，而进程其实压根没执行到那段代码。
+///
+/// 这个坑是真实踩到的：自检连续几轮都在报告"隔离未生效"，直到把 canary 的
+/// stdout 打出来才看见"running 0 tests"。
+fn locate_canary() -> Result<std::path::PathBuf, TokenError> {
+    // 显式覆盖优先，便于在其他布局下使用
+    if let Some(p) = std::env::var_os("YUNXI_BOT_CANARY") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+
+    let me =
+        std::env::current_exe().map_err(|e| TokenError::Invalid(format!("取不到自身路径: {e}")))?;
+
+    // 情况一：自己就是 CLI（`isolation-check` 命令走这条）
+    if me
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.starts_with("yunxi-bot"))
+    {
+        return Ok(me);
+    }
+
+    // 情况二：自己是测试二进制，CLI 在它的上上级目录
+    //   target/debug/deps/<test>.exe  →  target/debug/yunxi-bot.exe
+    if let Some(dir) = me.parent().and_then(|d| d.parent()) {
+        for name in ["yunxi-bot.exe", "yunxi-bot"] {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Ok(cand);
+            }
+        }
+    }
+
+    Err(TokenError::Invalid(format!(
+        "找不到 canary 可执行文件（自身为 {}）。\
+         请先 `cargo build`，或用 YUNXI_BOT_CANARY 指定路径。",
+        me.display()
+    )))
+}
+
 /// **写入隔离自检。**
 ///
 /// 真起一个 canary 子进程，让它尝试写两个路径：
@@ -886,12 +838,9 @@ pub fn verify_write_isolation(
     allowed: &std::path::Path,
     denied: &std::path::Path,
 ) -> Result<IsolationReport, TokenError> {
-    let sid = CapabilitySid::mint()?;
-    grant_write(&sid, allowed)?;
-    let token = RestrictedToken::create(&sid)?;
+    let token = RestrictedToken::create()?;
 
-    let canary =
-        std::env::current_exe().map_err(|e| TokenError::Invalid(format!("取不到自身路径: {e}")))?;
+    let canary = locate_canary()?;
 
     std::fs::create_dir_all(allowed).ok();
     std::fs::create_dir_all(denied).ok();
@@ -933,30 +882,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mints_distinct_capability_sids() {
-        let a = CapabilitySid::mint().expect("铸造 SID");
-        let b = CapabilitySid::mint().expect("铸造 SID");
-        assert_ne!(a.as_ptr(), b.as_ptr(), "两次铸造应是不同的分配");
-    }
-
-    #[test]
-    fn creates_a_restricted_token() {
-        let sid = CapabilitySid::mint().expect("铸造 SID");
-        let token = RestrictedToken::create(&sid);
+    fn creates_a_low_integrity_restricted_token() {
+        let token = RestrictedToken::create();
         assert!(token.is_ok(), "建受限令牌失败: {:?}", token.err());
     }
 
     #[test]
-    fn grants_write_ace_without_error() {
-        let dir = std::env::temp_dir().join(format!("yunxi-acl-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("建目录");
-        let sid = CapabilitySid::mint().expect("铸造 SID");
+    fn low_integrity_root_is_available_and_writable() {
+        // 低完整性可写区依赖系统预置的 AppData\LocalLow，缺了它整个机制不成立
+        let root = low_integrity_root().expect("应有 LocalLow");
+        assert!(root.is_dir(), "LocalLow 应存在: {}", root.display());
+        let probe = root.join(format!("YunXiBot-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&probe).expect("中完整性父进程应能写入 LocalLow");
+        let _ = std::fs::remove_dir_all(&probe);
+    }
+
+    #[test]
+    fn sandbox_dir_lives_under_low_integrity_root() {
+        let sb = sandbox_dir().expect("建沙箱");
+        let root = low_integrity_root().expect("应有 LocalLow");
         assert!(
-            grant_write(&sid, &dir).is_ok(),
-            "给目录加 ACE 失败: {:?}",
-            grant_write(&sid, &dir).err()
+            sb.starts_with(&root),
+            "沙箱必须位于低完整性根下，否则里面写不进去: {}",
+            sb.display()
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -990,20 +939,6 @@ mod tests {
     }
 
     #[test]
-    fn security_api_paths_drop_trailing_separator() {
-        use std::path::Path;
-        // 这是实测踩到的坑：带结尾反斜杠会让 GetNamedSecurityInfoW 返回 87
-        assert_eq!(
-            for_security_api(Path::new(r"D:\temp\")),
-            r"D:\temp",
-            "结尾反斜杠必须去掉"
-        );
-        assert_eq!(for_security_api(Path::new(r"D:\temp")), r"D:\temp");
-        // 但根目录必须保留反斜杠，否则 "C:\" 会变成毫无意义的 "C:"
-        assert_eq!(for_security_api(Path::new(r"C:\")), r"C:\");
-    }
-
-    #[test]
     fn env_block_is_double_null_terminated() {
         let block = build_env_block(&[("A".into(), "1".into())]);
         assert_eq!(block.last(), Some(&0));
@@ -1026,37 +961,42 @@ mod tests {
     /// 这正是期望行为：上层据此拒绝声称提供写入隔离。
     #[test]
     fn self_test_never_claims_isolation_it_cannot_deliver() {
-        let base = std::env::temp_dir().join(format!("yunxi-canary-{}", std::process::id()));
+        // 授权区放在系统预置的低完整性目录（AppData\LocalLow）下——
+        // 那里低完整性子进程写得进去，而用户的中完整性文件一个都动不了。
+        let low_root = low_integrity_root().expect("取低完整性根目录");
+        let base = low_root.join(format!("YunXiBot-canary-{}", std::process::id()));
         let allowed = base.join("allowed");
-        let denied = base.join("denied");
-        std::fs::create_dir_all(&allowed).expect("建允许目录");
-        std::fs::create_dir_all(&denied).expect("建禁止目录");
+
+        let medium_root = std::env::temp_dir().join(format!("yunxi-canary-{}", std::process::id()));
+        let denied = medium_root.join("denied");
+        std::fs::create_dir_all(&denied).expect("建中完整性目录");
 
         let report = match verify_write_isolation(&allowed, &denied) {
             Ok(r) => r,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&base);
+                let _ = std::fs::remove_dir_all(&medium_root);
                 eprintln!("自检无法完成（{e}），因此不能声称提供写入隔离");
                 return;
             }
         };
         let verdict = report.explain();
         let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&medium_root);
 
-        if !report.is_effective() {
-            // 当前实现下的预期路径。隔离不可用时绝不声称可用。
-            eprintln!("写入隔离当前不可用：{verdict}");
-            eprintln!(
-                "  观测: allowed_written={} denied_written={} exit={}",
-                report.allowed_written, report.denied_written, report.exit_code
-            );
-            return;
-        }
-
-        // 万一它真的生效了，必须两条都成立，不能只看一半
         assert!(
-            report.allowed_written && !report.denied_written,
-            "自检判定与观测不一致：{verdict}"
+            report.is_effective(),
+            "写入隔离未通过自检，因此不能声称提供写入隔离。\n\
+             判定: {verdict}\n\
+             观测: allowed_written={} denied_written={} exit={} (0x{:08X})\n\
+             canary stdout: {}\n\
+             canary stderr: {}",
+            report.allowed_written,
+            report.denied_written,
+            report.exit_code,
+            report.exit_code as u32,
+            report.stdout.trim(),
+            report.stderr.trim()
         );
     }
 }
