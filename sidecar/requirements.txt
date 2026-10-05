@@ -1,0 +1,15 @@
+# YunXi Bot 决策层（sidecar）的 Python 依赖
+#
+# 装法：
+#   python -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r sidecar/requirements.txt
+# 或直接用一键脚本：pwsh scripts/setup.ps1
+#
+# 关于 verdictml：PyPI 上已有 0.1.0，但官方 README 推荐从仓库装（修得更勤）。
+# 这里固定到仓库来源，实测可用。它会把 sentence-transformers / transformers /
+# torch(CPU) 一并带进来，venv 大约 1 GB——这是跑编码器模型的必要成本。
+verdictml @ git+https://github.com/Manavarya09/verdict
+
+# 注意：即使只要 ONNX 引擎，安装期仍会拉 torch（sentence-transformers 的基础
+# 依赖需要它）。只有**运行时** `Verdict(engine="onnx")` 才不需要 torch。
+# 想彻底免 torch 请用 `verdictml[onnx]` 并自行裁剪依赖，但那样没被实测过。

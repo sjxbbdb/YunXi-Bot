@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "note": "决策模型权重清单。权重不进 git（单文件 448.8MB 超过 GitHub 的 100MiB 硬上限），作为 GitHub Release 资产分发；用 scripts/fetch_model.py 下载并校验。sha256_archive 由 scripts/build_model_release.py 写入。",
+  "models": [
+    {
+      "name": "verdict-small",
+      "dir": "verdict-small",
+      "archive": "verdict-small.zip",
+      "release_tag": "models-v1",
+      "source_repo": "Manav2op/verdict-small",
+      "source_url": "https://huggingface.co/Manav2op/verdict-small",
+      "license": "Apache-2.0",
+      "vendor": "Verdict (verdictml)",
+      "encoder": "intfloat/multilingual-e5-small (118M, MIT)",
+      "required_files": [
+        "model.safetensors",
+        "config.json",
+        "tokenizer.json"
+      ],
+      "sha256_archive": "ccba1f2d65ac8db23940502a4ab499754eb76f89662b7002f10f236dff6540e7",
+      "size_bytes": 364679983,
+      "file_count": 10,
+      "revision": "085a41e0ea269f00483dd202a286cfb68f7aa63a"
+    }
+  ]
+}

@@ -56,6 +56,7 @@ state（含你的偏好与约束）+ 类型化问题
 | **`memory` — 记忆层** | ✅ 事件溯源投影；`build_decision_state` 主动裁剪 state |
 | **`companion` — 陪伴层** | ✅ 记忆 → 模型判断 → **约束只能更保守** |
 | **`think` — 思考层** | ✅ Agnes（OpenAI 兼容）接入 + 本地限流 + 错误可分重试 |
+| **`sidecar` — 决策模型接入** | ✅ Verdict 后端（选项顺序不变 + 估形弃权 + 可离线） |
 | **`agent` — Agent 循环** | ✅ 记忆投影 → 本地判断 → 约束收紧 → 远端表达 → 落台账 |
 | 常驻守护 | ✅ 单实例锁、连续失败熔断、开机自启 |
 | 入口层（语音 / 微信 / Web） | ⬜ 待实现（当前是 CLI） |
@@ -326,3 +327,49 @@ cargo run -- daemon --agent             # 常驻循环里开启判断（每 12 �
 
 `sidecar/mock_laya.py` 是一个**测试替身**：实现相同的线协议但按脚本作答，
 让"判断 → 约束 → 表达 → 台账"这条链路能在不下载 640MB 模型的情况下被验证。
+## 安装（一条命令）
+
+```powershell
+git clone https://github.com/sjxbbdb/YunXi-Bot
+cd YunXi-Bot
+pwsh scripts/setup.ps1        # 建 venv + 装依赖 + 拉决策模型权重（校验 SHA256）
+cargo build
+cargo run -- isolation-check  # 验证写入隔离真的生效
+```
+
+`setup.ps1` 会做三件事：建 `.venv`、装 Python 依赖（约 1GB，含 torch CPU 版）、
+**拉取决策模型权重（约 350MB，校验 SHA256）**。跑完即可用。
+
+### 决策模型权重为什么不在 git 里
+
+单个 `model.safetensors` 有 **448.8 MB**，超过 GitHub 的 **100 MiB 单文件硬上限**，
+推送会被直接拒绝。所以：
+
+| | 放在哪 | 大小 |
+|---|---|---|
+| 编码器权重 | [GitHub Release `models-v1`](https://github.com/sjxbbdb/YunXi-Bot/releases/tag/models-v1) | 347.7 MB |
+| 下载+校验脚本、清单、模型卡 | **仓库里** | 几十 KB |
+| 我们 fit 出来的决策头 + 校准 | **仓库里**（几十 KB，这才是项目的资产） | —— |
+
+```bash
+python scripts/fetch_model.py          # 下载 + 校验 + 解压到 <数据目录>/models/
+python scripts/fetch_model.py --check  # 只校验，不下载
+```
+
+权重落在 `<数据目录>/models/verdict-small/`，sidecar 优先读它——
+**实测在 `HF_HUB_OFFLINE=1` 下正常加载（7 秒），之后完全离线可用。**
+
+### 决策模型为什么是 Verdict
+
+选它不是为了基准分，是因为它**唯一同时满足这个项目的三条硬条件**：
+
+| 硬条件 | 出处 | Laya | **Verdict** |
+|---|---|---|---|
+| 中文可用 | 全程中文 | ⚠️ 非拉丁文字会静默失败 | ✅ multilingual-e5-small |
+| 概率可当阈值用 | ADR §7.3 第 5 条 | ❌ ECE 0.466，且未带拟合温度 | ✅ ECE 0.014–0.030，且如实报 `calibrated` |
+| 选项顺序不影响答案 | 判断"该不该打扰"，换问法变答案不可接受 | ❌ 翻转率 0.23 | ✅ 结构上保证（已实测正序/逆序一致） |
+
+外加：**`/v1/systemone` 线协议与 Laya 一致**，所以换后端 **Rust 侧一行未改**。
+
+⚠️ **默认未校准**（`calibrated: false`）。ADR §7.3 第 5 条禁止拿未校准的概率卡阈值，
+所以 Rust 侧目前只用 argmax，不用它的概率做阈值判断。

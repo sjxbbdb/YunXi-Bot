@@ -13,6 +13,14 @@ data/
 *.lock
 *.log
 
+# 打包产物（模型 zip 约 356MB，只上传到 Release，绝不入库）
+dist/
+
+# Python 虚拟环境（含 torch，约 1GB，绝不入库）
+.venv/
+__pycache__/
+*.pyc
+
 # 本地配置与密钥
 .env
 .env.*
