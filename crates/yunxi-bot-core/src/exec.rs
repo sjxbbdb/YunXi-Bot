@@ -91,16 +91,34 @@ where
 pub enum IsolationLevel {
     /// 仅进程隔离。未实施任何 OS 级强制。
     ProcessOnly,
+    /// Windows Job Object：进程树强制回收 + 进程数/内存上限。
+    ///
+    /// **不含文件系统写入隔离**——子进程仍以当前用户身份运行，能写用户能写的
+    /// 任何位置。不要把它当作沙箱。
+    WindowsJobObject,
     /// Windows：受限令牌 + 能力 SID 的写入隔离。
-    WindowsAclWrite,
+    ///
+    /// **尚未实现。** 这是 ADR D7 的目标形态，需要 `CreateRestrictedToken` +
+    /// `CreateProcessAsUser` + 能力 SID 构造。在它真正可用之前，
+    /// [`IsolationRequirement::RequireOsWriteIsolation`] 会**拒绝执行**，
+    /// 而不是退回无隔离运行。
+    WindowsRestrictedToken,
 }
 
 impl IsolationLevel {
     pub fn describe(self) -> &'static str {
         match self {
             IsolationLevel::ProcessOnly => "进程隔离（未实施 OS 级强制）",
-            IsolationLevel::WindowsAclWrite => "Windows 受限令牌 + 能力 SID 写入隔离",
+            IsolationLevel::WindowsJobObject => {
+                "Windows Job Object（进程树回收 + 资源上限；不含写入隔离）"
+            }
+            IsolationLevel::WindowsRestrictedToken => "Windows 受限令牌 + 能力 SID 写入隔离",
         }
+    }
+
+    /// 是否提供了文件系统写入隔离。
+    pub fn provides_write_isolation(self) -> bool {
+        matches!(self, IsolationLevel::WindowsRestrictedToken)
     }
 }
 
@@ -119,6 +137,10 @@ pub struct ExecOptions {
     pub cwd: PathBuf,
     pub timeout_ms: u64,
     pub isolation: IsolationRequirement,
+    /// Job Object 的单进程内存上限（字节）。`None` 表示不限制。
+    pub memory_limit_bytes: Option<u64>,
+    /// Job Object 的进程数上限。`None` 表示不限制。
+    pub max_processes: Option<u32>,
 }
 
 impl Default for ExecOptions {
@@ -127,6 +149,8 @@ impl Default for ExecOptions {
             cwd: PathBuf::from("."),
             timeout_ms: 60_000,
             isolation: IsolationRequirement::ProcessOnly,
+            memory_limit_bytes: None,
+            max_processes: None,
         }
     }
 }
@@ -185,10 +209,21 @@ impl std::error::Error for ExecError {}
 
 /// 当前平台能提供的隔离级别。
 ///
-/// 注意：Windows 的受限令牌实现（ADR D7）**尚未落地**，所以这里如实返回
-/// `ProcessOnly`。等它实现后，这里才会返回 `WindowsAclWrite`。
+/// 如实反映现实：
+/// - Windows：提供 Job Object（进程树回收 + 资源上限），**但不提供写入隔离**；
+/// - 其他平台：只有进程隔离。
+///
+/// 写入隔离（`WindowsRestrictedToken`）尚未实现，因此
+/// [`IsolationRequirement::RequireOsWriteIsolation`] 至今仍然会拒绝执行。
 pub fn available_isolation() -> IsolationLevel {
-    IsolationLevel::ProcessOnly
+    #[cfg(windows)]
+    {
+        IsolationLevel::WindowsJobObject
+    }
+    #[cfg(not(windows))]
+    {
+        IsolationLevel::ProcessOnly
+    }
 }
 
 fn truncate(mut s: String) -> String {
@@ -237,7 +272,7 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
     // 诚实隔离：拿不到要求的级别就拒绝，绝不降级为无隔离派生
     let isolation = available_isolation();
     if opts.isolation == IsolationRequirement::RequireOsWriteIsolation
-        && isolation != IsolationLevel::WindowsAclWrite
+        && !isolation.provides_write_isolation()
     {
         return Err(ExecError::IsolationUnavailable {
             required: opts.isolation,
@@ -259,6 +294,27 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
 
     let mut child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
     let pid = child.id();
+
+    // 放入 Job Object：进程树强制回收 + 资源上限。
+    //
+    // 必须在子进程刚起来时立刻 assign，趁它还没派生出孙进程；
+    // 晚一步就会有孙子跑在 Job 之外，回收不干净。
+    //
+    // 这里刻意**不**把 assign 失败当作致命错误：Job 是"额外的"护栏，
+    // 而诚实隔离要求我们把实际达到的级别如实报出去（见 `effective_level`）。
+    let mut effective_level = IsolationLevel::ProcessOnly;
+    #[cfg(windows)]
+    let _job = match crate::win_job::JobObject::create(opts.memory_limit_bytes, opts.max_processes)
+    {
+        Ok(job) => match job.assign(&child) {
+            Ok(()) => {
+                effective_level = IsolationLevel::WindowsJobObject;
+                Some(job)
+            }
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
 
     // 管道必须边跑边读：等进程结束再读会在输出超过管道缓冲时死锁
     let mut out_pipe = child.stdout.take();
@@ -311,7 +367,9 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
         stderr: truncate(stderr),
         timed_out,
         duration_ms: started.elapsed().as_millis() as u64,
-        isolation,
+        // 报告**实际达到**的级别，而不是"平台理论上支持的"。Job 建失败时
+        // 这里会如实回落到 ProcessOnly，不会把没做到的说成做到了。
+        isolation: effective_level,
     })
 }
 
@@ -410,6 +468,10 @@ mod tests {
             "got={}",
             out.stdout
         );
+        // Windows 上现在应达到 Job Object 级；若 Job 建或分配失败则如实回落
+        #[cfg(windows)]
+        assert_eq!(out.isolation, IsolationLevel::WindowsJobObject);
+        #[cfg(not(windows))]
         assert_eq!(out.isolation, IsolationLevel::ProcessOnly);
     }
 

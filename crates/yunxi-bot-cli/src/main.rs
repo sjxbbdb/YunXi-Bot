@@ -518,6 +518,8 @@ fn cmd_run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             cwd: job.spec.cwd.clone().into(),
             timeout_ms: job.spec.timeout_ms,
             isolation: yunxi_bot_core::exec::IsolationRequirement::ProcessOnly,
+            memory_limit_bytes: None,
+            max_processes: None,
         },
     )?;
 

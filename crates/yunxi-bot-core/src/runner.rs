@@ -25,6 +25,10 @@ pub struct TickOptions {
     pub approval: ApprovalPolicy,
     /// 是否要求 OS 级写入隔离。要求而拿不到时任务会失败，而不是无隔离执行。
     pub require_os_isolation: bool,
+    /// 每个任务的单进程内存上限（字节）。`None` 用默认值。
+    pub task_memory_limit_bytes: Option<u64>,
+    /// 每个任务的进程数上限。`None` 用默认值。
+    pub task_max_processes: Option<u32>,
     /// 注入时间戳，便于测试。`None` 表示取当前时间。
     pub now_ms: Option<u64>,
 }
@@ -35,6 +39,10 @@ impl Default for TickOptions {
             approval: ApprovalPolicy::Ask,
             require_os_isolation: false,
             now_ms: None,
+            // 默认给每个任务一道资源护栏：单进程 2 GiB、最多 16 个进程。
+            // 目的是"一个任务不能把常驻进程拖垮"，不是精确配额。
+            task_memory_limit_bytes: Some(2 * 1024 * 1024 * 1024),
+            task_max_processes: Some(16),
         }
     }
 }
@@ -160,6 +168,9 @@ pub fn tick(ledger: &mut Ledger, opts: &TickOptions) -> Result<TickReport, Ledge
                 } else {
                     IsolationRequirement::ProcessOnly
                 },
+                // 每个任务默认给一道资源上限，避免单个任务把常驻进程拖垮
+                memory_limit_bytes: opts.task_memory_limit_bytes,
+                max_processes: opts.task_max_processes,
             },
         );
 
