@@ -155,6 +155,15 @@ pub struct ToolRunner<'a> {
     approver: &'a mut dyn Approver,
     decider: Option<&'a dyn Decider>,
     ctx: ToolContext,
+    /// 本轮的思考模式。**每一轮请求都要带上它。**
+    ///
+    /// 第一版这里没有这个字段，于是工具循环发的请求一个都不带思考模式，
+    /// 全部落到服务端默认——**"复杂任务开思考"这个决策在工具路径上被静默丢掉了**。
+    /// 对 DeepSeek 恰好默认是开，所以行为看起来对；但记录显示"思考调用 0/6"，
+    /// 而如果策略是"关"，它照样会思考，输出 token 翻 2.5 倍且没人知道。
+    ///
+    /// `None` 表示不指定（不发这个字段），**不是"关"**。
+    thinking: Option<crate::think::Thinking>,
     /// 一轮对话最多几次工具往返。
     pub max_rounds: u32,
 }
@@ -178,8 +187,15 @@ impl<'a> ToolRunner<'a> {
             approver,
             decider: None,
             ctx,
+            thinking: None,
             max_rounds: DEFAULT_MAX_ROUNDS,
         }
+    }
+
+    /// 设定本轮的思考模式。**路由决定的，每个任务一次。**
+    pub fn with_thinking(mut self, t: Option<crate::think::Thinking>) -> Self {
+        self.thinking = t;
+        self
     }
 
     pub fn with_decider(mut self, decider: &'a dyn Decider) -> Self {
@@ -219,6 +235,11 @@ impl<'a> ToolRunner<'a> {
         for round in 1..=self.max_rounds {
             let messages = layout.build();
             let mut req = ThinkRequest::new(messages).with_max_tokens(max_tokens);
+            // **每一轮都要带思考模式。** 只在第一轮带会让后续轮次静默退回默认，
+            // 而"哪一轮思考了"在账单上分不出来。
+            if let Some(t) = self.thinking {
+                req = req.with_thinking(t);
+            }
             if !specs.is_empty() {
                 req = req.with_tools(specs.clone());
             }
@@ -959,6 +980,73 @@ mod tests {
             .run(&thinker, &mut layout, 512)
             .unwrap();
         assert_eq!(counter.count(), 0);
+    }
+
+    #[test]
+    fn thinking_mode_is_forwarded_to_every_round() {
+        // **回归：工具循环曾经把思考模式整个丢掉。**
+        //
+        // 表现很隐蔽：对 DeepSeek 服务端默认就是开，所以行为"看起来对"，
+        // 但台账记的是"思考调用 0 次"；而如果策略是"关"，它照样会思考，
+        // 输出 token 翻 2.5 倍而且没人知道。
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ScriptTool::new("t", Capability::ReadOnly)))
+            .unwrap();
+        let mut ap = RefusingApprover;
+        let thinker = ScriptThinker::new(vec![
+            ScriptThinker::tool_reply(vec![call_json("c1", "t", json!({}))]),
+            ScriptThinker::tool_reply(vec![call_json("c2", "t", json!({}))]),
+            ScriptThinker::text_reply("done"),
+        ]);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("q");
+        runner(&reg, ToolPolicy::default(), &mut ap)
+            .with_thinking(Some(crate::think::Thinking::Enabled))
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+
+        for (i, r) in thinker.requests().iter().enumerate() {
+            assert_eq!(
+                r.thinking,
+                Some(crate::think::Thinking::Enabled),
+                "第 {} 轮丢了思考模式",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_thinking_is_also_forwarded() {
+        // 另一半同样重要：决定"关"的时候不能被默认值悄悄打开
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ScriptTool::new("t", Capability::ReadOnly)))
+            .unwrap();
+        let mut ap = RefusingApprover;
+        let thinker = ScriptThinker::new(vec![ScriptThinker::text_reply("done")]);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("q");
+        runner(&reg, ToolPolicy::default(), &mut ap)
+            .with_thinking(Some(crate::think::Thinking::Disabled))
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+        assert_eq!(
+            thinker.requests()[0].thinking,
+            Some(crate::think::Thinking::Disabled)
+        );
+    }
+
+    #[test]
+    fn no_thinking_setting_sends_no_field() {
+        // `None` 是"不指定"，不是"关"。Agnes 不吃这个字段，给它塞就是错的。
+        let reg = ToolRegistry::new();
+        let mut ap = RefusingApprover;
+        let thinker = ScriptThinker::new(vec![ScriptThinker::text_reply("done")]);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("q");
+        runner(&reg, ToolPolicy::default(), &mut ap)
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+        assert_eq!(thinker.requests()[0].thinking, None);
     }
 
     // ---- 缓存纪律 ----

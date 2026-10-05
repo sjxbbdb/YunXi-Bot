@@ -420,8 +420,18 @@ impl Rule {
 
     /// 这条规则覆盖这次调用吗。
     ///
-    /// 粒度用**前缀匹配**：规则写 `D:\notes` 能覆盖 `D:\notes\a.md`。
-    /// 用前缀而不是相等，是因为"允许读这个目录"才是使用者想表达的意思。
+    /// 粒度用**边界前缀匹配**，不是字符串前缀匹配。这个区别是安全相关的：
+    ///
+    /// ```text
+    /// 规则 https://docs.rs   字符串前缀会命中 https://docs.rs.evil.example/   ← 洞
+    /// 规则 D:\notes          字符串前缀会命中 D:\notes-evil\                 ← 同一个洞
+    /// ```
+    ///
+    /// 也就是说使用者写"总是允许抓 docs.rs"，结果放行了攻击者的域名。
+    /// 所以匹配要求 rule 之后**紧跟着一个分隔符**（或整串相等）。
+    ///
+    /// 这个洞是 web-writer 在自己的模块注释里报上来的——**工具实现者比接口
+    /// 作者更容易发现边界规则的漏洞**，因为它就在他每天要写 specifier 的地方。
     pub fn matches(&self, tool: &str, specifier: Option<&str>) -> bool {
         if self.tool != tool {
             return false;
@@ -429,9 +439,30 @@ impl Rule {
         match (&self.specifier, specifier) {
             (None, _) => true,
             (Some(_), None) => false,
-            (Some(rule), Some(actual)) => actual.starts_with(rule.as_str()),
+            (Some(rule), Some(actual)) => boundary_match(rule, actual),
         }
     }
+}
+
+/// 分隔符：路径与 URL 都算。**两类 specifier 共用一套规则**，
+/// 因为它们要防的是同一个东西——"前缀相同但其实是别的主体"。
+const SEPARATORS: [char; 2] = ['/', '\\'];
+
+/// 带边界的前缀匹配。
+///
+/// `rule` 是 `actual` 的前缀**并且**后面紧跟分隔符（或完全相等）才算命中。
+pub fn boundary_match(rule: &str, actual: &str) -> bool {
+    if actual == rule {
+        return true;
+    }
+    let Some(rest) = actual.strip_prefix(rule) else {
+        return false;
+    };
+    // 规则自己已经以分隔符结尾 → 命中的就是那个目录/路径本身
+    if rule.ends_with(SEPARATORS) {
+        return true;
+    }
+    rest.starts_with(SEPARATORS)
 }
 
 /// 审批策略。Default 是手写的，见下方说明。
@@ -909,6 +940,74 @@ mod tests {
             )
             .is_allow()
         );
+    }
+
+    /// **安全回归：前缀相同但不是同一个主体。**
+    ///
+    /// 字符串前缀匹配会让规则 `https://docs.rs` 命中
+    /// `https://docs.rs.evil.example/`——使用者写"总是允许抓 docs.rs"，
+    /// 结果放行了攻击者的域名。路径上是同一个洞（`D:\notes` vs `D:\notes-evil`）。
+    ///
+    /// 这个洞是 web-writer 在自己的模块注释里报上来的：工具实现者比接口作者
+    /// 更容易发现边界规则的漏洞，因为它就在他每天要写 specifier 的地方。
+    #[test]
+    fn rule_matching_requires_a_boundary_not_just_a_prefix() {
+        // 域名：点号后面的东西是另一个域
+        assert!(!boundary_match(
+            "https://docs.rs",
+            "https://docs.rs.evil.example/x"
+        ));
+        // 路径：连字符后面的东西是另一个目录
+        assert!(!boundary_match("D:\\notes", "D:\\notes-evil\\a.md"));
+        // 正常的前缀仍要命中
+        assert!(boundary_match("https://docs.rs", "https://docs.rs"));
+        assert!(boundary_match("https://docs.rs", "https://docs.rs/rmcp"));
+        assert!(boundary_match("D:\\notes", "D:\\notes\\a.md"));
+        // 规则自己带分隔符也算
+        assert!(boundary_match("D:\\notes\\", "D:\\notes\\a.md"));
+        assert!(boundary_match("https://docs.rs/", "https://docs.rs/rmcp"));
+        // 不相关的不命中
+        assert!(!boundary_match("https://docs.rs", "https://rust-lang.org"));
+    }
+
+    #[test]
+    fn the_domain_hole_is_closed_end_to_end() {
+        // 同一件事从 gate 走一遍，确保不是只修了辅助函数
+        let t = FakeTool::new("web_fetch", Capability::Network).with_spec(SpecKind::Domain);
+        let policy = ToolPolicy {
+            allow: vec![Rule::scoped("web_fetch", "https://docs.rs")],
+            deny: Vec::new(),
+            inert_inside_cwd_is_free: false,
+        };
+        assert!(
+            gate(
+                &t,
+                &json!({ "url": "https://docs.rs/rmcp" }),
+                &policy,
+                &ctx(),
+                None
+            )
+            .is_allow()
+        );
+        assert!(
+            !gate(
+                &t,
+                &json!({ "url": "https://docs.rs.evil.example/steal" }),
+                &policy,
+                &ctx(),
+                None
+            )
+            .is_allow(),
+            "前缀相同的攻击者域名被放行了"
+        );
+    }
+
+    #[test]
+    fn a_shorter_rule_does_not_swallow_a_longer_sibling() {
+        // 规则写工具名的一部分不该命中另一个工具
+        let r = Rule::tool("read");
+        assert!(!r.matches("read_file", None));
+        assert!(r.matches("read", None));
     }
 
     #[test]

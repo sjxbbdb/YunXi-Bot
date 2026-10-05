@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use yunxi_bot_core::costlog::CallRecord;
+use yunxi_bot_core::decide::Decider;
 use yunxi_bot_core::task::TaskError;
 use yunxi_bot_core::task::engine::{
     OPTIONS_MAX_TOKENS, ObserveRequest, PLAN_MAX_TOKENS, PlanRequest, STEP_MAX_TOKENS, StepRequest,
@@ -31,6 +32,7 @@ use yunxi_bot_core::think::{
     ModelSpec, OpenAiThinker, ReasoningEffort, Routing, ThinkError, ThinkRequest, Thinker,
     ThinkerConfig, Thinking,
 };
+use yunxi_bot_core::tool::{Approver, RefusingApprover, ToolPolicy, ToolRegistry, ToolRunner};
 
 /// 拆解用的系统提示词。**必须是纯函数**——掺进时间或任务 id 就会毁掉前缀缓存。
 pub const PLANNER_SYSTEM: &str = "\
@@ -102,11 +104,23 @@ impl Intent {
 pub struct ChatHandler {
     home: PathBuf,
     /// 已构造的客户端。按 provider 缓存，避免每步都重新读密钥文件。
-    thinkers: BTreeMap<String, OpenAiThinker>,
+    ///
+    /// 存 `Arc` 是为了**取出来时不再借住 `self`**：工具循环同时要可变借
+    /// `sessions` 和不可变借 `registry`，再挂着一个 `&self` 的客户端借用
+    /// 就会打架。克隆一个 Arc 让借用关系干净。
+    thinkers: BTreeMap<String, std::sync::Arc<OpenAiThinker>>,
     /// 会话布局。key 是（意图，provider）。
     sessions: BTreeMap<SessionKey, PromptLayout>,
     /// 人格 + 硬规则拼成的稳定块。**只在这里存一份。**
     persona: String,
+    /// 可用的工具。空表示这条链路没有工具（行为与加工具之前完全一致）。
+    tools: ToolRegistry,
+    /// 谁能回答"批不批准"。默认谁都不问、一律拒绝。
+    approver: std::sync::Arc<std::sync::Mutex<dyn Approver>>,
+    /// 审批门禁第二层用的本地决策模型。
+    decider: Option<std::sync::Arc<dyn Decider>>,
+    /// 审批策略。
+    policy: ToolPolicy,
 }
 
 impl ChatHandler {
@@ -117,7 +131,38 @@ impl ChatHandler {
             thinkers: BTreeMap::new(),
             sessions: BTreeMap::new(),
             persona: build_persona(persona_name, persona_text, &rules),
+            tools: ToolRegistry::new(),
+            approver: std::sync::Arc::new(std::sync::Mutex::new(RefusingApprover)),
+            decider: None,
+            policy: ToolPolicy::default(),
         }
+    }
+
+    /// 挂上工具。
+    pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// 挂上审批者。**不挂就是 [`RefusingApprover`]**——没人应答等于不执行。
+    pub fn with_approver(
+        mut self,
+        approver: std::sync::Arc<std::sync::Mutex<dyn Approver>>,
+    ) -> Self {
+        self.approver = approver;
+        self
+    }
+
+    /// 挂上本地决策模型（审批门禁第二层）。
+    pub fn with_decider(mut self, decider: std::sync::Arc<dyn Decider>) -> Self {
+        self.decider = Some(decider);
+        self
+    }
+
+    /// 审批策略。
+    pub fn with_policy(mut self, policy: ToolPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// 三套系统提示词 + 人格，也就是三个会话各自的**稳定前缀**。
@@ -139,7 +184,7 @@ impl ChatHandler {
     ///
     /// 造不出来就是配置问题（缺密钥），**直接报错而不是换一个模型偷偷跑**——
     /// 悄悄降级会让"为什么这次答案变差了"永远查不清。
-    fn thinker(&mut self, spec: &ModelSpec) -> Result<&OpenAiThinker, TaskError> {
+    fn thinker(&mut self, spec: &ModelSpec) -> Result<std::sync::Arc<OpenAiThinker>, TaskError> {
         if !self.thinkers.contains_key(spec.provider) {
             let cfg = match spec.provider {
                 "deepseek" => ThinkerConfig::deepseek(),
@@ -151,15 +196,19 @@ impl ChatHandler {
                     spec.provider, spec.key_hint
                 )))
             })?;
-            self.thinkers.insert(spec.provider.to_string(), t);
+            self.thinkers
+                .insert(spec.provider.to_string(), std::sync::Arc::new(t));
         }
         self.thinkers
             .get(spec.provider)
+            .cloned()
             .ok_or_else(|| TaskError::Core(yunxi_bot_core::CoreError::Ledger("客户端丢失".into())))
     }
 
     /// 一次带会话的调用。返回模型正文。
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// 内部走的是**工具循环**：没挂工具时它等价于一次普通调用
+    /// （模型不调工具 → 第一轮就结束），所以不需要两条代码路径。
     fn converse(
         &mut self,
         routing: &Routing,
@@ -178,61 +227,118 @@ impl ChatHandler {
             self.sessions.insert(key.clone(), PromptLayout::new(stable));
         }
 
-        let thinking = routing.thinking_field();
-        // 先把易变尾部设好，再把整段发出去
-        let messages = {
-            let layout = self.sessions.get_mut(&key).ok_or_else(|| {
-                TaskError::Core(yunxi_bot_core::CoreError::Ledger("会话丢失".into()))
-            })?;
-            layout.ask(volatile);
-            layout.build()
+        let spec = routing.spec.clone();
+        let inner = self.thinker(&spec)?;
+        // 限流等待与用量记账都包在 thinker 里，于是**每一轮工具调用都享受同样的待遇**。
+        // 把它们放在外面就得每加一个调用点都记得处理一次，迟早漏。
+        let meter = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let metered = MeteredThinker {
+            inner,
+            rpm: spec.rpm,
+            provider: spec.provider,
+            model: spec.model,
+            sink: meter.clone(),
         };
 
-        let req = ThinkRequest::new(messages)
-            .with_max_tokens(max_tokens)
-            .with_thinking(thinking);
-        let spec = routing.spec.clone();
-        let resp = self.call_with_throttle_wait(&spec, &req)?;
+        let approver = self.approver.clone();
+        let mut ap = approver.lock().map_err(|_| {
+            TaskError::Core(yunxi_bot_core::CoreError::Ledger(
+                "审批者被毒化（上一次回答时 panic 了）".into(),
+            ))
+        })?;
 
-        // 记账：**存原始计数**，金额事后按价格表算
-        records.push(
-            CallRecord::new(
-                spec.provider,
-                spec.model,
-                yunxi_bot_core::costlog::peak_now(),
-            )
-            .with_thinking(thinking == Thinking::Enabled)
-            .with_usage(resp.usage),
+        // 借用关系：`sessions` 可变借、`tools` 不可变借——两个不同字段，
+        // 同一个函数体里可以共存。客户端已经克隆成 Arc，不再借住 self。
+        let layout = self
+            .sessions
+            .get_mut(&key)
+            .ok_or_else(|| TaskError::Core(yunxi_bot_core::CoreError::Ledger("会话丢失".into())))?;
+        layout.ask(volatile);
+
+        let ctx = yunxi_bot_core::tool::ToolContext::new(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            yunxi_bot_core::policy::SandboxMode::WorkspaceWrite,
         );
-
-        // 把这一问一答追加进历史，供下一轮复用前缀
-        if let Some(layout) = self.sessions.get_mut(&key) {
-            layout.record_reply(resp.content.clone());
+        let mut runner = ToolRunner::new(&self.tools, self.policy.clone(), &mut *ap, ctx)
+            // **把路由的思考决定带进工具循环。** 忘了这一步，"复杂任务开思考"
+            // 就只在没有工具的那条路径上成立——而几乎每条路径都有工具。
+            .with_thinking(match routing.thinking_field() {
+                Thinking::ServerDefault => None,
+                other => Some(other),
+            });
+        if let Some(d) = &self.decider {
+            runner = runner.with_decider(&**d);
         }
-        Ok(resp.content)
-    }
 
-    /// 调一次模型；碰到**本地**限流就等一等再发，不算失败。
-    fn call_with_throttle_wait(
-        &mut self,
-        spec: &ModelSpec,
+        let outcome = runner.run(&metered, layout, max_tokens).map_err(|e| {
+            TaskError::Core(yunxi_bot_core::CoreError::Ledger(format!(
+                "工具循环失败: {e}"
+            )))
+        })?;
+
+        // 把这一轮所有模型调用的用量一次性交出去
+        if let Ok(mut m) = meter.lock() {
+            records.append(&mut m);
+        }
+        // "总是允许"的规则要能留到后面的调用——它是使用者的决定，不该每轮重问
+        self.policy = runner.policy().clone();
+
+        Ok(outcome.text)
+    }
+}
+
+/// 包在客户端外面的两件事：**本地限流等待**与**用量记账**。
+///
+/// 包成 `Thinker` 而不是散在调用点，是为了让工具循环的每一轮自动享受同样待遇。
+/// 放在外面就得每加一个调用点都记得处理一次——而"记得"是靠不住的。
+struct MeteredThinker {
+    inner: std::sync::Arc<OpenAiThinker>,
+    rpm: u32,
+    provider: &'static str,
+    model: &'static str,
+    sink: std::sync::Arc<std::sync::Mutex<Vec<CallRecord>>>,
+}
+
+impl Thinker for MeteredThinker {
+    fn think(
+        &self,
         req: &ThinkRequest,
-    ) -> Result<yunxi_bot_core::think::ThinkResponse, TaskError> {
-        let rpm = spec.rpm;
-        let provider = spec.provider;
-        // `.think()` 要借 &self.thinker，闭包又要可变借 self —— 所以先把返回
-        // 值收进作用域，让闭包只捕获 `self`。
-        let thinker = self.thinker(spec)?;
-        retry_throttled(
-            || thinker.think(req),
+    ) -> Result<yunxi_bot_core::think::ThinkResponse, ThinkError> {
+        let rpm = self.rpm;
+        let resp = retry_throttled(
+            || self.inner.think(req),
             |wait| {
                 eprintln!(
                     "  · 本地限流（{rpm} RPM），等 {} ms 后重发",
                     wait.as_millis()
                 );
             },
-        )
-        .map_err(|e| think_error_to_task(e, provider))
+        )?;
+
+        // 记账：**存原始计数**，金额事后按价格表算
+        if let Ok(mut s) = self.sink.lock() {
+            // 只把**显式开的**记成思考。
+            //
+            // 记录成 `None`（不指定）时服务端可能仍然思考——对 DeepSeek 默认就是开。
+            // 所以"没指定"记成 false 是不准确的，但记成 true 更不准确：
+            // 前者低估、后者虚报。选择低估，因为**台账宁可少记也不要虚报**，
+            // 而且调用方（工具循环）现在总会显式指定，这条退路只在不指定的旧路径上生效。
+            let did_think = req.thinking == Some(Thinking::Enabled);
+            s.push(
+                CallRecord::new(
+                    self.provider,
+                    self.model,
+                    yunxi_bot_core::costlog::peak_now(),
+                )
+                .with_thinking(did_think)
+                .with_usage(resp.usage),
+            );
+        }
+        Ok(resp)
+    }
+
+    fn model(&self) -> &str {
+        self.model
     }
 }
 
@@ -273,14 +379,6 @@ where
             }
             other => return other,
         }
-    }
-}
-
-/// 把思考层的错误翻成任务层。**保留可重试性**——执行引擎靠它决定重试还是停。
-fn think_error_to_task(e: ThinkError, provider: &str) -> TaskError {
-    TaskError::StepFailed {
-        step: provider.to_string(),
-        reason: e.to_string(),
     }
 }
 

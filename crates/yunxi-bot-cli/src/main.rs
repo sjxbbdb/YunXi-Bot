@@ -5,8 +5,12 @@
 //!
 //! 外加**任务执行框架**（`do` / `tasks` / `resume`）：人类给一个目标，
 //! 系统拆解、逐步执行、决策点交给本地决策模型，全程留痕。
+//!
+//! 以及**工具层**：模型能读文件、跑命令、抓网页，每个动作都过审批门禁。
 
+mod approval;
 mod chat_handler;
+mod tooling;
 
 use std::path::PathBuf;
 use std::thread;
@@ -86,9 +90,13 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --max-steps <n>       拆解出的步骤上限（默认 12）
       --dry-run             不调模型，只展示会怎么拆分与路由（不花钱）
       --show-prompt         打印三段稳定前缀（核对缓存前提，不花钱）
+      --yes                 自动批准全部工具调用（危险，只给自动化用）
+      --allow <工具[:粒度]>  预批准，可重复。例：--allow read_file:D:\\notes
+      --deny <工具[:粒度]>   拒绝，优先级高于 --allow，可重复
       --provider <名>       强制全程用一个模型：agnes / deepseek
       --thinking <模式>      auto（默认，按任务类型）/ on / off
       --id <名字>           指定任务 id（默认自动生成）
+  yunxi-bot tools             列出工具及其能力类别（不需要模型）
   yunxi-bot tasks             列出执行框架里的任务及其步骤
   yunxi-bot tasks <id>        看一个任务的步骤明细
   yunxi-bot resume <id>       续跑一个停在半路的任务
@@ -173,6 +181,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "run" => cmd_run(rest),
         "do" => cmd_do(rest),
         "tasks" => cmd_tasks(rest),
+        "tools" => cmd_tools(rest),
         "resume" => cmd_resume(rest),
         "cost" => cmd_cost(rest),
         "log" => cmd_log(rest),
@@ -1381,6 +1390,19 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             chat_handler::DEFAULT_PERSONA,
             chat_handler::default_rules(),
         );
+        // 工具 + 审批。**这是模型第一次真的能对世界动手。**
+        let tools = tooling::default_registry().map_err(|e| format!("工具注册失败: {e}"))?;
+        println!("工具      : {} 个（`yunxi-bot tools` 看清单）", tools.len());
+        handler = handler
+            .with_tools(tools)
+            .with_approver(tooling::approver_from_args(args))
+            .with_policy(tooling::policy_from_args(args))
+            .with_decider(std::sync::Arc::new(
+                yunxi_bot_core::decide::LayaDecider::new(
+                    flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
+                ),
+            ));
+        println!();
         Engine::new(&router, &decider, &mut handler, &mut store, budget)
             .with_effort(effort)
             .run(&task_id)?
@@ -1417,6 +1439,41 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             Ok(1)
         }
     }
+}
+
+/// 列出工具及其能力类别。**不需要模型，不花钱。**
+///
+/// 这个命令存在的理由：使用者要写 `--allow` 规则，就得知道工具叫什么、
+/// 粒度是什么、默认会不会问。让人去翻源码是把成本推给使用者。
+fn cmd_tools(_args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::tool::Capability;
+
+    let r = tooling::default_registry().map_err(|e| format!("工具注册失败: {e}"))?;
+    println!("共 {} 个工具：", r.len());
+    println!();
+    println!("{:<14} {:<8} 默认是否免问", "工具", "能力");
+    for (name, cap) in r.capabilities() {
+        let free = match cap {
+            Capability::ReadOnly => "是（只读）",
+            _ => "否（要问人）",
+        };
+        println!("{name:<14} {:<8} {free}", cap.label());
+    }
+    println!();
+    println!("能力类别的含义：");
+    println!("  只读    无副作用。工作区内的读自动放行。");
+    println!("  写入    改文件。每次要问，除非写了 --allow。");
+    println!("  执行    跑命令。每次要问，除非写了 --allow。");
+    println!("  网络    出站请求。单列而不并进只读——它会泄露 URL，");
+    println!("          返回的内容还是不可信数据，会进模型上下文。");
+    println!("  不可逆  对外发送/删除这类。**永远问人**，不接受模型判定，");
+    println!("          且「总是允许」对它无效。");
+    println!();
+    println!("写规则：--allow <工具>[:粒度]，例如");
+    println!("  --allow read_file:D:\\notes      总是允许读这个目录");
+    println!("  --allow run_command:git         总是允许跑 git");
+    println!("  --allow web_fetch:https://docs.rs  总是允许抓这个站");
+    Ok(0)
 }
 
 fn cmd_tasks(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
@@ -1558,6 +1615,18 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         chat_handler::DEFAULT_PERSONA,
         chat_handler::default_rules(),
     );
+    // 续跑时也要挂上同一套工具与策略——否则"同一个任务在 do 和 resume 里
+    // 行为不同"，那种 bug 极难查
+    let tools = tooling::default_registry().map_err(|e| format!("工具注册失败: {e}"))?;
+    handler = handler
+        .with_tools(tools)
+        .with_approver(tooling::approver_from_args(args))
+        .with_policy(tooling::policy_from_args(args))
+        .with_decider(std::sync::Arc::new(
+            yunxi_bot_core::decide::LayaDecider::new(
+                flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
+            ),
+        ));
     let outcome = {
         let mut e =
             Engine::new(&router, &decider, &mut handler, &mut store, budget).with_effort(effort);

@@ -223,6 +223,43 @@ impl OpenAiThinker {
     }
 }
 
+/// 把一条消息渲染成线上格式。
+///
+/// ## 为什么单独一个函数，而不是在 `json!` 里内联
+///
+/// 第一版是在 `json!({...})` 里内联 `role` + `content` 两个字段的。加了工具
+/// 调用之后，那两行**静默丢掉了 `tool_calls` 和 `tool_call_id`**——
+/// 服务端报的是 `messages[3]: missing field tool_call_id`，一个 400，
+/// 而错误信息里完全看不出是"我们没序列化这个字段"。
+///
+/// 单独成函数之后，"一条消息有哪些字段"只有一个地方要维护。
+/// 这也说明内联的 JSON 构造在字段会增长时是个陷阱。
+///
+/// ## 三个细节
+///
+/// 1. **助手消息带 `tool_calls` 时 `content` 必须是 `null`**，不能是空字符串。
+///    带 `content: ""` 的助手工具调用消息会被部分实现拒绝。
+/// 2. 工具结果必须带 `tool_call_id`，否则服务端报 400。
+/// 3. 普通消息不额外打字段——多余字段会让前缀缓存失配。
+fn wire_message(m: &super::Message) -> serde_json::Value {
+    use super::Role;
+
+    let mut v = serde_json::Map::new();
+    v.insert("role".into(), serde_json::json!(m.role.as_str()));
+
+    if m.role == Role::Assistant && !m.tool_calls.is_empty() {
+        v.insert("content".into(), serde_json::Value::Null);
+        v.insert("tool_calls".into(), serde_json::json!(m.tool_calls));
+    } else {
+        v.insert("content".into(), serde_json::json!(m.content));
+    }
+
+    if let Some(id) = &m.tool_call_id {
+        v.insert("tool_call_id".into(), serde_json::json!(id));
+    }
+    serde_json::Value::Object(v)
+}
+
 /// 有线响应形状（OpenAI 兼容）。
 #[derive(Debug, serde::Deserialize)]
 struct WireResponse {
@@ -275,11 +312,7 @@ impl Thinker for OpenAiThinker {
 
         let mut body = serde_json::json!({
             "model": self.config.model,
-            "messages": req
-                .messages
-                .iter()
-                .map(|m| serde_json::json!({ "role": m.role.as_str(), "content": m.content }))
-                .collect::<Vec<_>>(),
+            "messages": req.messages.iter().map(wire_message).collect::<Vec<_>>(),
         });
         if let Some(n) = req.max_tokens {
             body["max_tokens"] = serde_json::json!(n);
