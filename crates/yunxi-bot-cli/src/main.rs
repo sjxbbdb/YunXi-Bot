@@ -54,6 +54,10 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
   yunxi-bot log [-n N]        显示最近 N 条台账事件（默认 20）
   yunxi-bot status            数据目录与台账概况
   yunxi-bot policy            列出权限预设
+  yunxi-bot decide [选项]     演示决策层
+      --demo                只打印六类降级方向表（不需要模型）
+      --endpoint <URL>      决策模型 sidecar 地址
+                            （默认 http://127.0.0.1:17870/decide）
 
   yunxi-bot help              显示本帮助
 ";
@@ -86,6 +90,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "add" => cmd_add(rest),
         "approve" => cmd_approve(rest),
         "policy" => cmd_policy(),
+        "decide" => cmd_decide(rest),
         "tick" => cmd_tick(),
         "daemon" => cmd_daemon(rest),
         "run" => cmd_run(rest),
@@ -464,6 +469,101 @@ fn summarize_data(d: &serde_json::Value) -> String {
         String::new()
     } else {
         format!("  {}", parts.join(" "))
+    }
+}
+
+/// 决策层的演示入口。
+///
+/// `--demo` 不需要模型，直接打印六类降级方向——这是整个降级策略最容易搞错、
+/// 也最该被一眼看清的地方。不带 `--demo` 时真实调用本地 sidecar。
+fn cmd_decide(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::decide::{
+        DecisionClass, DecisionEngine, DegradationDirection, LayaDecider, Question,
+    };
+
+    if args.iter().any(|a| a == "--demo") {
+        println!("决策类别与降级方向（ADR §7.2）:\n");
+        println!("  {:<16} {:<14} {}", "类别", "降级方向", "降级时的保守动作");
+        for c in [
+            DecisionClass::Interrupt,
+            DecisionClass::Escalate,
+            DecisionClass::Irreversible,
+            DecisionClass::Classify,
+            DecisionClass::Urgency,
+            DecisionClass::Anomaly,
+        ] {
+            let dir = match c.direction() {
+                DegradationDirection::FailClosed => "fail-closed",
+                DegradationDirection::FailOpen => "fail-open",
+                DegradationDirection::NotApplicable => "不参与降级",
+            };
+            println!("  {:<16} {:<14} {}", c.label(), dir, c.degraded_action());
+        }
+        println!(
+            "\n注意第 1 行与第 2 行【方向相反】：打扰类不确定就不打扰，\n\
+             安全类不确定就要叫人。统一的「模型挂了走规则兜底」会同时犯两个错。"
+        );
+        return Ok(0);
+    }
+
+    let endpoint = flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide");
+
+    // 内置问题集：直接对应本项目的存在理由——此刻该不该介入
+    let questions = vec![
+        Question::choice(
+            "intervention",
+            "此刻应当如何介入？",
+            &[
+                ("speak", "有值得主动说明的信息，且现在说不打扰"),
+                ("quiet", "没有需要主动说明的，保持静默即可"),
+                ("hold", "有信息但现在不适合说，留到合适的时候"),
+            ],
+        ),
+        Question::noul("needs_support", "使用者此刻是否处于需要情绪支持的状态？"),
+        Question::noul(
+            "is_anomaly",
+            "近期的运行结果中是否出现了显著偏离常态的情况？",
+        ),
+    ];
+
+    let state = serde_json::json!({
+        "local_time": "2026-10-05T19:30:00+08:00",
+        "quiet_hours": false,
+        "unread_events": 3,
+        "last_interaction_hours_ago": 6,
+        "recent_failures": 0,
+    });
+
+    println!("决策模型 : {endpoint}");
+    println!("类别     : 打扰/通知（降级方向 fail-closed）");
+    println!();
+
+    let decider = LayaDecider::new(endpoint);
+    let mut engine = DecisionEngine::new(decider, DecisionClass::Interrupt);
+
+    let req = yunxi_bot_core::decide::DecisionRequest::new(state, questions);
+    let outcome = engine.decide(&req);
+
+    println!("台账数据（降级必须可见）:");
+    println!("{}", serde_json::to_string_pretty(&outcome.ledger_data())?);
+    println!();
+
+    match &outcome {
+        yunxi_bot_core::decide::DecisionOutcome::Decided(r) => {
+            println!("模型作答（注意：这只是策略的输入，不是最终决定）:");
+            println!("  模型 : {}", r.model);
+            for (id, a) in &r.answers {
+                println!("  {id:<16} {a:?}");
+            }
+            println!("\n最终该不该打扰，仍由约束层用阈值与硬规则决定。");
+            Ok(0)
+        }
+        yunxi_bot_core::decide::DecisionOutcome::Degraded { reason, action, .. } => {
+            println!("已降级: {reason}");
+            println!("保守动作: {action}");
+            println!("\n（sidecar 未启动时会走到这里，这是预期行为，不是故障。）");
+            Ok(0)
+        }
     }
 }
 

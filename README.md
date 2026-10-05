@@ -50,9 +50,40 @@ state（含你的偏好与约束）+ 类型化问题
 | `trigger` — 定时 / cron / 文件监听 | ✅ 本地时间 cron、单飞、崩溃残留回收 |
 | `exec` — 子进程执行与凭证剥离 | ✅ 硬超时 + 进程树清理；**拿不到要求的隔离就拒绝执行** |
 | `runner` — 调度循环 | ✅ 把上面五个模块串成一个回合 |
-| 常驻守护 | ✅ `daemon` 子命令（单实例锁、开机自启待补） |
-| 决策层（决策模型接入 + 降级策略） | ⬜ 待实现 |
+| **`decide` — 决策层** | ✅ typed questions、响应校验、六类双向降级、熔断 |
+| 常驻守护 | 🔶 `daemon` 可用（单实例锁、开机自启待补） |
 | 陪伴层 / 记忆层 / 入口层 | ⬜ 待实现 |
+
+### 决策层
+
+```bash
+cargo run -- decide --demo   # 六类降级方向表（不需要模型）
+cargo run -- decide          # 真实调用本地 sidecar
+```
+
+决策模型是**本地 sidecar**，只绑回环：
+
+```bash
+python -m pip install laya                    # 上游决策模型包
+python sidecar/laya_server.py --port 17870    # 中文场景用 laya-multilingual
+```
+
+Rust 侧只认一个固定 JSON 契约，上游库的差异由 sidecar 吸收（见
+[`sidecar/laya_server.py`](sidecar/laya_server.py)）。
+
+**三条硬规则：**
+
+1. **模型的判断是策略的输入，不是策略的替代**——模型给概率，约束层做决定。
+2. **降级方向按类别相反**：打扰类 fail-closed（不打扰），安全类 fail-open（升级给人）。
+3. **不信任模型返回值**：选项不在声明的判据里、概率越界、缺答案 → 一律判为非法并降级。
+
+模型不可用时**返回明确错误让上层降级，绝不伪造答案**。实测：
+
+```text
+$ cargo run -- decide
+已降级: 决策模型不可用：调用超时
+保守动作: 延后聚合，本轮不打扰
+```
 
 架构与边界的完整设计见 **[ADR-0001](docs/adr/0001-架构与边界.md)**。
 
