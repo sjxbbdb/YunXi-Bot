@@ -57,6 +57,7 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
   yunxi-bot uninstall-autostart  取消自启
   yunxi-bot autostart-status     查看自启注册状态
 
+  yunxi-bot isolation-check      隔离自检：真起受限子进程验证写入隔离是否生效
   yunxi-bot supervise [选项]   监督模式：daemon 异常退出时自动重启
       --interval <毫秒>     传给 daemon 的轮间隔（默认 5000）
       --max-restarts <n>    放弃前最多重启几次（默认 10）
@@ -81,6 +82,19 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // 隐藏模式：隔离自检的 canary 子进程。
+    // 它由受限令牌启动，只做一件事——分别尝试写「允许」与「禁止」的路径。
+    // 父进程检查的是**文件是否真的被创建**，而不是本进程的自我报告：
+    // 报告可以撒谎，文件系统状态不会。
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some("__canary-write") {
+        for p in &args[1..] {
+            let _ = std::fs::write(p, b"canary");
+        }
+        std::process::exit(0);
+    }
+
     let code = match run(&args) {
         Ok(c) => c,
         Err(e) => {
@@ -109,6 +123,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "policy" => cmd_policy(),
         "decide" => cmd_decide(rest),
         "companion" => cmd_companion(rest),
+        "isolation-check" => cmd_isolation_check(),
         "install-autostart" => cmd_autostart(AutostartAction::Install),
         "uninstall-autostart" => cmd_autostart(AutostartAction::Uninstall),
         "autostart-status" => cmd_autostart(AutostartAction::Status),
@@ -555,6 +570,78 @@ fn cmd_supervise(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         );
         thread::sleep(Duration::from_secs(backoff));
     }
+}
+
+/// 隔离自检：真起一个 canary 子进程，验证写入隔离是否**真的**生效。
+///
+/// 它存在的理由：隔离的实现里有太多地方可以"错了但不报错"，而那会产出
+/// **看起来实现了隔离、实际毫无限制**的代码。声称必须由实测背书。
+#[cfg(windows)]
+fn cmd_isolation_check() -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::exec;
+    use yunxi_bot_core::win_token;
+
+    let base = std::env::temp_dir().join(format!("yunxi-isocheck-{}", std::process::id()));
+    let allowed = base.join("allowed");
+    let denied = base.join("denied");
+    std::fs::create_dir_all(&allowed)?;
+    std::fs::create_dir_all(&denied)?;
+
+    println!(
+        "平台报告可用隔离级别 : {}",
+        exec::available_isolation().describe()
+    );
+    println!();
+    println!("正在运行写入隔离开自检（会真的起一个受限子进程）...");
+
+    let result = win_token::verify_write_isolation(&allowed, &denied);
+    let _ = std::fs::remove_dir_all(&base);
+
+    match result {
+        Ok(report) => {
+            println!();
+            println!("授权路径写入 : {}", report.allowed_written);
+            println!("未授权路径写入: {}", report.denied_written);
+            println!(
+                "子进程退出码 : {} (0x{:08X})",
+                report.exit_code, report.exit_code as u32
+            );
+            if !report.stdout.trim().is_empty() {
+                println!("stdout: {}", report.stdout.trim());
+            }
+            if !report.stderr.trim().is_empty() {
+                println!("stderr: {}", report.stderr.trim());
+            }
+            println!();
+            println!("判定: {}", report.explain());
+            println!();
+            if report.is_effective() {
+                println!("写入隔离已通过自检。");
+                Ok(0)
+            } else {
+                println!(
+                    "结论：**不声称提供写入隔离。** `--require-os-isolation` 会继续拒绝执行，"
+                );
+                println!("      这是失败契约在工作，不是缺陷。");
+                Ok(1)
+            }
+        }
+        Err(e) => {
+            println!("\n自检无法完成：{e}");
+            println!("结论：不声称提供写入隔离。");
+            Ok(1)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn cmd_isolation_check() -> Result<i32, Box<dyn std::error::Error>> {
+    println!("当前平台不适用（写入隔离是 Windows 专有机制）。");
+    println!(
+        "平台报告可用隔离级别: {}",
+        yunxi_bot_core::exec::available_isolation().describe()
+    );
+    Ok(2)
 }
 
 fn cmd_run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {

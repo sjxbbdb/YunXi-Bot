@@ -24,6 +24,8 @@ pub mod policy;
 pub mod runner;
 pub mod trigger;
 pub mod win_job;
+#[cfg(windows)]
+pub mod win_token;
 
 pub use exec::{ExecError, ExecOptions, ExecOutcome, IsolationLevel, IsolationRequirement};
 pub use job::{Job, JobId, JobSpec, JobState, Trigger};
