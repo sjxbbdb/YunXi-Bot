@@ -50,6 +50,29 @@ pub enum EventKind {
     /// `Watch` 触发器本轮观测到的 mtime，用于避免同一变更被重复触发。
     JobWatchObserved,
 
+    // —— 任务执行框架（由 task::task_from_events 投影）——
+    //
+    // 为什么单独一组词汇：`job` 那组是"定时/触发的一件差事"，跑完就完了；
+    // 这一组是"人类给的目标"，要拆解、要逐步执行、要能跨重启续跑。
+    // 两者生命周期不同，混用会让投影逻辑分不清"这一步在等什么"。
+    TaskCreated,
+    TaskPlanning,
+    TaskPlanned,
+    TaskStateChanged,
+    StepPending,
+    StepRunning,
+    StepSucceeded,
+    StepFailed,
+    StepSkipped,
+    StepRouted,
+    TaskFinished,
+
+    /// 一次模型调用的真实用量。**归因的依据。**
+    ///
+    /// 存的是回执里的原始计数，不是算出来的钱：单价会变、时段会变，
+    /// 而 token 数是既成事实。**先记账，后算钱。**
+    ModelCalled,
+
     // —— 记忆（由 memory::Memory::from_events 投影）——
     MemoryRecorded,
     MemoryReinforced,
@@ -446,6 +469,197 @@ pub fn project(events: &[Event]) -> BTreeMap<JobId, Job> {
     }
 
     jobs
+}
+
+/// 把事件流折叠成任务集合。纯函数，便于测试。
+///
+/// **这是"跨重启续跑"的实现**：进程重启后不读任何快照文件，只重放台账。
+/// 好处是台账与状态不可能不一致——状态本来就是台账的函数。
+///
+/// 折叠规则都是幂等的：同一条 `StepSucceeded` 重放两次结果一样。
+/// 非幂等的事件（比如计数）会显式写清它是计数。
+pub fn task_from_events(events: &[Event]) -> crate::task::TaskSet {
+    use crate::task::{RoutingRecord, Step, StepState, Task, TaskState};
+
+    let mut out: crate::task::TaskSet = BTreeMap::new();
+
+    for e in events {
+        let Some(id) = e.data.get("task").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let id = id.to_string();
+
+        match e.kind {
+            EventKind::TaskCreated => {
+                let goal = e
+                    .data
+                    .get("goal")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let mut t = Task::new(id.clone(), goal, e.at);
+                t.state = TaskState::Planning;
+                out.insert(id, t);
+            }
+            EventKind::TaskPlanning => {
+                if let Some(t) = out.get_mut(&id) {
+                    t.state = TaskState::Planning;
+                }
+            }
+            EventKind::TaskPlanned => {
+                if let Some(t) = out.get_mut(&id) {
+                    let steps: Vec<Step> = e
+                        .data
+                        .get("steps")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default();
+                    t.steps = steps;
+                    // 拆解完就是"可以开始跑"，但真正的状态由随后的 TaskStateChanged 定
+                    t.state = TaskState::Running;
+                }
+            }
+            EventKind::TaskStateChanged => {
+                if let Some(t) = out.get_mut(&id) {
+                    if let Some(s) = e
+                        .data
+                        .get("state")
+                        .and_then(|v| serde_json::from_value::<TaskState>(v.clone()).ok())
+                    {
+                        t.state = s;
+                    }
+                }
+            }
+            EventKind::StepPending => {
+                if let Some(t) = out.get_mut(&id) {
+                    let sid = e
+                        .data
+                        .get("step")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let kind = e
+                        .data
+                        .get("kind")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or(crate::think::TaskKind::Generation);
+                    let instruction = e
+                        .data
+                        .get("instruction")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let deps: Vec<String> = e
+                        .data
+                        .get("depends_on")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default();
+                    // 重试会把同一步重新置为 Pending：此时保留已有的 attempts 和结果
+                    if t.step(sid).is_some() {
+                        if let Some(s) = t.step_mut(sid) {
+                            s.state = StepState::Pending;
+                            s.result = None;
+                        }
+                    } else {
+                        t.steps.push(
+                            Step::new(sid.to_string(), instruction, kind).with_depends_on(deps),
+                        );
+                    }
+                }
+            }
+            EventKind::StepRunning => {
+                if let Some(t) = out.get_mut(&id) {
+                    let sid = e
+                        .data
+                        .get("step")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if let Some(s) = t.step_mut(sid) {
+                        s.state = StepState::Running;
+                        // **attempts 是计数事件**：每次 StepRunning 加一。
+                        // 它是这里唯一非幂等的折叠，所以显式说明。
+                        s.attempts += 1;
+                    }
+                }
+            }
+            EventKind::StepSucceeded => {
+                if let Some(t) = out.get_mut(&id) {
+                    let sid = e
+                        .data
+                        .get("step")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let result = e
+                        .data
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    if let Some(s) = t.step_mut(sid) {
+                        s.state = StepState::Succeeded;
+                        s.result = result;
+                    }
+                }
+            }
+            EventKind::StepFailed => {
+                if let Some(t) = out.get_mut(&id) {
+                    let sid = e
+                        .data
+                        .get("step")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let result = e
+                        .data
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    if let Some(s) = t.step_mut(sid) {
+                        s.state = StepState::Failed;
+                        s.result = result;
+                    }
+                }
+            }
+            EventKind::StepSkipped => {
+                if let Some(t) = out.get_mut(&id) {
+                    let sid = e
+                        .data
+                        .get("step")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let reason = e
+                        .data
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    if let Some(s) = t.step_mut(sid) {
+                        s.state = StepState::Skipped;
+                        s.result = reason;
+                    }
+                }
+            }
+            EventKind::StepRouted => {
+                if let Some(t) = out.get_mut(&id) {
+                    let sid = e
+                        .data
+                        .get("step")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let rec: Option<RoutingRecord> = e
+                        .data
+                        .get("routing")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok());
+                    if let (Some(s), Some(r)) = (t.step_mut(sid), rec) {
+                        s.routing = Some(r);
+                    }
+                }
+            }
+            EventKind::TaskFinished => {
+                if let Some(t) = out.get_mut(&id) {
+                    t.state = TaskState::Done;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]

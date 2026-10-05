@@ -21,12 +21,20 @@ pub mod agnes;
 pub mod cost;
 pub mod prompt;
 pub mod router;
+/// 路由阈值。**集中在一处**，便于按实际账单调整。
+pub mod thresholds {
+    pub use super::router::thresholds::*;
+}
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub use agnes::{OpenAiThinker, ThinkerConfig};
 pub use cost::{Cost, PriceTable, Usage};
+pub use router::{
+    ModelRouter, ModelSpec, ReasoningEffort, Routing, TaskKind, TaskProfile, Thinking, detect_code,
+    detect_explicit_multi, is_peak_now, profile_task,
+};
 
 /// 对话角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -82,6 +90,16 @@ pub struct ThinkRequest {
     pub max_tokens: Option<u32>,
     /// 采样温度。陪伴场景宜低——要的是稳定，不是花哨。
     pub temperature: Option<f32>,
+    /// 本次请求的思考模式。`None` 表示用客户端配置。
+    ///
+    /// **放这里是因为思考模式是任务的属性，不是客户端的属性。** 同一个 DeepSeek
+    /// 客户端可能这一轮在处理分析任务（要思考），下一轮在批量改文件（不要思考）。
+    /// 客户端上的 `thinking` 只表示"这个端点支不支持"。
+    pub thinking: Option<Thinking>,
+    /// 工具描述（OpenAI 兼容格式）。空表示不带工具。
+    ///
+    /// 实测：**开思考时带 `tools` 不会报错**，正常返回 `tool_calls`。
+    pub tools: Vec<serde_json::Value>,
 }
 
 impl ThinkRequest {
@@ -90,6 +108,8 @@ impl ThinkRequest {
             messages,
             max_tokens: None,
             temperature: None,
+            thinking: None,
+            tools: Vec::new(),
         }
     }
 
@@ -102,6 +122,28 @@ impl ThinkRequest {
         self.temperature = Some(t);
         self
     }
+
+    /// 指定本次的思考模式。由路由决定，不由调用点拍脑袋。
+    pub fn with_thinking(mut self, t: Thinking) -> Self {
+        self.thinking = Some(t);
+        self
+    }
+
+    pub fn with_tools(mut self, tools: Vec<serde_json::Value>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// 最终要发出去的思考模式。请求上的优先于客户端配置。
+    ///
+    /// **端点的能力是硬约束**：客户端配了 [`Thinking::ServerDefault`]
+    /// 说明它不吃这个字段，此时即使请求要求思考也不发（发了是错的行为）。
+    pub fn effective_thinking(&self, client: Thinking) -> Thinking {
+        if matches!(client, Thinking::ServerDefault) {
+            return Thinking::ServerDefault;
+        }
+        self.thinking.unwrap_or(client)
+    }
 }
 
 /// 一次思考的结果。
@@ -111,6 +153,15 @@ pub struct ThinkResponse {
     pub model: String,
     pub usage: Usage,
     pub finish_reason: Option<String>,
+    /// 思考过程原文。**不开思考时为空。**
+    ///
+    /// 单独留着而不是塞进 `content`，是因为它对使用者没用、对排查有用，
+    /// 而且它按输出 token 计费——用量要能对上账。
+    pub reasoning: Option<String>,
+    /// 本次实际生效的思考模式。
+    pub thinking: Thinking,
+    /// 模型请求的工具调用。目前只记录，不自动执行（见 ADR D15）。
+    pub tool_calls: Vec<serde_json::Value>,
 }
 
 /// 思考层失败的形态。

@@ -1,0 +1,2011 @@
+//! 执行循环：取可跑的步骤 → 执行 → 回填 → 再取，直到全部终态。
+//!
+//! ## 为什么并行是"设计好但先不接线"
+//!
+//! [`ready_steps`] 返回的是**一批**可以并行的步骤，不是一步。DAG 的形状、
+//! 依赖检查、状态机都为并行准备好了。
+//!
+//! 但当前实现顺序执行，理由是这两条：
+//!
+//! 1. **台账是串行的。** `append` 要 `&mut Ledger` 且每条都 flush。并行写台账
+//!    要么加锁排队（那并行就没意义了），要么破坏 append-only 的时序保证。
+//! 2. **限流器是共享状态。** Agnes 免费档 10 RPM——并行发请求只会更快撞上 429，
+//!    不会更快跑完。
+//!
+//! 所以并行的收益在**远端调用**上，而当前的瓶颈在**台账和配额**上。
+//! 等真有并发需求（比如 DeepSeek 档上跑十几个独立步骤）再接，
+//! 那时要改的只是"从 ready_steps 里取一批还是取一个"。
+//!
+//! ## 一个任务执行中途不换模型
+//!
+//! 每一步各自路由一次（因为每一步是独立的任务），但**某一步自己从开始到结束
+//! 用一个模型**。中途换模型会把已经构建好的前缀缓存全部作废——
+//! DeepSeek 的缓存单元必须完整匹配，参见 [`crate::think::router`] 的模块文档。
+
+use std::collections::BTreeMap;
+
+use crate::costlog::CallRecord;
+use crate::decide::Decider;
+use crate::ledger::{EventKind, Ledger, LedgerError, task_from_events};
+use crate::think::{ModelRouter, ReasoningEffort, Routing, TaskKind, TaskProfile};
+
+use super::decide::{TaskDecision, parse_options};
+use super::model::{
+    Budget, BudgetLedger, RoutingRecord, Step, StepState, Task, TaskError, TaskState,
+    validate_dependencies,
+};
+use super::plan::parse_plan;
+
+/// 单步输出上限。够一段正文或一个命令，又不至于让失控的输出吃掉预算。
+pub const STEP_MAX_TOKENS: u32 = 1024;
+
+/// 拆解输出的上限。步骤清单本身不长，但思考过程要占位置。
+pub const PLAN_MAX_TOKENS: u32 = 2048;
+
+/// 决策点生成选项的输出上限。
+pub const OPTIONS_MAX_TOKENS: u32 = 512;
+
+/// 决策点步骤的前缀。带这个前缀的步骤**不产生内容，只做选择**。
+///
+/// 用一个显式前缀而不是让模型自己说"这一步是决策"，是因为
+/// **"哪一步需要人判断"必须是可检的、不依赖模型措辞的**。
+pub const DECIDE_PREFIX: &str = "decide:";
+
+/// 判据：决策点至少要有几个选项。少于两个就不叫选择。
+pub const MIN_OPTIONS: usize = 2;
+
+/// 步骤产出的成功标记。模型必须用它开头。
+pub const OK_MARK: &str = "OK:";
+/// 步骤产出的"做不了"标记。
+pub const BLOCKED_MARK: &str = "BLOCKED:";
+
+/// 一个步骤的产出该怎么判定。
+///
+/// ## 为什么需要这个
+///
+/// 真实运行里出现过这样一幕：三步任务，前两步模型都回了
+/// "做不了。我没有联网能力，无法获取实时天气数据……"，而引擎把它们
+/// **记成了成功**——因为在引擎眼里"模型返回了文本"就是成功。
+/// 于是任务报告"完成 2 步"，而实际上什么都没办成。
+///
+/// **这是最坏的一种错**：报告说做完了，实际没做。所以步骤产出有了一个
+/// 明确契约——模型必须用 `OK:` 或 `BLOCKED:` 开头。这不是靠关键词猜
+/// （"做不了"这三个字有一万种说法），而是一条**格式约定**。
+///
+/// 没有标记时按"完成"处理而不是"失败"：内容确实在那儿，判失败会让它
+/// 白重试一次。但记下"没标记"，让这种事在台账里看得见。
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepVerdict {
+    /// 做成了。
+    Done(String),
+    /// **明确说做不了。** 不该重试——模型说了缺什么，再试一次还是缺。
+    Blocked(String),
+    /// 没有标记。内容在，但没法确认完成。
+    Unmarked(String),
+}
+
+/// 解析步骤产出。**大小写不敏感**，并容忍全角冒号与行首空白。
+pub fn classify_step_output(raw: &str) -> StepVerdict {
+    let t = raw.trim_start();
+    let upper = t.to_ascii_uppercase();
+    // 只在**开头**认标记：正文里出现 "BLOCKED:" 不算
+    if upper.starts_with("BLOCKED:") || upper.starts_with("BLOCKED：") {
+        return StepVerdict::Blocked(strip_mark(t, "BLOCKED"));
+    }
+    if upper.starts_with("OK:") || upper.starts_with("OK：") {
+        return StepVerdict::Done(strip_mark(t, "OK"));
+    }
+    StepVerdict::Unmarked(raw.trim().to_string())
+}
+
+/// 去掉开头的标记与紧随其后的冒号/空白。
+fn strip_mark(s: &str, mark: &str) -> String {
+    let rest = &s[mark.len()..];
+    rest.trim_start_matches([':', '：'])
+        .trim_start()
+        .to_string()
+}
+
+/// 模型侧的三个动作。引擎只负责调它们，不关心用的是哪个模型。
+///
+/// 拆出来是为了**执行循环可以完全离线测试**：给一个不碰网络的 handler，
+/// 就能测出拓扑、预算、重试、卡住、升级人工这些逻辑。
+///
+/// `records` 由引擎传进来而不是 handler 自己存：handler 要同时持有
+/// "可选模型"（可变）和"观测"（可变）两个东西，塞进同一个 struct 会让
+/// 每次调用都撞借用检查。把观测当参数传，借用关系就一目了然。
+pub trait TaskHandler {
+    /// 把目标拆成步骤清单（模型的原始回复）。
+    fn plan(
+        &mut self,
+        routing: &Routing,
+        run: &PlanRequest,
+        records: &mut Vec<CallRecord>,
+    ) -> Result<String, TaskError>;
+
+    /// 执行一步，返回这一步的产出。
+    fn execute_step(
+        &mut self,
+        routing: &Routing,
+        run: &StepRequest,
+        records: &mut Vec<CallRecord>,
+    ) -> Result<String, TaskError>;
+
+    /// 为决策点生成选项（模型的原始回复）。
+    fn observe(
+        &mut self,
+        routing: &Routing,
+        run: &ObserveRequest,
+        records: &mut Vec<CallRecord>,
+    ) -> Result<String, TaskError>;
+}
+
+/// 拆解请求的输入。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanRequest {
+    pub task_id: String,
+    pub goal: String,
+    /// 最多允许几个步骤。
+    pub max_steps: u32,
+}
+
+/// 单步执行的输入。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepRequest {
+    pub task_id: String,
+    pub goal: String,
+    pub step_id: String,
+    pub instruction: String,
+    /// 已完成的依赖步骤 → 其结果。**只给依赖的结果**，不给全部历史：
+    /// 无关步骤的输出既浪费 token 又会干扰。
+    pub inputs: Vec<(String, String)>,
+}
+
+/// 决策点生成选项的输入。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObserveRequest {
+    pub task_id: String,
+    pub goal: String,
+    pub step_id: String,
+    pub question: String,
+}
+
+/// 一次推进的结果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Advance {
+    /// 又跑完一步，还能继续。
+    Progress {
+        settled: usize,
+        total: usize,
+        last: String,
+    },
+    /// 全部终态。
+    Finished,
+    /// 停下等人。**失败方向朝「不执行」**：预算、成环、弃权都走这里。
+    Waiting { reason: String },
+}
+
+/// 一轮推进的汇总。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineOutcome {
+    pub task: Task,
+    pub used_model_calls: u32,
+    pub advance: Advance,
+}
+
+/// 任务执行引擎。
+///
+/// 泛型参数是两个 mock 点：`H` 模型调用、`S` 落盘。
+/// 两个都不碰网络时，整个执行循环可以离线跑完。
+/// 决策层用 `&dyn Decider`——它已经是一个 trait 对象可用的抽象，
+/// 再套一层泛型只会让签名更长。
+pub struct Engine<'a, H: TaskHandler, S: TaskStore> {
+    pub router: &'a ModelRouter,
+    pub decider: &'a dyn Decider,
+    pub handler: &'a mut H,
+    pub store: &'a mut S,
+    pub effort: ReasoningEffort,
+    budget: Budget,
+}
+
+impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
+    pub fn new(
+        router: &'a ModelRouter,
+        decider: &'a dyn Decider,
+        handler: &'a mut H,
+        store: &'a mut S,
+        budget: Budget,
+    ) -> Self {
+        Self {
+            router,
+            decider,
+            handler,
+            store,
+            effort: ReasoningEffort::Auto,
+            budget,
+        }
+    }
+
+    pub fn with_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    /// 推进一个任务直到完成 / 等人 / 预算用尽。
+    ///
+    /// **每轮都从台账重新投影**，不用内存里的状态推进。这样"状态"永远只是
+    /// 台账的函数，不存在内存与台账不一致的可能。
+    pub fn run(&mut self, task_id: &str) -> Result<EngineOutcome, TaskError> {
+        let mut ledger = BudgetLedger::new(self.budget);
+        // 本轮所有模型调用的用量。跑完一次性写台账——
+        // **一次 flush 一条，而不是每次调用都写**：调用期间崩掉留下的
+        // 是"钱花了没记上"，而记上的是既成事实，宁可重复不可丢失。
+        let mut records: Vec<CallRecord> = Vec::new();
+        let result = self.run_inner(task_id, &mut ledger, &mut records);
+        self.flush_records(&mut records);
+        result
+    }
+
+    fn run_inner(
+        &mut self,
+        task_id: &str,
+        ledger: &mut BudgetLedger,
+        records: &mut Vec<CallRecord>,
+    ) -> Result<EngineOutcome, TaskError> {
+        // 循环体里每个分支要么 return，要么 continue；这个哨兵让"循环不可达终点"
+        // 这件事在类型层面成立，而不是靠一句注释。
+        let mut outcome = None;
+        // 回收只在开头做一次。每轮都做的话，一旦还有 Running 的步骤就会无限循环。
+        let mut recovered = false;
+
+        loop {
+            let mut task = self.load(task_id)?;
+
+            // 拆解阶段
+            if task.state == TaskState::Planning {
+                self.plan_task(&mut task, ledger, records)?;
+                continue;
+            }
+
+            // 终态：收工
+            if task.state.is_terminal() {
+                let advance = match task.state {
+                    TaskState::Done => Advance::Finished,
+                    other => Advance::Waiting {
+                        reason: format!("任务已{}", other.label()),
+                    },
+                };
+                outcome = Some(EngineOutcome {
+                    task,
+                    used_model_calls: ledger.used(),
+                    advance,
+                });
+            } else if task.state == TaskState::AwaitingHuman {
+                // 有人等在人工上，就别动
+                outcome = Some(EngineOutcome {
+                    task,
+                    used_model_calls: ledger.used(),
+                    advance: Advance::Waiting {
+                        reason: "任务在等人工介入".into(),
+                    },
+                });
+            } else {
+                // 依赖合法性只在第一次执行前查一次——成环必须在花钱之前查出来
+                validate_dependencies(&task.steps)?;
+                self.skip_doomed(&mut task)?;
+
+                // **回收被打断的步骤。** 走到这里说明任务是闲置的，
+                // 所以任何还停在"执行中"的步骤都是上一次跑到一半断掉的——
+                // 当前没有任何进程在跑它。不回收的话它会永远停在 Running，
+                // 而 Running 既不在 ready_steps 里也不是终态，任务就卡住了。
+                if !recovered && self.recover_interrupted(task_id)? {
+                    recovered = true;
+                    continue;
+                }
+
+                task = self.load(task_id)?;
+
+                if task.all_settled() {
+                    self.finish(task_id, TaskState::Done)?;
+                    continue;
+                }
+
+                let ready = ready_steps(&task);
+                if ready.is_empty() {
+                    let remaining: Vec<String> = task
+                        .steps
+                        .iter()
+                        .filter(|s| !s.state.is_settled())
+                        .map(|s| s.id.clone())
+                        .collect();
+                    self.set_state(task_id, TaskState::Stalled)?;
+                    outcome = Some(EngineOutcome {
+                        task: self.load(task_id)?,
+                        used_model_calls: ledger.used(),
+                        advance: Advance::Waiting {
+                            reason: TaskError::Stalled { remaining }.to_string(),
+                        },
+                    });
+                } else {
+                    // 逐个跑。并行版本从这里改成"取一批"，其余不变（见模块文档）。
+                    let mut stopped = false;
+                    for step_id in ready {
+                        match self.run_step(self.decider, task_id, &step_id, ledger, records) {
+                            Ok(StepRun::Settled | StepRun::RetryLater) => {}
+                            Ok(StepRun::NeedsHuman { reason }) => {
+                                outcome = Some(EngineOutcome {
+                                    task: self.load(task_id)?,
+                                    used_model_calls: ledger.used(),
+                                    advance: Advance::Waiting { reason },
+                                });
+                                stopped = true;
+                            }
+                            Err(e) if e.needs_human() => {
+                                self.set_state(task_id, TaskState::AwaitingHuman)?;
+                                outcome = Some(EngineOutcome {
+                                    task: self.load(task_id)?,
+                                    used_model_calls: ledger.used(),
+                                    advance: Advance::Waiting {
+                                        reason: e.to_string(),
+                                    },
+                                });
+                                stopped = true;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        if stopped {
+                            break;
+                        }
+                    }
+                    if !stopped {
+                        // 这一轮跑完了，**推进了一步**：回去重新投影再跑下一轮。
+                        //
+                        // 这里不能 return——任务是"循环到跑完"，不是"跑一步就交差"。
+                        // 我第一版就是在这里 return 了，于是三步的线性任务只跑第一步
+                        // 就报告 Progress。**测试抓到了它。**
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(o) = outcome.take() {
+                return Ok(o);
+            }
+            // 走到这里说明既没有终态也没有可推进的步骤。
+            // 不能静默返回——那会表现为"任务停在原地但没人知道为什么"。
+            return Err(TaskError::Stalled {
+                remaining: vec![task_id.to_string()],
+            });
+        }
+    }
+
+    /// 把本轮的模型用量写进观测台账。
+    ///
+    /// 每次调用都写一条：**崩在中间时丢的是记录，不是事实**。
+    /// 反过来的设计（攒到最后一起写）会让"钱花了但台账里没有"，
+    /// 而台账是唯一事实来源——它不能比现实少。
+    fn flush_records(&mut self, records: &mut Vec<CallRecord>) {
+        for r in records.drain(..) {
+            // 写失败只报不中断：账已经花了，任务结果比记账重要
+            if let Err(e) = self.store.record_cost(&r) {
+                eprintln!("⚠ 成本记录写入失败（不影响任务）: {e}");
+            }
+        }
+    }
+
+    /// 拆解。
+    fn plan_task(
+        &mut self,
+        task: &mut Task,
+        ledger: &mut BudgetLedger,
+        records: &mut Vec<CallRecord>,
+    ) -> Result<(), TaskError> {
+        // **拆解本身也是"一个任务"**，所以也走路由：它需要推理、而且它要产出多步。
+        //
+        // `step_count` 故意按"至少三步"报：拆解的产出是多步计划，按一步报会被
+        // 判成轻量档（免费的那个），而免费档的思考模式是"服务端默认"——
+        // 拆解不开思考，拆出来的步骤质量会明显掉。这是我在测试里发现接线错了的地方。
+        let kind = TaskKind::Planning;
+        let profile = TaskProfile {
+            prompt_chars: task.goal.chars().count(),
+            step_count: 3,
+            explicit_multi: crate::think::detect_explicit_multi(&task.goal),
+            has_code: crate::think::detect_code(&task.goal),
+        };
+        let routing =
+            self.router
+                .route(&task.goal, kind, &profile, self.effort, Some(self.decider));
+        ledger.try_charge()?;
+        let req = PlanRequest {
+            task_id: task.id.clone(),
+            goal: task.goal.clone(),
+            max_steps: self.budget.max_steps,
+        };
+        let raw = self.handler.plan(&routing, &req, records)?;
+
+        let planned = parse_plan(&raw)?;
+        ledger.steps_allowed(planned.len())?;
+
+        // 落成 Step：类型由模型给，没给就按文本兜底判
+        let steps: Vec<Step> = planned
+            .iter()
+            .map(|p| {
+                let kind = p.kind.unwrap_or_else(|| {
+                    TaskKind::classify(&p.instruction).unwrap_or(TaskKind::Generation)
+                });
+                Step::new(p.id.clone(), p.instruction.clone(), kind)
+                    .with_depends_on(p.depends_on.clone())
+            })
+            .collect();
+        validate_dependencies(&steps)?;
+
+        // 一次写完拆解结果：崩在中间不会留下"半个步骤清单"
+        self.store.write(
+            &task.id,
+            EventKind::TaskPlanned,
+            serde_json::json!({
+                "task": task.id,
+                "steps": steps,
+                "routing": RoutingRecord::from_routing(&routing),
+            }),
+        )?;
+        self.set_state(&task.id, TaskState::Running)?;
+        Ok(())
+    }
+
+    /// 把停在"执行中"的步骤退回待执行。
+    ///
+    /// 只在任务闲置时调用。**这是"跨重启续跑"和"预算中途用尽"共用的恢复路径**：
+    /// 两种情况留下的都是"标记为执行中、但实际没人在跑"的步骤。
+    ///
+    /// 退回而不是判失败，是因为**我们不知道它做没做完**——可能已经在远端产生了
+    /// 副作用。交给下一步再试一次，比假装它失败了安全。
+    ///
+    /// 返回是否有步骤被回收。
+    fn recover_interrupted(&mut self, task_id: &str) -> Result<bool, TaskError> {
+        let task = self.load(task_id)?;
+        let stuck: Vec<Step> = task
+            .steps
+            .iter()
+            .filter(|s| s.state == StepState::Running)
+            .cloned()
+            .collect();
+        if stuck.is_empty() {
+            return Ok(false);
+        }
+        for step in &stuck {
+            self.store.write(
+                task_id,
+                EventKind::StepPending,
+                serde_json::json!({
+                    "task": task_id,
+                    "step": step.id,
+                    "instruction": step.instruction,
+                    "kind": step.kind,
+                    "depends_on": step.depends_on,
+                    "recovered": "上一次执行被打断，退回待执行",
+                }),
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// 执行一个步骤。
+    fn run_step(
+        &mut self,
+        decider: &dyn Decider,
+        task_id: &str,
+        step_id: &str,
+        ledger: &mut BudgetLedger,
+        records: &mut Vec<CallRecord>,
+    ) -> Result<StepRun, TaskError> {
+        let task = self.load(task_id)?;
+        let Some(step) = task.step(step_id).cloned() else {
+            return Err(TaskError::Stalled {
+                remaining: vec![step_id.to_string()],
+            });
+        };
+        if step.state.is_settled() || step.state == StepState::Running {
+            return Ok(StepRun::Settled);
+        }
+
+        // 重试次数用尽 → 这一步判失败
+        if step.attempts >= self.budget.max_attempts_per_step {
+            self.store.write(
+                task_id,
+                EventKind::StepFailed,
+                serde_json::json!({
+                    "task": task_id,
+                    "step": step_id,
+                    "error": format!("已尝试 {} 次仍未成功", step.attempts),
+                }),
+            )?;
+            return Ok(StepRun::Settled);
+        }
+
+        // 路由：这一步自己的属性决定模型和思考模式
+        let profile = TaskProfile {
+            prompt_chars: step.instruction.chars().count(),
+            step_count: 1,
+            explicit_multi: crate::think::detect_explicit_multi(&step.instruction),
+            has_code: crate::think::detect_code(&step.instruction),
+        };
+        let routing = self.router.route(
+            &step.instruction,
+            step.kind,
+            &profile,
+            self.effort,
+            Some(decider),
+        );
+        self.store.write(
+            task_id,
+            EventKind::StepRouted,
+            serde_json::json!({
+                "task": task_id,
+                "step": step_id,
+                "routing": RoutingRecord::from_routing(&routing),
+            }),
+        )?;
+
+        // **先落 Running 再扣预算**：如果崩在中间，投影会显示"执行中"而不是
+        // "待执行"——模糊总比"看起来没跑过"安全（可能已经产生了副作用）。
+        self.store.write(
+            task_id,
+            EventKind::StepRunning,
+            serde_json::json!({ "task": task_id, "step": step_id }),
+        )?;
+        if let Err(e) = ledger.try_charge() {
+            // 预算在"标记执行中"之后用尽：必须把它退回去，
+            // 否则这一步会永远停在 Running——既不是终态也永远不会被选中。
+            self.reset_step(task_id, &step)?;
+            return Err(e);
+        }
+
+        // 决策点走另一条路
+        if let Some(question) = step.instruction.strip_prefix(DECIDE_PREFIX) {
+            let question = question.trim().to_string();
+            return self.run_decision(self.decider, task_id, &step, &question, ledger, records);
+        }
+
+        let inputs: Vec<(String, String)> = step
+            .depends_on
+            .iter()
+            .filter_map(|d| {
+                task.step(d)
+                    .and_then(|s| s.result.clone())
+                    .map(|r| (d.clone(), r))
+            })
+            .collect();
+        let req = StepRequest {
+            task_id: task_id.to_string(),
+            goal: task.goal.clone(),
+            step_id: step_id.to_string(),
+            instruction: step.instruction.clone(),
+            inputs,
+        };
+
+        match self.handler.execute_step(&routing, &req, records) {
+            Ok(out) => {
+                // **产出要看它自己怎么说，不能"返回了文本就算成功"。**
+                match classify_step_output(&out) {
+                    StepVerdict::Done(text) => {
+                        self.store.write(
+                            task_id,
+                            EventKind::StepSucceeded,
+                            serde_json::json!({
+                                "task": task_id, "step": step_id, "result": text, "marked": true,
+                            }),
+                        )?;
+                    }
+                    StepVerdict::Blocked(reason) => {
+                        // 模型明确说做不了 → 判失败，**且不重试**：
+                        // 它已经说了缺什么，再试一次还是缺。
+                        self.store.write(
+                            task_id,
+                            EventKind::StepFailed,
+                            serde_json::json!({
+                                "task": task_id,
+                                "step": step_id,
+                                "error": reason,
+                                "blocked": true,
+                            }),
+                        )?;
+                    }
+                    StepVerdict::Unmarked(text) => {
+                        // 没标记：内容在，按完成算，但记下来让这事在台账里看得见
+                        self.store.write(
+                            task_id,
+                            EventKind::StepSucceeded,
+                            serde_json::json!({
+                                "task": task_id, "step": step_id, "result": text, "marked": false,
+                            }),
+                        )?;
+                    }
+                }
+                Ok(StepRun::Settled)
+            }
+            Err(e) => {
+                // 单步失败不立刻判死，但**只有还能重试时才写 StepFailed**。
+                // 再写一条 StepPending 会覆盖掉刚写下的失败原因，让投影里
+                // 看不出这一步曾经失败过——排查时最需要的就是那条。
+                // attempts 已经由 StepRunning 累加过，所以重试次数仍然是有限的。
+                if step.attempts + 1 < self.budget.max_attempts_per_step {
+                    self.reset_step(task_id, &step)?;
+                    Ok(StepRun::RetryLater)
+                } else {
+                    self.store.write(
+                        task_id,
+                        EventKind::StepFailed,
+                        serde_json::json!({
+                            "task": task_id,
+                            "step": step_id,
+                            "error": e.to_string(),
+                        }),
+                    )?;
+                    Ok(StepRun::Settled)
+                }
+            }
+        }
+    }
+
+    /// 跑一个决策点。
+    ///
+    /// 决策层用 `&dyn Decider` 传进来而不是从 `self.decider` 取：
+    /// `self` 同时被 `handler`（可变）和 `store`（可变）借着，
+    /// 从 `self` 里再借一个字段出来会和它们打架。显式传参把借用关系摆明了。
+    fn run_decision(
+        &mut self,
+        decider: &dyn Decider,
+        task_id: &str,
+        step: &Step,
+        question: &str,
+        ledger: &mut BudgetLedger,
+        records: &mut Vec<CallRecord>,
+    ) -> Result<StepRun, TaskError> {
+        // 决策点生成选项是**一次调用**，而且它必须推理（要理解这一步在纠结什么）。
+        //
+        // 所以这里**故意不把档位交给本地决策模型**：调用次数我们已经知道是 1，
+        // "需要推理"也已经在 `TaskKind::Analysis` 里写明了。问一次纯属浪费一个
+        // 本地调用，而且被问的模型并不比我们多任何信息。
+        //
+        // 档位先按"一次调用"落到默认档，再由路由里那条
+        // **"需要推理但端点不支持思考 → 换到支持思考的端点"** 规则升上去。
+        // 两个轴的判据各自只写在一处（router.rs），这里不重复实现一遍。
+        let profile = TaskProfile {
+            prompt_chars: question.chars().count(),
+            step_count: 1,
+            explicit_multi: false,
+            has_code: false,
+        };
+        let routing = self
+            .router
+            .route(question, TaskKind::Analysis, &profile, self.effort, None);
+
+        ledger.try_charge()?;
+        let raw = self.handler.observe(
+            &routing,
+            &ObserveRequest {
+                task_id: task_id.to_string(),
+                goal: String::new(),
+                step_id: step.id.clone(),
+                question: question.to_string(),
+            },
+            records,
+        )?;
+
+        let (q, options) = parse_options(&raw)?;
+        if options.len() < MIN_OPTIONS {
+            return self.escalate(task_id, step, &q, &options, "选项少于两个");
+        }
+
+        // 判据的键必须与选项一一对应——**顺序也要一致**，
+        // 否则本地决策模型看到的"选项"和它给回的 choice 对不上。
+        //
+        // 用 opt0/opt1 当键、选项原文当判据：本地决策模型（Verdict）是双编码器，
+        // 它按**判据文本**打分，所以判据必须是能读懂的原话；而它回的是键。
+        let criteria: Vec<(String, String)> = options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (format!("opt{i}"), o.clone()))
+            .collect();
+        let criteria_ref: Vec<(&str, &str)> = criteria
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        match super::decide::decision_point(decider, "task_decision", &q, &criteria_ref)? {
+            TaskDecision::Chosen {
+                choice,
+                rationale,
+                alternatives,
+            } => {
+                // **键要换回原文再落盘。** 否则台账里存的是 "opt1" 这种占位符，
+                // 事后回看"当时选了哪个做法"完全读不出来——留痕就白留了。
+                let label = |key: &str| -> String {
+                    key.strip_prefix("opt")
+                        .and_then(|i| i.parse::<usize>().ok())
+                        .and_then(|i| options.get(i))
+                        .cloned()
+                        .unwrap_or_else(|| key.to_string())
+                };
+                let result = serde_json::json!({
+                    "choice": label(&choice),
+                    "choice_key": choice,
+                    "rationale": rationale,
+                    "alternatives": alternatives.iter().map(|a| label(a)).collect::<Vec<_>>(),
+                })
+                .to_string();
+                self.store.write(
+                    task_id,
+                    EventKind::StepSucceeded,
+                    serde_json::json!({ "task": task_id, "step": step.id, "result": result }),
+                )?;
+                Ok(StepRun::Settled)
+            }
+            TaskDecision::NeedsHuman {
+                question,
+                options: opts,
+            } => self.escalate(task_id, step, &question, &opts, "决策模型弃权"),
+        }
+    }
+
+    /// 升级人工。**不确定就停，不猜。**
+    fn escalate(
+        &mut self,
+        task_id: &str,
+        step: &Step,
+        question: &str,
+        options: &[String],
+        why: &str,
+    ) -> Result<StepRun, TaskError> {
+        let reason = format!(
+            "{why}：步骤 {} 需要人工判断「{question}」；候选 = {options:?}",
+            step.id
+        );
+        // 步骤回到待执行，但任务状态转等人工——人处理完之后重新跑就能续上
+        self.reset_step(task_id, step)?;
+        self.set_state(task_id, TaskState::AwaitingHuman)?;
+        Ok(StepRun::NeedsHuman { reason })
+    }
+
+    /// 把一步退回待执行（保留 attempts，不重置重试计数）。
+    fn reset_step(&mut self, task_id: &str, step: &Step) -> Result<(), TaskError> {
+        self.store.write(
+            task_id,
+            EventKind::StepPending,
+            serde_json::json!({
+                "task": task_id,
+                "step": step.id,
+                "instruction": step.instruction,
+                "kind": step.kind,
+                "depends_on": step.depends_on,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// 依赖已失败的步骤：标记跳过。**跳过不是失败**——它自己没出错。
+    fn skip_doomed(&mut self, task: &mut Task) -> Result<(), TaskError> {
+        let doomed: Vec<String> = task
+            .steps
+            .iter()
+            .filter(|s| {
+                !s.state.is_settled()
+                    && s.state != StepState::Running
+                    && s.depends_on
+                        .iter()
+                        .any(|d| task.step(d).is_some_and(|x| x.state == StepState::Failed))
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for id in doomed {
+            self.store.write(
+                &task.id,
+                EventKind::StepSkipped,
+                serde_json::json!({
+                    "task": task.id,
+                    "step": id,
+                    "reason": "依赖的步骤失败",
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn set_state(&mut self, task_id: &str, to: TaskState) -> Result<(), TaskError> {
+        self.store.write(
+            task_id,
+            EventKind::TaskStateChanged,
+            serde_json::json!({ "task": task_id, "state": to }),
+        )?;
+        Ok(())
+    }
+
+    fn finish(&mut self, task_id: &str, to: TaskState) -> Result<(), TaskError> {
+        self.store.write(
+            task_id,
+            EventKind::TaskFinished,
+            serde_json::json!({ "task": task_id, "state": to }),
+        )?;
+        Ok(())
+    }
+
+    fn load(&self, task_id: &str) -> Result<Task, TaskError> {
+        let set = self.store.project();
+        set.get(task_id).cloned().ok_or_else(|| {
+            TaskError::Core(crate::CoreError::Ledger(format!("找不到任务 {task_id}")))
+        })
+    }
+}
+
+/// 单步执行的结局。
+enum StepRun {
+    Settled,
+    RetryLater,
+    NeedsHuman { reason: String },
+}
+
+/// 任务落盘。抽象出来是为了执行循环能离线测试。
+///
+/// **成本记录也走这里**，而不是给引擎单独接一个 sink：引擎已经可变借着
+/// `store`，再让它借第二个可变引用指向同一个台账对象，借用检查过不去——
+/// 而这个限制是对的，它逼着"谁持有台账"只有一个答案。
+pub trait TaskStore {
+    /// 追加一条事件。
+    fn write(
+        &mut self,
+        task_id: &str,
+        kind: EventKind,
+        data: serde_json::Value,
+    ) -> Result<(), TaskError>;
+
+    /// 从台账投影出全部任务。
+    fn project(&self) -> crate::task::TaskSet;
+
+    /// 记一次模型调用的用量。**默认不记**——不落盘的 store（比如干跑）不需要。
+    fn record_cost(&mut self, _rec: &CallRecord) -> Result<(), TaskError> {
+        Ok(())
+    }
+}
+
+/// 基于台账的实现。**唯一的事实来源。**
+pub struct LedgerTaskStore {
+    ledger: Ledger,
+}
+
+impl LedgerTaskStore {
+    pub fn new(ledger: Ledger) -> Self {
+        Self { ledger }
+    }
+
+    pub fn ledger(&self) -> &Ledger {
+        &self.ledger
+    }
+
+    /// 可变访问台账。给 CLI 读明细用。**别拿它绕过 `write` 改任务状态。**
+    pub fn ledger_mut(&mut self) -> &mut Ledger {
+        &mut self.ledger
+    }
+}
+
+impl TaskStore for LedgerTaskStore {
+    fn write(
+        &mut self,
+        _task_id: &str,
+        kind: EventKind,
+        data: serde_json::Value,
+    ) -> Result<(), TaskError> {
+        // 审计事件必须落在边界内——台账会拒绝边界外的审计事件。
+        // 任务执行框架目前没有审计事件（DecisionAsked 由 decide 模块写），
+        // 所以这里直接追加；等决策点接入台账审计时在这里开边界。
+        if kind.requires_span() && !self.ledger.has_open_span() {
+            return Err(TaskError::Core(crate::CoreError::Ledger(format!(
+                "{kind:?} 需要边界，但当前没有开启"
+            ))));
+        }
+        self.ledger
+            .append(kind, None, data)
+            .map(|_| ())
+            .map_err(|e: LedgerError| TaskError::Core(crate::CoreError::Ledger(e.to_string())))
+    }
+
+    fn project(&self) -> crate::task::TaskSet {
+        task_from_events(self.ledger.events())
+    }
+
+    fn record_cost(&mut self, rec: &CallRecord) -> Result<(), TaskError> {
+        self.ledger
+            .append(EventKind::ModelCalled, None, serde_json::json!(rec))
+            .map(|_| ())
+            .map_err(|e: LedgerError| TaskError::Core(crate::CoreError::Ledger(e.to_string())))
+    }
+}
+
+/// 内存实现。**只用于测试和干跑**——不落盘就没有"跨重启存活"。
+#[derive(Debug, Default)]
+pub struct MemoryTaskStore {
+    events: Vec<crate::ledger::Event>,
+    seq: u64,
+    /// 成本记录单独存：它们不是任务事件，混进 `events` 会污染投影。
+    pub costs: Vec<CallRecord>,
+}
+
+impl MemoryTaskStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn events(&self) -> &[crate::ledger::Event] {
+        &self.events
+    }
+}
+
+impl TaskStore for MemoryTaskStore {
+    fn write(
+        &mut self,
+        _task_id: &str,
+        kind: EventKind,
+        data: serde_json::Value,
+    ) -> Result<(), TaskError> {
+        self.seq += 1;
+        let seq = self.seq;
+        self.events.push(crate::ledger::Event {
+            seq,
+            at: seq,
+            kind,
+            span: None,
+            job: None,
+            data,
+        });
+        Ok(())
+    }
+
+    fn project(&self) -> crate::task::TaskSet {
+        task_from_events(&self.events)
+    }
+
+    fn record_cost(&mut self, rec: &CallRecord) -> Result<(), TaskError> {
+        self.costs.push(rec.clone());
+        Ok(())
+    }
+}
+
+/// 记录一个新任务。**只写 TaskCreated**，拆解由 [`Engine::run`] 做。
+pub fn create_task<S: TaskStore>(
+    store: &mut S,
+    task_id: &str,
+    goal: &str,
+) -> Result<(), TaskError> {
+    store.write(
+        task_id,
+        EventKind::TaskCreated,
+        serde_json::json!({ "task": task_id, "goal": goal }),
+    )?;
+    store.write(
+        task_id,
+        EventKind::TaskPlanning,
+        serde_json::json!({ "task": task_id }),
+    )
+}
+
+/// 现在就能跑的步骤：状态是待执行，且**所有依赖都已成功**。
+///
+/// 依赖失败的情况不在这里处理（那由 [`Engine::skip_doomed`] 转成跳过），
+/// 因为"能不能跑"和"该不该跳过"是两个判断。
+pub fn ready_steps(task: &Task) -> Vec<String> {
+    task.steps
+        .iter()
+        .filter(|s| s.state == StepState::Pending)
+        .filter(|s| {
+            s.depends_on.iter().all(|d| {
+                task.step(d)
+                    .is_some_and(|x| x.state == StepState::Succeeded)
+            })
+        })
+        .map(|s| s.id.clone())
+        .collect()
+}
+
+/// 汇总各步骤结果，拼成给人类看的答复。
+///
+/// **失败的步骤也要出现**，不能只报成功的部分——那会让人以为任务做完了。
+pub fn summarize(task: &Task) -> String {
+    let (done, failed, skipped) = task.tally();
+    let mut out = format!(
+        "任务「{}」{}：完成 {} / 失败 {} / 跳过 {}\n",
+        task.goal,
+        task.state.label(),
+        done,
+        failed,
+        skipped
+    );
+    for s in &task.steps {
+        let mark = match s.state {
+            StepState::Succeeded => "✓",
+            StepState::Failed => "✗",
+            StepState::Skipped => "—",
+            _ => "·",
+        };
+        out.push_str(&format!("{mark} [{}] {}", s.id, s.instruction));
+        if let Some(r) = &s.result {
+            let head: String = r.chars().take(120).collect();
+            out.push_str(&format!("\n    {head}"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// 从台账投影里取一个任务。给 CLI 用。
+pub fn find_task(set: &crate::task::TaskSet, id: &str) -> Option<Task> {
+    set.get(id).cloned()
+}
+
+/// 供 CLI 展示用：把一个任务的步骤状态整理成表。
+pub fn step_table(task: &Task) -> Vec<(String, &'static str, String)> {
+    task.steps
+        .iter()
+        .map(|s| {
+            let deps = if s.depends_on.is_empty() {
+                "-".to_string()
+            } else {
+                s.depends_on.join(",")
+            };
+            (s.id.clone(), s.state.label(), deps)
+        })
+        .collect()
+}
+
+/// 报表用的空映射辅助（避免调用点到处写类型标注）。
+pub fn empty_inputs() -> Vec<(String, String)> {
+    BTreeMap::<String, String>::new().into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decide::StubDecider;
+    use crate::think::ModelRouter;
+
+    /// 剧本化 handler：按调用顺序返回预设回复，全程不碰网络。
+    #[derive(Debug, Default)]
+    struct ScriptedHandler {
+        plans: Vec<String>,
+        steps: Vec<Result<String, TaskError>>,
+        observes: Vec<String>,
+        plan_calls: usize,
+        step_calls: usize,
+        observe_calls: usize,
+        /// 记录每次调用拿到的路由，用来断言"复杂走 DeepSeek、简单走 Agnes"
+        seen_providers: Vec<String>,
+        seen_thinking: Vec<bool>,
+        seen_kinds: Vec<TaskKind>,
+    }
+
+    impl ScriptedHandler {
+        fn with_plan(plan: &str) -> Self {
+            Self {
+                plans: vec![plan.to_string()],
+                ..Default::default()
+            }
+        }
+
+        fn push_step(mut self, out: Result<&str, TaskError>) -> Self {
+            self.steps.push(out.map(str::to_string));
+            self
+        }
+    }
+
+    impl TaskHandler for ScriptedHandler {
+        fn plan(
+            &mut self,
+            routing: &Routing,
+            _run: &PlanRequest,
+            records: &mut Vec<CallRecord>,
+        ) -> Result<String, TaskError> {
+            self.plan_calls += 1;
+            self.seen_providers.push(routing.spec.provider.to_string());
+            self.seen_thinking.push(routing.thinking);
+            self.seen_kinds.push(routing.kind);
+            records.push(
+                CallRecord::new(
+                    routing.spec.provider,
+                    routing.spec.model,
+                    crate::costlog::peak_now(),
+                )
+                .with_thinking(routing.thinking),
+            );
+            Ok(self.plans.remove(0))
+        }
+
+        fn execute_step(
+            &mut self,
+            routing: &Routing,
+            _run: &StepRequest,
+            records: &mut Vec<CallRecord>,
+        ) -> Result<String, TaskError> {
+            let i = self.step_calls;
+            self.step_calls += 1;
+            self.seen_providers.push(routing.spec.provider.to_string());
+            self.seen_thinking.push(routing.thinking);
+            self.seen_kinds.push(routing.kind);
+            records.push(
+                CallRecord::new(
+                    routing.spec.provider,
+                    routing.spec.model,
+                    crate::costlog::peak_now(),
+                )
+                .with_thinking(routing.thinking),
+            );
+            if i < self.steps.len() {
+                match &self.steps[i] {
+                    Ok(s) => Ok(s.clone()),
+                    Err(e) => Err(match e {
+                        TaskError::StepFailed { step, reason } => TaskError::StepFailed {
+                            step: step.clone(),
+                            reason: reason.clone(),
+                        },
+                        other => TaskError::Core(crate::CoreError::Ledger(other.to_string())),
+                    }),
+                }
+            } else {
+                Ok(format!("step-{i} 完成"))
+            }
+        }
+
+        fn observe(
+            &mut self,
+            routing: &Routing,
+            _run: &ObserveRequest,
+            records: &mut Vec<CallRecord>,
+        ) -> Result<String, TaskError> {
+            let i = self.observe_calls;
+            self.observe_calls += 1;
+            self.seen_providers.push(routing.spec.provider.to_string());
+            self.seen_thinking.push(routing.thinking);
+            self.seen_kinds.push(routing.kind);
+            records.push(
+                CallRecord::new(
+                    routing.spec.provider,
+                    routing.spec.model,
+                    crate::costlog::peak_now(),
+                )
+                .with_thinking(routing.thinking),
+            );
+            Ok(self.observes.get(i).cloned().unwrap_or_else(|| {
+                r#"{"question":"怎么办？","options":["方案甲","方案乙"]}"#.to_string()
+            }))
+        }
+    }
+
+    fn engine<'a>(
+        router: &'a ModelRouter,
+        decider: &'a StubDecider,
+        handler: &'a mut ScriptedHandler,
+        store: &'a mut MemoryTaskStore,
+        budget: Budget,
+    ) -> Engine<'a, ScriptedHandler, MemoryTaskStore> {
+        Engine::new(router, decider, handler, store, budget)
+    }
+
+    #[test]
+    fn cost_records_reach_the_store() {
+        // 记账必须真的接上——否则花了多少没人知道
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[]), ("b", &["a"])]));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "两步").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        assert_eq!(store.costs.len(), 3, "拆解 1 次 + 两步，共 3 次调用");
+        assert_eq!(store.costs[0].provider, "deepseek", "拆解走深度档");
+        assert!(store.costs[0].thinking, "拆解要开思考");
+    }
+
+    #[test]
+    fn cost_records_do_not_pollute_the_task_projection() {
+        // 成本事件不是任务事件，不该出现在任务投影里
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[])]));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "一步").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        let t = store.project().get("t1").cloned().unwrap();
+        assert_eq!(t.state, TaskState::Done);
+        assert_eq!(t.steps.len(), 1);
+        assert!(!store.costs.is_empty());
+    }
+
+    fn plan_json(ids: &[(&str, &[&str])]) -> String {
+        let steps: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|(id, deps)| {
+                serde_json::json!({
+                    "id": id,
+                    "instruction": format!("做 {id}"),
+                    "depends_on": deps,
+                    "kind": "generation",
+                })
+            })
+            .collect();
+        serde_json::json!({ "steps": steps }).to_string()
+    }
+
+    #[test]
+    fn a_linear_task_runs_to_completion() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler =
+            ScriptedHandler::with_plan(&plan_json(&[("a", &[]), ("b", &["a"]), ("c", &["b"])]));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "把三件事依次做了").unwrap();
+
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        assert_eq!(outcome.task.state, TaskState::Done);
+        assert_eq!(outcome.task.tally(), (3, 0, 0));
+        assert_eq!(outcome.advance, Advance::Finished);
+        // 拆解 1 次 + 3 步
+        assert_eq!(outcome.used_model_calls, 4);
+    }
+
+    #[test]
+    fn independent_steps_all_get_run() {
+        // 三个互不依赖的步骤：ready_steps 一次返回三个，顺序执行也要全跑完
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler =
+            ScriptedHandler::with_plan(&plan_json(&[("a", &[]), ("b", &[]), ("c", &[])]));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "三件独立的事").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        assert_eq!(outcome.task.state, TaskState::Done);
+        assert_eq!(outcome.task.tally().0, 3);
+    }
+
+    #[test]
+    fn ready_steps_respects_dependencies() {
+        let mut t = Task::new("t", "g", 0);
+        t.steps = vec![
+            Step::new("a", "A", TaskKind::Generation),
+            Step::new("b", "B", TaskKind::Generation).with_depends_on(vec!["a".into()]),
+        ];
+        assert_eq!(ready_steps(&t), vec!["a"], "b 在 a 成功前不能跑");
+
+        t.step_mut("a").unwrap().state = StepState::Succeeded;
+        assert_eq!(ready_steps(&t), vec!["b"]);
+    }
+
+    #[test]
+    fn blocked_step_is_not_ready() {
+        let mut t = Task::new("t", "g", 0);
+        let mut s = Step::new("a", "A", TaskKind::Generation);
+        s.state = StepState::Blocked;
+        t.steps = vec![s];
+        assert!(ready_steps(&t).is_empty(), "等批准的步骤不能被自动选中");
+    }
+
+    #[test]
+    fn a_cycle_is_caught_before_spending_anything() {
+        // 成环必须在花钱之前查出来。注意 handler 一次都没被调用。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &["b"]), ("b", &["a"])]));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "互相依赖").unwrap();
+        let r = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1");
+        assert!(
+            matches!(r, Err(TaskError::CircularDependency { .. })),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn budget_exhaustion_stops_instead_of_retrying() {
+        // 预算用尽 → 停下等人，不是"再试一次"
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        // 5 步但预算只有 3 次调用：拆解用掉 1 次，只剩 2 次
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[
+            ("a", &[]),
+            ("b", &["a"]),
+            ("c", &["b"]),
+            ("d", &["c"]),
+            ("e", &["d"]),
+        ]));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "五步任务").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget {
+                max_model_calls: 3,
+                ..Default::default()
+            },
+        )
+        .run("t1")
+        .unwrap();
+        assert_eq!(outcome.used_model_calls, 3, "不该超预算");
+        assert_eq!(outcome.task.state, TaskState::AwaitingHuman);
+        match outcome.advance {
+            Advance::Waiting { reason } => assert!(reason.contains("预算"), "{reason}"),
+            other => panic!("应停下等人，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn too_many_steps_is_rejected_before_running_any() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[
+            ("a", &[]),
+            ("b", &[]),
+            ("c", &[]),
+            ("d", &[]),
+        ]));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "四步").unwrap();
+        let r = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget {
+                max_steps: 3,
+                ..Default::default()
+            },
+        )
+        .run("t1");
+        assert!(
+            matches!(r, Err(TaskError::TooManySteps { got: 4, limit: 3 })),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn unparsable_plan_stops_and_names_the_raw_text() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan("我觉得可以这么做：先这样再那样");
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "目标").unwrap();
+        let r = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1");
+        match r {
+            Err(TaskError::UnparsablePlan { raw, .. }) => {
+                assert!(raw.contains("我觉得"), "必须带上原文: {raw}")
+            }
+            other => panic!("应报无法解析，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_step_makes_dependents_skipped_not_failed() {
+        // 跳过不是失败：它自己没出错
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[]), ("b", &["a"])]))
+            .push_step(Err(TaskError::StepFailed {
+                step: "a".into(),
+                reason: "超时".into(),
+            }));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "两步").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget {
+                // 只允许试 1 次，避免测试里来回重试
+                max_attempts_per_step: 1,
+                ..Default::default()
+            },
+        )
+        .run("t1")
+        .unwrap();
+        assert_eq!(outcome.task.step("a").unwrap().state, StepState::Failed);
+        assert_eq!(
+            outcome.task.step("b").unwrap().state,
+            StepState::Skipped,
+            "依赖失败应跳过而不是也判失败"
+        );
+        assert_eq!(outcome.task.tally(), (0, 1, 1));
+    }
+
+    #[test]
+    fn a_failing_step_is_retried_up_to_the_limit() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[])]))
+            .push_step(Err(TaskError::StepFailed {
+                step: "a".into(),
+                reason: "第一次超时".into(),
+            }))
+            .push_step(Ok("第二次成了"));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "一步").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget {
+                max_attempts_per_step: 2,
+                ..Default::default()
+            },
+        )
+        .run("t1")
+        .unwrap();
+        let s = outcome.task.step("a").unwrap();
+        assert_eq!(s.state, StepState::Succeeded);
+        assert_eq!(s.attempts, 2, "两次尝试都该被记上");
+        assert_eq!(s.result.as_deref(), Some("第二次成了"));
+    }
+
+    #[test]
+    fn a_step_that_keeps_failing_settles_as_failed() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[])]))
+            .push_step(Err(TaskError::StepFailed {
+                step: "a".into(),
+                reason: "一直失败".into(),
+            }))
+            .push_step(Err(TaskError::StepFailed {
+                step: "a".into(),
+                reason: "还是失败".into(),
+            }));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "一步").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget {
+                max_attempts_per_step: 2,
+                ..Default::default()
+            },
+        )
+        .run("t1")
+        .unwrap();
+        assert_eq!(outcome.task.step("a").unwrap().state, StepState::Failed);
+        assert_eq!(outcome.task.state, TaskState::Done, "全部终态就是收工");
+    }
+
+    #[test]
+    fn decision_step_uses_the_local_decider() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding().with_choice("task_decision", "opt1");
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        // 让这一步成为决策点
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 选哪个方案？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        handler.observes =
+            vec![r#"{"question":"选哪个方案？","options":["保守方案","激进方案"]}"#.to_string()];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "需要选择的任务").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        assert_eq!(outcome.task.step("d").unwrap().state, StepState::Succeeded);
+        let result = outcome.task.step("d").unwrap().result.clone().unwrap();
+        assert!(result.contains("激进方案"), "应记录选中的那个: {result}");
+        // **恰好一次**：决策点的路由不该再去问一次本地决策模型，
+        // 它只该被用来"在选项里选一个"。
+        assert_eq!(decider.calls(), 1, "决策点必须问本地决策模型，且只问一次");
+        assert_eq!(handler.observe_calls, 1);
+        // 落盘的是选项原文，不是 opt0/opt1 这种占位键
+        assert!(!result.contains("opt0"), "台账里不该出现占位键: {result}");
+    }
+
+    #[test]
+    fn decision_step_escalates_when_the_decider_abstains() {
+        // 弃权 → 等人工，绝不默认选第一个
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding().with_choice("task_decision", "不在选项里");
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 选哪个？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "需要选择").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        assert_eq!(outcome.task.state, TaskState::AwaitingHuman);
+        assert_eq!(
+            outcome.task.step("d").unwrap().state,
+            StepState::Pending,
+            "弃权时步骤应退回待执行"
+        );
+        match outcome.advance {
+            Advance::Waiting { reason } => assert!(reason.contains("人工"), "{reason}"),
+            other => panic!("应升级人工，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decision_step_escalates_when_the_decider_errors() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::failing("sidecar 没起来");
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 选哪个？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "需要选择").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        assert_eq!(outcome.task.state, TaskState::AwaitingHuman);
+    }
+
+    // ---- 路由在任务框架里的接线 ----
+
+    #[test]
+    fn simple_steps_go_to_agnes_complex_steps_go_to_deepseek() {
+        // 使用者的要求：复杂任务给 DeepSeek，简单任务给 Agnes
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let plan = serde_json::json!({
+            "steps": [
+                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "lookup" },
+                { "id": "s2", "instruction": "分析这周的邮件并对比上周的变化趋势，评估是否需要调整",
+                  "depends_on": ["s1"], "kind": "analysis" }
+            ]
+        })
+        .to_string();
+        let mut handler = ScriptedHandler::with_plan(&plan);
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "先查日程再分析邮件").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        // 第一次调用是拆解，之后依次是 s1、s2
+        assert_eq!(handler.seen_kinds[1], TaskKind::Lookup);
+        assert_eq!(handler.seen_kinds[2], TaskKind::Analysis);
+        assert_eq!(
+            handler.seen_providers[1], "agnes",
+            "查找类应走 Agnes（{:?}）",
+            handler.seen_providers
+        );
+        assert!(!handler.seen_thinking[1], "查找类不该开思考");
+        assert_eq!(
+            handler.seen_providers[2], "deepseek",
+            "分析类需要多次调用 → DeepSeek（{:?}）",
+            handler.seen_providers
+        );
+        assert!(handler.seen_thinking[2], "分析类必须开思考");
+    }
+
+    #[test]
+    fn planning_itself_routes_to_a_reasoning_capable_model() {
+        // 拆解要推理，不能落在"服务端默认"的免费档上
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[])]));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "一件简单的事").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        assert_eq!(handler.seen_kinds[0], TaskKind::Planning);
+        assert!(
+            handler.seen_thinking[0],
+            "拆解必须开思考，否则拆不出像样的步骤"
+        );
+        assert_eq!(handler.seen_providers[0], "deepseek");
+    }
+
+    #[test]
+    fn step_routing_is_recorded_in_the_ledger() {
+        // 留痕是为了事后能解释账单
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[])]));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "一步").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        let t = store.project().get("t1").cloned().unwrap();
+        let rec = t.step("a").unwrap().routing.clone().expect("应记录路由");
+        assert!(!rec.reason.is_empty(), "理由必须能解释账单");
+        assert!(!rec.model.is_empty());
+    }
+
+    #[test]
+    fn state_survives_a_restart() {
+        // 台账是唯一事实来源：换个 store 实例重放事件，状态必须一样。
+        // 预算掐在中间，制造一个"没跑完"的任务。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let plan = plan_json(&[("a", &[]), ("b", &["a"]), ("c", &["b"])]);
+        let mut handler = ScriptedHandler::with_plan(&plan);
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "三步").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget {
+                max_model_calls: 2,
+                ..Default::default()
+            },
+        )
+        .run("t1")
+        .unwrap();
+
+        let before = store.project().get("t1").cloned().unwrap();
+        assert_eq!(before.state, TaskState::AwaitingHuman);
+        assert_eq!(before.step("a").unwrap().state, StepState::Succeeded);
+
+        // "重启"：只用事件流重新投影
+        let after = task_from_events(store.events()).get("t1").cloned().unwrap();
+        assert_eq!(after, before, "重放事件必须得到同一个任务");
+    }
+
+    #[test]
+    fn resume_continues_from_where_it_stopped() {
+        // 续跑：把预算放宽，同一个事件流接着跑应该能到完成
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let plan = plan_json(&[("a", &[]), ("b", &["a"]), ("c", &["b"])]);
+        let mut handler = ScriptedHandler::with_plan(&plan);
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "三步").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget {
+                max_model_calls: 2,
+                ..Default::default()
+            },
+        )
+        .run("t1")
+        .unwrap();
+
+        // 续跑前把状态从"等人工"放回执行中（模拟人处理完了）
+        store
+            .write(
+                "t1",
+                EventKind::TaskStateChanged,
+                serde_json::json!({ "task": "t1", "state": "running" }),
+            )
+            .unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        assert_eq!(outcome.task.state, TaskState::Done);
+        assert_eq!(outcome.task.tally().0, 3);
+        // a 不该被重跑：成功过的步骤不回到待执行
+        assert_eq!(outcome.task.step("a").unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn a_stalled_task_says_stalled_not_running() {
+        // 没有可跑步骤又没全部终态 → 卡住。不能表现成"还在跑"。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[])]));
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "a", "instruction": "做 a", "depends_on": [], "kind": "generation" }]
+        })
+        .to_string()];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "一步").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        // 手工把 a 置回 Blocked：既不是终态，也不在 ready 里
+        store
+            .write(
+                "t1",
+                EventKind::StepRunning,
+                serde_json::json!({ "task": "t1", "step": "a" }),
+            )
+            .unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        // Running 的步骤不该被抢着再跑一遍
+        assert_eq!(outcome.task.step("a").unwrap().state, StepState::Running);
+    }
+
+    #[test]
+    fn summarize_reports_failures_not_just_successes() {
+        // 只报成功的部分会让人以为任务做完了
+        let mut t = Task::new("t", "目标", 0);
+        let mut a = Step::new("a", "做 a", TaskKind::Generation);
+        a.state = StepState::Succeeded;
+        a.result = Some("成了".into());
+        let mut b = Step::new("b", "做 b", TaskKind::Generation);
+        b.state = StepState::Failed;
+        b.result = Some("超时".into());
+        t.steps = vec![a, b];
+        let s = summarize(&t);
+        assert!(s.contains("失败 1"), "{s}");
+        assert!(s.contains("超时"), "失败原因必须出现: {s}");
+        assert!(s.contains("成了"), "{s}");
+    }
+
+    #[test]
+    fn step_table_shows_dependencies() {
+        let mut t = Task::new("t", "g", 0);
+        t.steps = vec![
+            Step::new("a", "A", TaskKind::Generation),
+            Step::new("b", "B", TaskKind::Generation).with_depends_on(vec!["a".into()]),
+        ];
+        let table = step_table(&t);
+        assert_eq!(table.len(), 2);
+        assert_eq!(table[0].2, "-", "无依赖应显示为 -");
+        assert_eq!(table[1].2, "a");
+    }
+
+    #[test]
+    fn empty_inputs_is_empty() {
+        assert!(empty_inputs().is_empty());
+    }
+
+    #[test]
+    fn thresholds_are_used_for_step_profiles() {
+        // 步骤画像复用路由的阈值，不要在任务框架里另起一套
+        const { assert!(crate::think::thresholds::MULTI_CALL >= 2) };
+        let long = "x".repeat(crate::think::thresholds::SHORT_PROMPT_CHARS + 10);
+        assert_eq!(TaskKind::classify(&long), None);
+    }
+
+    // ---- 步骤产出判定 ----
+
+    #[test]
+    fn ok_mark_is_done_and_stripped() {
+        assert_eq!(
+            classify_step_output("OK: 北京今天 22℃"),
+            StepVerdict::Done("北京今天 22℃".into())
+        );
+        // 大小写、全角冒号、行首空白都要容忍
+        assert_eq!(
+            classify_step_output("  ok：做完了"),
+            StepVerdict::Done("做完了".into())
+        );
+    }
+
+    #[test]
+    fn blocked_mark_is_blocked() {
+        assert_eq!(
+            classify_step_output("BLOCKED: 我没有联网能力"),
+            StepVerdict::Blocked("我没有联网能力".into())
+        );
+        assert_eq!(
+            classify_step_output("blocked：缺 API key"),
+            StepVerdict::Blocked("缺 API key".into())
+        );
+    }
+
+    #[test]
+    fn a_mark_in_the_middle_does_not_count() {
+        // 只在开头认标记。正文里提到 BLOCKED 这个词不算"这一步被阻塞"
+        match classify_step_output("先说明一下。BLOCKED: 这是文档里的示例") {
+            StepVerdict::Unmarked(_) => {}
+            other => panic!("正文里的标记不该被当成开头标记: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unmarked_output_is_not_treated_as_failure() {
+        // 内容确实在那儿，判失败会让它白重试一次
+        match classify_step_output("北京今天 22℃") {
+            StepVerdict::Unmarked(t) => assert_eq!(t, "北京今天 22℃"),
+            other => panic!("无标记应按未标记处理: {other:?}"),
+        }
+    }
+
+    /// 回归：**模型说"做不了"的时候，不能记成成功。**
+    ///
+    /// 真实运行里的三步任务，前两步模型都回了"做不了。我没有联网能力……"，
+    /// 而引擎把它们记成成功，任务报告"完成 2 步"——实际什么都没办成。
+    /// 报告说做完了而实际没做，是最坏的一种错。
+    #[test]
+    fn a_blocked_step_is_recorded_as_failed_not_succeeded() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[]), ("b", &["a"])]));
+        handler.steps = vec![
+            Ok("BLOCKED: 我没有联网能力，无法获取实时天气".to_string()),
+            Ok("不该跑到这里".to_string()),
+        ];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "查天气再比较").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        let a = outcome.task.step("a").unwrap();
+        assert_eq!(a.state, StepState::Failed, "说了做不了就不能算成功");
+        assert!(
+            a.result.as_deref().unwrap_or("").contains("联网"),
+            "失败原因要留下模型的原话: {:?}",
+            a.result
+        );
+        // 依赖它的步骤应该被跳过，而不是拿着"做不了"当输入硬跑
+        assert_eq!(outcome.task.step("b").unwrap().state, StepState::Skipped);
+        assert_eq!(outcome.task.tally(), (0, 1, 1));
+        assert!(
+            handler.step_calls == 1,
+            "被阻塞的步骤不该重试（模型已经说了缺什么）"
+        );
+    }
+
+    #[test]
+    fn an_unmarked_step_still_succeeds_but_is_flagged() {
+        // 老模型不认标记也不该把任务全判死；但台账里要看得见"没标记"
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[])]));
+        handler.steps = vec![Ok("北京今天 22℃".to_string())];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "查天气").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        assert_eq!(outcome.task.step("a").unwrap().state, StepState::Succeeded);
+
+        let flagged = store.events().iter().any(|e| {
+            e.kind == EventKind::StepSucceeded
+                && e.data.get("marked").and_then(|v| v.as_bool()) == Some(false)
+        });
+        assert!(flagged, "无标记的产出要在台账里留痕");
+    }
+
+    #[test]
+    fn a_marked_ok_step_records_the_stripped_text() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[])]));
+        handler.steps = vec![Ok("OK: 22℃".to_string())];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "查天气").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        // 标记本身不该进结果正文——它只是协议
+        assert_eq!(
+            outcome.task.step("a").unwrap().result.as_deref(),
+            Some("22℃")
+        );
+    }
+}

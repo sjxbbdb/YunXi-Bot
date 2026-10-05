@@ -105,7 +105,12 @@ impl Default for ThinkerConfig {
 }
 
 impl ThinkerConfig {
-    /// DeepSeek Flash。**默认关思考**——实测开思考时输出 token 是关掉时的 4 倍多。
+    /// DeepSeek Flash。
+    ///
+    /// `thinking` 这里给 [`Thinking::Enabled`]，含义是**"这个端点支持思考"**，
+    /// 不是"每个请求都开"——实测开思考输出 token 是关掉的 2.5 倍。
+    /// 实际发什么由路由按任务类型逐任务决定（见 [`super::router::ReasoningEffort`]），
+    /// 调用方拿到 [`super::router::Routing`] 后应用 `routing.thinking_field()` 覆盖。
     pub fn deepseek() -> Self {
         Self {
             base_url: "https://api.deepseek.com/v1".into(),
@@ -113,7 +118,7 @@ impl ThinkerConfig {
             timeout: Duration::from_secs(180),
             rpm: 60,
             key_file: "deepseek.key",
-            thinking: Thinking::Disabled,
+            thinking: Thinking::Enabled,
         }
     }
 
@@ -239,8 +244,15 @@ struct WireChoice {
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct WireMessage {
+    /// **可以是 `null`**：模型只返回工具调用时 `content` 就是 null。
+    /// 早先把 `None` 当畸形响应，会在工具调用路径上误报失败。
     #[serde(default)]
     content: Option<String>,
+    /// 思考过程。不开思考时不存在。
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<serde_json::Value>,
 }
 
 impl Thinker for OpenAiThinker {
@@ -276,9 +288,15 @@ impl Thinker for OpenAiThinker {
             // ⚠️ 思考模式下 temperature 不生效（官方文档：设了不报错，但也不生效）
             body["temperature"] = serde_json::json!(t);
         }
-        // 思考模式开关。不打这个字段就用服务端默认——对 DeepSeek 就是**开**
-        if let Some(t) = self.config.thinking.body_field() {
+        // 思考模式开关。**请求上的设置优先于客户端配置**——思考模式是任务的属性。
+        // 端点不支持思考时 effective_thinking 会返回 ServerDefault，即不打这个字段。
+        let thinking = req.effective_thinking(self.config.thinking);
+        if let Some(t) = thinking.body_field() {
             body["thinking"] = t;
+        }
+        // 工具描述。实测开思考时带 tools 不报错。
+        if !req.tools.is_empty() {
+            body["tools"] = serde_json::json!(req.tools);
         }
 
         let resp = self
@@ -328,10 +346,19 @@ impl Thinker for OpenAiThinker {
             .next()
             .ok_or_else(|| ThinkError::Malformed("响应里没有 choices".into()))?;
 
-        let content = choice
-            .message
-            .content
-            .ok_or_else(|| ThinkError::Malformed("响应里没有 message.content".into()))?;
+        let msg = choice.message;
+        let tool_calls = msg.tool_calls;
+        // content 为 null 是合法的——只要带回了工具调用。
+        // 两者都空才是真的畸形响应。
+        let content = match msg.content {
+            Some(c) => c,
+            None if !tool_calls.is_empty() => String::new(),
+            None => {
+                return Err(ThinkError::Malformed(
+                    "响应里既没有 message.content 也没有 tool_calls".into(),
+                ));
+            }
+        };
 
         Ok(ThinkResponse {
             content,
@@ -342,6 +369,9 @@ impl Thinker for OpenAiThinker {
             },
             usage: wire.usage,
             finish_reason: choice.finish_reason,
+            reasoning: msg.reasoning_content,
+            thinking,
+            tool_calls,
         })
     }
 
@@ -391,6 +421,9 @@ impl Thinker for StubThinker {
             model: "stub".into(),
             usage: Usage::default(),
             finish_reason: Some("stop".into()),
+            reasoning: None,
+            thinking: _req.effective_thinking(Thinking::ServerDefault),
+            tool_calls: Vec::new(),
         })
     }
     fn model(&self) -> &str {

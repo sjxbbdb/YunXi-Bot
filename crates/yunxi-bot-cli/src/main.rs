@@ -2,13 +2,21 @@
 //!
 //! 当前里程碑：**可运行的调度原型**——任务能按触发条件自动执行、结果落台账、
 //! 需批准的任务被拦下、崩溃残留被回收、状态跨进程存活。
+//!
+//! 外加**任务执行框架**（`do` / `tasks` / `resume`）：人类给一个目标，
+//! 系统拆解、逐步执行、决策点交给本地决策模型，全程留痕。
+
+mod chat_handler;
 
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+use yunxi_bot_core::decide::Decider;
 use yunxi_bot_core::job::{JobId, JobSpec, JobState, Trigger};
 use yunxi_bot_core::ledger::{EventKind, Ledger};
+use yunxi_bot_core::task::engine::{LedgerTaskStore, TaskStore};
+use yunxi_bot_core::think::{ModelSpec, ReasoningEffort, TaskKind, TaskProfile};
 use yunxi_bot_core::{TickOptions, now_millis, policy, tick};
 
 fn default_home() -> PathBuf {
@@ -71,9 +79,25 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
 
   yunxi-bot run <id>          立即执行一次（忽略触发条件）
   yunxi-bot list              列出全部任务
+
+  —— 任务执行框架（给目标，不是给命令）——
+  yunxi-bot do \"<目标>\"       拆解目标、逐步执行、完成一个做一个
+      --budget <n>          模型调用次数上限（默认 20）
+      --max-steps <n>       拆解出的步骤上限（默认 12）
+      --dry-run             不调模型，只展示会怎么拆分与路由（不花钱）
+      --show-prompt         打印三段稳定前缀（核对缓存前提，不花钱）
+      --provider <名>       强制全程用一个模型：agnes / deepseek
+      --thinking <模式>      auto（默认，按任务类型）/ on / off
+      --id <名字>           指定任务 id（默认自动生成）
+  yunxi-bot tasks             列出执行框架里的任务及其步骤
+  yunxi-bot tasks <id>        看一个任务的步骤明细
+  yunxi-bot resume <id>       续跑一个停在半路的任务
+
   yunxi-bot approve <id>      批准待批准任务
   yunxi-bot log [-n N]        显示最近 N 条台账事件（默认 20）
   yunxi-bot status            数据目录与台账概况
+  yunxi-bot cost [选项]       模型调用花销（按台账重算）
+      --calls <n>           显示最近 n 次调用明细（默认不显示）
   yunxi-bot policy            列出权限预设
   yunxi-bot decide [选项]     演示决策层
       --demo                只打印六类降级方向表（不需要模型）
@@ -147,6 +171,10 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "daemon" => cmd_daemon(rest),
         "supervise" => cmd_supervise(rest),
         "run" => cmd_run(rest),
+        "do" => cmd_do(rest),
+        "tasks" => cmd_tasks(rest),
+        "resume" => cmd_resume(rest),
+        "cost" => cmd_cost(rest),
         "log" => cmd_log(rest),
         other => {
             eprintln!("未知命令: {other}\n");
@@ -1161,6 +1189,467 @@ fn cmd_run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         eprintln!("执行失败（退出码 {}）: {err}", outcome.exit_code);
         Ok(1)
     }
+}
+
+// ——————————————————— 任务执行框架 ———————————————————
+
+/// 任务 id 生成：时间戳 + 目标前几个字。
+///
+/// 不用随机数：**同一秒内的两次提交应该看得见冲突**，而不是悄悄覆盖。
+/// 撞了就加后缀，见 [`unique_task_id`]。
+fn make_task_id(goal: &str) -> String {
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let head: String = goal
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(6)
+        .collect();
+    format!("do-{stamp}-{head}")
+}
+
+fn unique_task_id(store: &yunxi_bot_core::task::TaskSet, base: &str) -> String {
+    if !store.contains_key(base) {
+        return base.to_string();
+    }
+    for i in 2..1000 {
+        let cand = format!("{base}-{i}");
+        if !store.contains_key(&cand) {
+            return cand;
+        }
+    }
+    base.to_string()
+}
+
+/// 从 `--thinking` 解析思考策略。
+fn parse_effort(args: &[String]) -> Result<ReasoningEffort, Box<dyn std::error::Error>> {
+    Ok(match flag(args, "--thinking").unwrap_or("auto") {
+        "auto" => ReasoningEffort::Auto,
+        "on" | "always" => ReasoningEffort::Always,
+        "off" | "never" => ReasoningEffort::Never,
+        other => {
+            eprintln!("未知思考模式 {other}，可用: auto / on / off");
+            return Err("参数错误".into());
+        }
+    })
+}
+
+/// 打开台账 + 决策层。**决策层连不上要显式说出来**，不能静默降级。
+fn open_decider(args: &[String]) -> (Ledger, yunxi_bot_core::decide::LayaDecider, bool) {
+    let endpoint = flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide");
+    let decider = yunxi_bot_core::decide::LayaDecider::new(endpoint);
+    let ledger = Ledger::open(ledger_path()).expect("无法打开台账");
+    let alive = decider
+        .decide(&yunxi_bot_core::decide::DecisionRequest::new(
+            serde_json::json!({}),
+            vec![],
+        ))
+        .is_ok();
+    (ledger, decider, alive)
+}
+
+fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::task::Budget;
+    use yunxi_bot_core::task::engine::{Engine, LedgerTaskStore, create_task, summarize};
+    use yunxi_bot_core::think::ModelRouter;
+
+    let goal: String = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| !a.starts_with("--") && !(*i > 0 && args[i - 1].starts_with("--")))
+        .map(|(_, a)| a.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if goal.trim().is_empty() {
+        eprintln!("缺少目标。用法: yunxi-bot do \"把这件事办了\"");
+        return Ok(2);
+    }
+
+    let budget = Budget {
+        max_model_calls: flag(args, "--budget")
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or(20),
+        max_steps: flag(args, "--max-steps")
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or(12),
+        ..Default::default()
+    };
+    let effort = parse_effort(args)?;
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+
+    // 缓存命中的前提是"前缀逐字节不变"，而这是使用者唯一能亲眼核对的地方。
+    if args.iter().any(|a| a == "--show-prompt") {
+        let h = chat_handler::ChatHandler::new(
+            default_home(),
+            "云熙",
+            chat_handler::DEFAULT_PERSONA,
+            chat_handler::default_rules(),
+        );
+        println!("—— 三个会话各自的稳定前缀（跨调用必须逐字节相同）——");
+        for (name, p) in h.stable_prefixes() {
+            println!("\n===== {name}（{} 字符）=====", p.chars().count());
+            println!("{p}");
+        }
+        println!("\n易变的部分（目标、当前步骤、前置结果）不进这段前缀，");
+        println!("历史只往后追加、不改前面——这样下一次调用才能命中缓存。");
+        return Ok(0);
+    }
+
+    let router = ModelRouter::default();
+    // `--provider` 强制全程用一个模型。做法是**换掉整张档位表**，
+    // 而不是在路由里加特例——路由只有一套判据，别为调试口子fork 一份逻辑。
+    let router = match flag(args, "--provider") {
+        None => router,
+        Some(p) => {
+            let spec = match p {
+                "deepseek" => ModelSpec::DEEPSEEK_FLASH,
+                "agnes" => ModelSpec::AGNES_FLASH,
+                other => {
+                    eprintln!("未知 provider {other}，可用: agnes / deepseek");
+                    return Ok(2);
+                }
+            };
+            let tier = spec.tier;
+            println!("注意      : --provider 强制全程用 {p}，已关闭自动选择");
+            ModelRouter::new(vec![spec], tier)
+        }
+    };
+    let (ledger, decider, decider_alive) = open_decider(args);
+
+    // ---- 先把"会怎么走"说清楚，再花钱 ----
+    //
+    // 注意这里要报的是**拆解那一步**的路由，不是"目标整体"的路由：
+    // 真正先发生的是拆解，而拆解固定按 Planning 走。早先我打的是目标整体的
+    // 路由，结果和实际执行的第一跳对不上——预览骗人比没有预览更糟。
+    let plan_kind = TaskKind::Planning;
+    let plan_profile = TaskProfile {
+        prompt_chars: goal.chars().count(),
+        step_count: 3,
+        explicit_multi: yunxi_bot_core::think::detect_explicit_multi(&goal),
+        has_code: yunxi_bot_core::think::detect_code(&goal),
+    };
+    let preview = router.route(&goal, plan_kind, &plan_profile, effort, None);
+
+    println!("目标      : {goal}");
+    println!("拆解路由  : {}", chat_handler::route_line(&preview, effort));
+    println!("拆解理由  : {}", preview.reason);
+    println!("步骤路由  : 拆出来的每步各自判——按步骤类型决定用哪个模型、要不要开思考");
+    println!(
+        "预算      : 最多 {} 次模型调用 / {} 个步骤",
+        budget.max_model_calls, budget.max_steps
+    );
+    let peak = yunxi_bot_core::costlog::peak_now();
+    println!(
+        "拆解估算  : ¥{:.6}（{}时段，按未命中缓存计；全部步骤另算）",
+        preview.estimated_cost(peak).total(),
+        if peak { "高峰" } else { "空闲" }
+    );
+    if !decider_alive {
+        println!();
+        println!("⚠ 本地决策模型连不上：需要它拍板的步骤会全部升级为人工介入。");
+        println!("  启动 sidecar（python sidecar/verdict_server.py）后重跑即可。");
+    }
+    if dry_run {
+        println!("（--dry-run：不调用任何模型）");
+    }
+    println!();
+
+    let mut store = LedgerTaskStore::new(ledger);
+    let tasks = store.project();
+    let task_id = match flag(args, "--id") {
+        Some(id) => id.to_string(),
+        None => unique_task_id(&tasks, &make_task_id(&goal)),
+    };
+    create_task(&mut store, &task_id, &goal)?;
+
+    let outcome = if dry_run {
+        let mut handler = chat_handler::DryRunHandler::default();
+        let out = Engine::new(&router, &decider, &mut handler, &mut store, budget)
+            .with_effort(effort)
+            .run(&task_id)?;
+        println!("—— 干跑推演 ——");
+        for line in &handler.seen {
+            println!("  {line}");
+        }
+        println!();
+        out
+    } else {
+        let mut handler = chat_handler::ChatHandler::new(
+            default_home(),
+            "云熙",
+            chat_handler::DEFAULT_PERSONA,
+            chat_handler::default_rules(),
+        );
+        Engine::new(&router, &decider, &mut handler, &mut store, budget)
+            .with_effort(effort)
+            .run(&task_id)?
+    };
+
+    println!("任务 id   : {task_id}（用 `yunxi-bot tasks {task_id}` 看明细）");
+    println!();
+    print!("{}", summarize(&outcome.task));
+    println!();
+    println!("本次模型调用 : {} 次", outcome.used_model_calls);
+    let (done, failed, skipped) = outcome.task.tally();
+    match &outcome.advance {
+        yunxi_bot_core::task::Advance::Finished => {
+            // **"全部终态"不等于"都成功"。** 只报"完成"会让失败的步骤被读成
+            // 已经办好了——这是最危险的一种报告方式，所以这里必须分开说。
+            if failed == 0 && skipped == 0 {
+                println!("结果      : 完成（{done} 步全部成功）");
+                Ok(0)
+            } else {
+                println!("结果      : 完成，但有 {failed} 步失败、{skipped} 步被跳过");
+                println!("           成功的是 {done} 步。失败原因见上面的 ✗ 行。");
+                Ok(1)
+            }
+        }
+        yunxi_bot_core::task::Advance::Waiting { reason } => {
+            println!("结果      : 停下等人");
+            println!("原因      : {reason}");
+            println!();
+            println!("处理完之后用 `yunxi-bot resume {task_id}` 续跑。");
+            Ok(3)
+        }
+        yunxi_bot_core::task::Advance::Progress { settled, total, .. } => {
+            println!("结果      : 中途返回（{settled}/{total}）—— 这不该发生，请报告");
+            Ok(1)
+        }
+    }
+}
+
+fn cmd_tasks(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::task::engine::step_table;
+    let store = LedgerTaskStore::new(Ledger::open(ledger_path())?);
+    let tasks = store.project();
+
+    if let Some(id) = args.first().filter(|s| !s.starts_with("--")) {
+        let Some(t) = tasks.get(id) else {
+            eprintln!("找不到任务 {id}");
+            return Ok(2);
+        };
+        println!("任务      : {}", t.id);
+        println!("目标      : {}", t.goal);
+        println!("状态      : {}", t.state.label());
+        let (done, failed, skipped) = t.tally();
+        println!(
+            "进度      : 完成 {done} / 失败 {failed} / 跳过 {skipped} / 共 {}",
+            t.steps.len()
+        );
+        println!();
+        println!("{:<6} {:<8} {:<10} 指令", "步骤", "状态", "依赖");
+        for (id, state, deps) in step_table(t) {
+            let instr = t
+                .step(&id)
+                .map(|s| s.instruction.clone())
+                .unwrap_or_default();
+            let head: String = instr.chars().take(46).collect();
+            println!("{id:<6} {state:<8} {deps:<10} {head}");
+        }
+        // 路由留痕：解释"为什么花了这笔钱"
+        let routed: Vec<&yunxi_bot_core::task::Step> =
+            t.steps.iter().filter(|s| s.routing.is_some()).collect();
+        if !routed.is_empty() {
+            println!();
+            println!("路由留痕:");
+            for s in routed {
+                let r = s.routing.as_ref().expect("上面刚判过");
+                println!(
+                    "  {} → {}/{} 思考{}",
+                    s.id,
+                    r.provider,
+                    r.model,
+                    if r.thinking { "开" } else { "关" }
+                );
+                println!("      {}", r.reason);
+            }
+        }
+        // 结果与失败原因**都要显示**，只显示成功的会让人以为做完了
+        let with_result: Vec<&yunxi_bot_core::task::Step> =
+            t.steps.iter().filter(|s| s.result.is_some()).collect();
+        if !with_result.is_empty() {
+            println!();
+            println!("结果:");
+            for s in with_result {
+                let r = s.result.as_ref().expect("上面刚判过");
+                let head: String = r.chars().take(200).collect();
+                println!("  [{}] {}", s.id, head);
+            }
+        }
+        return Ok(0);
+    }
+
+    if tasks.is_empty() {
+        println!("（还没有用 `do` 提交过任务）");
+        return Ok(0);
+    }
+    println!("{:<34} {:<8} {:<16} 目标", "任务 id", "状态", "进度");
+    for (id, t) in &tasks {
+        let (done, failed, skipped) = t.tally();
+        let progress = format!(
+            "{done}/{}{}{}",
+            t.steps.len(),
+            if failed > 0 {
+                format!(" 失败{failed}")
+            } else {
+                String::new()
+            },
+            if skipped > 0 {
+                format!(" 跳过{skipped}")
+            } else {
+                String::new()
+            }
+        );
+        let goal: String = t.goal.chars().take(30).collect();
+        println!("{id:<34} {:<8} {progress:<16} {goal}", t.state.label());
+    }
+    Ok(0)
+}
+
+fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::task::engine::{Engine, LedgerTaskStore, summarize};
+    use yunxi_bot_core::task::{Budget, TaskState};
+    use yunxi_bot_core::think::ModelRouter;
+
+    let Some(id) = args.first().filter(|s| !s.starts_with("--")) else {
+        eprintln!("缺少任务 id。用法: yunxi-bot resume <id>");
+        return Ok(2);
+    };
+
+    let router = ModelRouter::default();
+    let (_, decider, _) = open_decider(args);
+    let mut store = LedgerTaskStore::new(Ledger::open(ledger_path())?);
+    let tasks = store.project();
+    let Some(t) = tasks.get(id) else {
+        eprintln!("找不到任务 {id}");
+        return Ok(2);
+    };
+    if t.state.is_terminal() {
+        println!("任务 {id} 已经是{}，不需要续跑。", t.state.label());
+        return Ok(0);
+    }
+    if t.state == TaskState::AwaitingHuman {
+        // 人处理完了，把状态放回执行中，剩下的交给引擎
+        store.write(
+            id,
+            EventKind::TaskStateChanged,
+            serde_json::json!({ "task": id, "state": "running" }),
+        )?;
+        println!(
+            "已把任务 {id} 从「{}」放回执行中。",
+            TaskState::AwaitingHuman.label()
+        );
+    }
+
+    let budget = Budget {
+        max_model_calls: flag(args, "--budget")
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or(20),
+        max_steps: t.steps.len().max(12) as u32,
+        ..Default::default()
+    };
+    let effort = parse_effort(args)?;
+
+    let mut handler = chat_handler::ChatHandler::new(
+        default_home(),
+        "云熙",
+        chat_handler::DEFAULT_PERSONA,
+        chat_handler::default_rules(),
+    );
+    let outcome = {
+        let mut e =
+            Engine::new(&router, &decider, &mut handler, &mut store, budget).with_effort(effort);
+        e.run(id)?
+    };
+    print!("{}", summarize(&outcome.task));
+    println!("\n本次模型调用 : {} 次", outcome.used_model_calls);
+    let (done, failed, skipped) = outcome.task.tally();
+    match &outcome.advance {
+        yunxi_bot_core::task::Advance::Finished => {
+            if failed == 0 && skipped == 0 {
+                println!("结果      : 完成（{done} 步全部成功）");
+                Ok(0)
+            } else {
+                println!("结果      : 完成，但有 {failed} 步失败、{skipped} 步被跳过");
+                Ok(1)
+            }
+        }
+        yunxi_bot_core::task::Advance::Waiting { reason } => {
+            println!("仍在等人 : {reason}");
+            Ok(3)
+        }
+        yunxi_bot_core::task::Advance::Progress { .. } => Ok(1),
+    }
+}
+
+fn cmd_cost(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::costlog::{price_for, project_costs};
+    let l = Ledger::open(ledger_path())?;
+    let r = project_costs(l.events());
+
+    if r.calls == 0 {
+        println!("（台账里还没有模型调用记录）");
+        return Ok(0);
+    }
+    println!("调用次数  : {}", r.calls);
+    println!(
+        "token     : 输入 {}（命中 {} / 未命中 {}）/ 输出 {}",
+        r.prompt_tokens, r.cache_hit_tokens, r.cache_miss_tokens, r.completion_tokens
+    );
+    if let Some(rate) = r.cache_hit_rate() {
+        println!("缓存命中率: {:.1}%", rate * 100.0);
+    } else {
+        println!("缓存命中率: 未知（服务端没回缓存字段）");
+    }
+    if r.calls_without_cache_data > 0 {
+        println!(
+            "           其中 {} 次没有缓存数据——这些按未命中计费，实际可能更省",
+            r.calls_without_cache_data
+        );
+    }
+    println!("思考调用  : {}/{} 次", r.thinking_calls, r.calls);
+    println!();
+    println!("合计      : ¥{:.6}", r.total);
+    if r.saved() > 0.0 {
+        println!(
+            "缓存省下  : ¥{:.6}（不命中会花 ¥{:.6}）",
+            r.saved(),
+            r.without_cache
+        );
+    }
+
+    let n: usize = flag(args, "--calls")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(0);
+    if n > 0 {
+        use yunxi_bot_core::costlog::CallRecord;
+        println!();
+        println!("最近 {n} 次调用:");
+        let recs: Vec<CallRecord> = l
+            .events()
+            .iter()
+            .filter(|e| e.kind == EventKind::ModelCalled)
+            .filter_map(|e| serde_json::from_value(e.data.clone()).ok())
+            .collect();
+        for rec in recs.iter().rev().take(n).rev() {
+            let money = price_for(&rec.provider)
+                .map(|p| rec.cost(&p).total())
+                .unwrap_or(0.0);
+            println!(
+                "  {}/{} 思考{} {}tok 入/{}tok 出 ¥{:.6}",
+                rec.provider,
+                rec.model,
+                if rec.thinking { "开" } else { "关" },
+                rec.usage.prompt_tokens,
+                rec.usage.completion_tokens,
+                money
+            );
+        }
+    }
+    Ok(0)
 }
 
 fn cmd_log(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {

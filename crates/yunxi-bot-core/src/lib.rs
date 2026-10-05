@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod companion;
+pub mod costlog;
 pub mod decide;
 pub mod exec;
 pub mod instance;
@@ -23,6 +24,7 @@ pub mod ledger;
 pub mod memory;
 pub mod policy;
 pub mod runner;
+pub mod task;
 pub mod think;
 pub mod trigger;
 pub mod win_job;
