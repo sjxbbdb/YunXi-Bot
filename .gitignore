@@ -9,8 +9,10 @@ data/
 *.db-wal
 *.db-shm
 
-# 锁文件与日志
+# 运行时锁与日志
+# 注意放行 Cargo.lock——它是**依赖**锁，必须入库才能保证安装可复现
 *.lock
+!Cargo.lock
 *.log
 
 # 打包产物（模型 zip 约 356MB，只上传到 Release，绝不入库）
