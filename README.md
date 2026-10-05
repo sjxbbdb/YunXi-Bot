@@ -39,17 +39,19 @@ state（含你的偏好与约束）+ 类型化问题
 
 ## 当前状态
 
-**早期。** 已完成的是**内聚内核**的第一层：
+**可运行的调度原型。** 任务能按触发条件自动执行、结果落台账、需批准的任务被拦下、
+崩溃残留被回收、状态跨进程存活。
 
 | 模块 | 状态 |
 |---|---|
-| `job` — 任务模型与状态机 | ✅ 已实现，含非法迁移白名单 |
-| `ledger` — append-only 台账 + 投影 | ✅ 已实现，含边界与格式版本 |
-| `policy` — 两个正交旋钮 + 封闭审批词汇表 | ✅ 已实现 |
-| `trigger` — 定时 / cron / 文件监听 | ✅ 已实现，含单飞与崩溃残留回收 |
-| `exec` — 子进程执行与凭证剥离 | ⬜ 待实现 |
+| `job` — 任务模型与状态机 | ✅ 状态迁移白名单；区分「上次运行结果」与「任务生命周期」 |
+| `ledger` — append-only 台账 + 投影 | ✅ 边界内审计、格式版本、拒绝无损 JSON |
+| `policy` — 两个正交旋钮 + 封闭审批词汇表 | ✅ 表外结果一律归一为 `unavailable` |
+| `trigger` — 定时 / cron / 文件监听 | ✅ 本地时间 cron、单飞、崩溃残留回收 |
+| `exec` — 子进程执行与凭证剥离 | ✅ 硬超时 + 进程树清理；**拿不到要求的隔离就拒绝执行** |
+| `runner` — 调度循环 | ✅ 把上面五个模块串成一个回合 |
+| 常驻守护 | ✅ `daemon` 子命令（单实例锁、开机自启待补） |
 | 决策层（决策模型接入 + 降级策略） | ⬜ 待实现 |
-| 常驻守护进程 | ⬜ 待实现 |
 | 陪伴层 / 记忆层 / 入口层 | ⬜ 待实现 |
 
 架构与边界的完整设计见 **[ADR-0001](docs/adr/0001-架构与边界.md)**。
@@ -64,16 +66,30 @@ state（含你的偏好与约束）+ 类型化问题
 cargo build
 cargo test
 
-# 创建一个定时任务
-cargo run -- add "每日备份" --every 3600 -- pwsh -c "Write-Output backup-done"
+# 创建一个每 2 秒执行的任务
+cargo run -- add "心跳任务" --every 2 -- cmd /C "echo heartbeat-ok"
 
-# 创建一个不可逆任务（会先进入待批准）
-cargo run -- add "发布公告" --irreversible --cron "0 9 * * *" -- ./publish.sh
+# 创建一个不可逆任务（创建即进入待批准，不会执行）
+cargo run -- add "发送通知" --irreversible --every 2 -- ./publish.sh
 
-cargo run -- list        # 列出任务
+# 常驻守护：每 1 秒一轮，跑 6 轮（去掉 --max-ticks 就是真常驻）
+cargo run -- daemon --interval 1000 --max-ticks 6
+
+cargo run -- list          # 列出任务
+cargo run -- log -n 12     # 看台账事件流
 cargo run -- approve <id>  # 批准待批准任务
-cargo run -- status      # 台账概况
-cargo run -- policy      # 权限预设
+cargo run -- policy        # 权限预设
+```
+
+实测输出（心跳任务执行 3 次，不可逆任务一次都没跑）：
+
+```text
+[  1] 检查 2｜到期 1｜单飞跳过 0｜待批准 0｜成功 1｜失败 0｜残留回收 0
+[  3] 检查 2｜到期 1｜单飞跳过 0｜待批准 0｜成功 1｜失败 0｜残留回收 0
+[  5] 检查 2｜到期 1｜单飞跳过 0｜待批准 0｜成功 1｜失败 0｜残留回收 0
+
+   3  job_started            1a10bc19ef97f7c
+   4  job_succeeded          1a10bc19ef97f7c  exit_code=0 duration_ms=27 isolation=进程隔离（未实施 OS 级强制）
 ```
 
 数据目录默认为 `%LOCALAPPDATA%\YunXiBot`（Windows）或 `~/.yunxi-bot`，可用 `YUNXI_BOT_HOME` 覆盖。

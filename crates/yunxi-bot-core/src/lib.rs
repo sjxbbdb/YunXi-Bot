@@ -13,16 +13,20 @@
 //! 3. 决策模型的判断不能替代策略——模型给概率，约束层做决定。
 //! 4. 不写入边界外的审计事件——宁可抛错。
 
+pub mod exec;
 pub mod job;
 pub mod ledger;
 pub mod policy;
+pub mod runner;
 pub mod trigger;
 
+pub use exec::{ExecError, ExecOptions, ExecOutcome, IsolationLevel, IsolationRequirement};
 pub use job::{Job, JobId, JobSpec, JobState, Trigger};
 pub use ledger::{Event, EventKind, Ledger, LedgerError, SpanGuard};
 pub use policy::{
     ApprovalOutcome, ApprovalPolicy, PermissionState, SandboxMode, normalize_outcome,
 };
+pub use runner::{TickOptions, TickReport, tick};
 
 /// 内核错误。所有失败都显式表达，不使用 panic 作为控制流。
 #[derive(Debug)]

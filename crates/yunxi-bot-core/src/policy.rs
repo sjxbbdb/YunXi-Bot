@@ -207,6 +207,20 @@ pub fn normalize_outcome(raw: &str) -> ApprovalOutcome {
 /// 无可用应答者时的结果：失败关闭。
 pub const NO_ANSWERER: ApprovalOutcome = ApprovalOutcome::Unavailable;
 
+/// 从事件流折叠出权限状态。
+///
+/// 只有真正相关的事件才会改变状态（其余返回 `None` 被跳过），
+/// 这与 `apply_permission_event` 的变更门控是同一套语义。
+pub fn fold_permission_state(events: &[Event]) -> PermissionState {
+    let mut state = PermissionState::default();
+    for e in events {
+        if let Some(next) = apply_permission_event(&state, e) {
+            state = next;
+        }
+    }
+    state
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -47,6 +47,8 @@ pub enum EventKind {
     JobSucceeded,
     JobFailed,
     JobSkipped,
+    /// `Watch` 触发器本轮观测到的 mtime，用于避免同一变更被重复触发。
+    JobWatchObserved,
 
     // —— 审计对（必须位于边界内）——
     DecisionAsked,
@@ -395,6 +397,8 @@ pub fn project(events: &[Event]) -> BTreeMap<JobId, Job> {
                     j.state = JobState::Succeeded;
                     j.last_success_at = Some(e.at);
                     j.last_error = None;
+                    // 成功清零连续失败计数
+                    j.consecutive_failures = 0;
                     j.updated_at = e.at;
                 }
             }
@@ -405,11 +409,15 @@ pub fn project(events: &[Event]) -> BTreeMap<JobId, Job> {
                         .get("error")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
-                    // 还有重试额度就回队列，否则终态失败
+                    // 连续失败计数 +1，再决定是留在可调度状态还是停用。
+                    // 用连续而非累计，是为了让周期性任务扛得住偶发失败。
+                    j.consecutive_failures += 1;
                     j.state = if j.has_retry_budget() {
-                        JobState::Pending
-                    } else {
+                        // 仍在预算内：记为失败，但任务依旧可被触发
                         JobState::Failed
+                    } else {
+                        // 超限：停用，需人工重置
+                        JobState::Disabled
                     };
                     j.updated_at = e.at;
                 }
@@ -419,6 +427,12 @@ pub fn project(events: &[Event]) -> BTreeMap<JobId, Job> {
                     // 纯观测事件：单飞跳过不改变状态——"任务仍在运行"
                     // 这个事实不能被一次跳过覆盖掉。
                     j.last_skipped_at = Some(e.at);
+                    j.updated_at = e.at;
+                }
+            }
+            EventKind::JobWatchObserved => {
+                if let Some(j) = jobs.get_mut(&id) {
+                    j.watch_mtime_ms = e.data.get("mtime_ms").and_then(|v| v.as_u64());
                     j.updated_at = e.at;
                 }
             }
@@ -537,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_job_requeues_while_retry_budget_remains() {
+    fn consecutive_failures_disable_the_job_only_after_budget_exhausted() {
         let p = tmp("retry");
         let mut l = Ledger::open(&p).unwrap();
         let id = JobId::new("j3");
@@ -553,15 +567,41 @@ mod tests {
             .unwrap();
 
         let jobs = l.rebuild();
-        // max_attempts = 2，用掉 1 次，应回到 Pending
-        assert_eq!(jobs[&id].state, JobState::Pending);
+        // max_attempts = 2，连续失败 1 次：记为失败，但**仍可被触发**
+        assert_eq!(jobs[&id].state, JobState::Failed);
+        assert!(
+            jobs[&id].state.is_schedulable(),
+            "周期性任务不能被一次失败打死"
+        );
+        assert_eq!(jobs[&id].consecutive_failures, 1);
 
         l.append(EventKind::JobStarted, Some(&id), json!({}))
             .unwrap();
         l.append(EventKind::JobFailed, Some(&id), json!({ "error": "boom2" }))
             .unwrap();
         let jobs = l.rebuild();
-        assert_eq!(jobs[&id].state, JobState::Failed, "额度耗尽后进入终态");
+        assert_eq!(jobs[&id].state, JobState::Disabled, "连续失败超限后停用");
+        assert!(jobs[&id].state.is_terminal());
+
+        // 成功一次应清零连续失败计数
+        let id2 = JobId::new("j4");
+        l.append(
+            EventKind::JobCreated,
+            Some(&id2),
+            json!({ "spec": spec("会成功", false) }),
+        )
+        .unwrap();
+        l.append(EventKind::JobStarted, Some(&id2), json!({}))
+            .unwrap();
+        l.append(EventKind::JobFailed, Some(&id2), json!({ "error": "boom" }))
+            .unwrap();
+        l.append(EventKind::JobStarted, Some(&id2), json!({}))
+            .unwrap();
+        l.append(EventKind::JobSucceeded, Some(&id2), json!({}))
+            .unwrap();
+        let jobs = l.rebuild();
+        assert_eq!(jobs[&id2].consecutive_failures, 0, "成功应清零连续失败");
+        assert_eq!(jobs[&id2].state, JobState::Succeeded);
         let _ = std::fs::remove_file(&p);
     }
 
