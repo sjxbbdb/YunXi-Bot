@@ -420,7 +420,10 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         None
     };
     let thinker = if agent_on {
-        match yunxi_bot_core::think::agnes::AgnesThinker::from_home(&agent_home) {
+        match yunxi_bot_core::think::agnes::OpenAiThinker::from_home(
+            &agent_home,
+            ThinkerConfig::agnes(),
+        ) {
             Ok(t) => {
                 use yunxi_bot_core::think::Thinker as _;
                 println!("  表达   : {}（{} RPM）", t.model(), t.config().rpm);
@@ -787,17 +790,38 @@ fn cmd_isolation_check() -> Result<i32, Box<dyn std::error::Error>> {
 /// 这个命令存在的意义：**接入层的真伪只能靠真实调用验证**。
 /// 单测能证明错误映射、限流、密钥不泄露，但证明不了"这台机器此刻真的能连上
 /// Agnes 并拿到回复"。
-fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
-    use yunxi_bot_core::think::{Message, ThinkRequest, Thinker, agnes::AgnesThinker};
+use yunxi_bot_core::think::ThinkerConfig;
 
-    let prompt: String = if args.is_empty() {
+fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::think::{Message, ThinkRequest, Thinker, agnes::OpenAiThinker};
+
+    let positional: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| {
+            !a.starts_with("--")
+                && !(*i > 0 && args.get(i - 1).map(String::as_str) == Some("--provider"))
+        })
+        .map(|(_, a)| a.clone())
+        .collect();
+    let prompt: String = if positional.is_empty() {
         "用一句话说明你是谁。".to_string()
     } else {
-        args.join(" ")
+        positional.join(" ")
     };
 
     let home = default_home();
-    let thinker = match AgnesThinker::from_home(&home) {
+    // --provider 让同一套代码在 Agnes 与 DeepSeek 之间切换。
+    // 两者都是 OpenAI 兼容，差别只在 base_url / model / 密钥文件 / 思考模式。
+    let config = match flag(args, "--provider").unwrap_or("agnes") {
+        "agnes" => ThinkerConfig::agnes(),
+        "deepseek" => ThinkerConfig::deepseek(),
+        other => {
+            eprintln!("未知 provider {other}，可用: agnes / deepseek");
+            return Ok(2);
+        }
+    };
+    let thinker = match OpenAiThinker::from_home(&home, config) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("无法初始化思考模型: {e}");
@@ -819,6 +843,7 @@ fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         thinker.min_interval()
     );
     println!("超时      : {:?}", thinker.config().timeout);
+    println!("思考模式  : {}", thinker.config().thinking.label());
     println!("提示词    : {prompt}");
     println!();
 
@@ -926,7 +951,7 @@ fn cmd_agent(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let thinker = if no_think {
         None
     } else {
-        yunxi_bot_core::think::agnes::AgnesThinker::from_home(&home).ok()
+        yunxi_bot_core::think::agnes::OpenAiThinker::from_home(&home, ThinkerConfig::agnes()).ok()
     };
     if !no_think && thinker.is_none() {
         println!("提示：没有可用的思考模型（密钥缺失），本轮只判断不表达。");

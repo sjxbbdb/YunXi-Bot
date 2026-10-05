@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::router::Thinking;
 use super::{RateLimiter, ThinkError, ThinkRequest, ThinkResponse, Thinker, Usage};
 
 /// 默认 Base URL。
@@ -77,15 +78,19 @@ impl std::fmt::Debug for ApiKey {
 
 /// Agnes 客户端配置。
 #[derive(Debug, Clone)]
-pub struct AgnesConfig {
+pub struct ThinkerConfig {
     pub base_url: String,
     pub model: String,
     pub timeout: Duration,
     /// 每分钟请求数上限。默认按免费档 10 处理。
     pub rpm: u32,
+    /// 密钥文件名（相对 `<home>/secrets/`）。Agnes 与 DeepSeek 各一份。
+    pub key_file: &'static str,
+    /// 思考模式。DeepSeek **默认开**，那是输出 token 的大头。
+    pub thinking: Thinking,
 }
 
-impl Default for AgnesConfig {
+impl Default for ThinkerConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
@@ -93,7 +98,28 @@ impl Default for AgnesConfig {
             // 长上下文 + 大输出的请求可能要跑一会儿；给足余量但不无限等
             timeout: Duration::from_secs(120),
             rpm: FREE_TIER_RPM,
+            key_file: "agnes.key",
+            thinking: Thinking::ServerDefault,
         }
+    }
+}
+
+impl ThinkerConfig {
+    /// DeepSeek Flash。**默认关思考**——实测开思考时输出 token 是关掉时的 4 倍多。
+    pub fn deepseek() -> Self {
+        Self {
+            base_url: "https://api.deepseek.com/v1".into(),
+            model: "deepseek-flash".into(),
+            timeout: Duration::from_secs(180),
+            rpm: 60,
+            key_file: "deepseek.key",
+            thinking: Thinking::Disabled,
+        }
+    }
+
+    /// Agnes 3.0 Flash。
+    pub fn agnes() -> Self {
+        Self::default()
     }
 }
 
@@ -101,20 +127,25 @@ impl Default for AgnesConfig {
 ///
 /// 放在**仓库之外**（`%LOCALAPPDATA%\YunXiBot`），并在 `.gitignore` 里用
 /// `*.key` / `secrets/` 兜底。
+pub fn key_file_for(home: &Path, name: &str) -> PathBuf {
+    home.join("secrets").join(name)
+}
+
+/// 默认（Agnes）的密钥文件。
 pub fn default_key_file(home: &Path) -> PathBuf {
-    home.join("secrets").join("agnes.key")
+    key_file_for(home, "agnes.key")
 }
 
 /// Agnes 客户端。
-pub struct AgnesThinker {
-    config: AgnesConfig,
+pub struct OpenAiThinker {
+    config: ThinkerConfig,
     api_key: ApiKey,
     agent: ureq::Agent,
     limiter: RateLimiter,
 }
 
-impl AgnesThinker {
-    pub fn new(config: AgnesConfig, api_key: ApiKey) -> Self {
+impl OpenAiThinker {
+    pub fn new(config: ThinkerConfig, api_key: ApiKey) -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout(config.timeout)
             .user_agent(concat!("yunxi-bot/", env!("CARGO_PKG_VERSION")))
@@ -129,12 +160,12 @@ impl AgnesThinker {
     }
 
     /// 走默认配置 + 默认密钥文件构造。
-    pub fn from_home(home: &Path) -> Result<Self, ThinkError> {
-        let key = ApiKey::load(&default_key_file(home))?;
-        Ok(Self::new(AgnesConfig::default(), key))
+    pub fn from_home(home: &Path, config: ThinkerConfig) -> Result<Self, ThinkError> {
+        let key = ApiKey::load(&key_file_for(home, config.key_file))?;
+        Ok(Self::new(config, key))
     }
 
-    pub fn config(&self) -> &AgnesConfig {
+    pub fn config(&self) -> &ThinkerConfig {
         &self.config
     }
 
@@ -212,7 +243,7 @@ struct WireMessage {
     content: Option<String>,
 }
 
-impl Thinker for AgnesThinker {
+impl Thinker for OpenAiThinker {
     fn think(&self, req: &ThinkRequest) -> Result<ThinkResponse, ThinkError> {
         if self.api_key.is_empty() {
             return Err(ThinkError::Auth("密钥为空".into()));
@@ -242,7 +273,12 @@ impl Thinker for AgnesThinker {
             body["max_tokens"] = serde_json::json!(n);
         }
         if let Some(t) = req.temperature {
+            // ⚠️ 思考模式下 temperature 不生效（官方文档：设了不报错，但也不生效）
             body["temperature"] = serde_json::json!(t);
+        }
+        // 思考模式开关。不打这个字段就用服务端默认——对 DeepSeek 就是**开**
+        if let Some(t) = self.config.thinking.body_field() {
+            body["thinking"] = t;
         }
 
         let resp = self
@@ -385,7 +421,7 @@ mod tests {
 
     #[test]
     fn maps_429_with_retry_after() {
-        let e = AgnesThinker::map_status(429, "slow down".into(), Some(Duration::from_secs(30)));
+        let e = OpenAiThinker::map_status(429, "slow down".into(), Some(Duration::from_secs(30)));
         match e {
             ThinkError::RateLimited { retry_after, .. } => {
                 assert_eq!(retry_after, Some(Duration::from_secs(30)))
@@ -398,7 +434,7 @@ mod tests {
     fn permanent_failures_are_not_retryable() {
         // 这些重试只会浪费配额并刷屏
         for code in [400u16, 401, 402, 403, 404, 413, 422] {
-            let e = AgnesThinker::map_status(code, "x".into(), None);
+            let e = OpenAiThinker::map_status(code, "x".into(), None);
             assert!(!e.is_retryable(), "{code} 不该被判定为可重试: {e:?}");
         }
     }
@@ -406,15 +442,15 @@ mod tests {
     #[test]
     fn transient_failures_are_retryable() {
         for code in [408u16, 409, 429, 500, 502, 503, 504] {
-            let e = AgnesThinker::map_status(code, "x".into(), None);
+            let e = OpenAiThinker::map_status(code, "x".into(), None);
             assert!(e.is_retryable(), "{code} 应可重试: {e:?}");
         }
     }
 
     #[test]
     fn endpoint_has_no_double_slash() {
-        let t = AgnesThinker::new(
-            AgnesConfig {
+        let t = OpenAiThinker::new(
+            ThinkerConfig {
                 base_url: "https://api.agnes-ai.cn/v1/".into(),
                 ..Default::default()
             },
@@ -425,14 +461,14 @@ mod tests {
 
     #[test]
     fn empty_message_list_is_rejected_before_any_io() {
-        let t = AgnesThinker::new(AgnesConfig::default(), ApiKey::new("sk-x"));
+        let t = OpenAiThinker::new(ThinkerConfig::default(), ApiKey::new("sk-x"));
         let err = t.think(&ThinkRequest::new(vec![])).unwrap_err();
         assert!(matches!(err, ThinkError::BadRequest { .. }), "{err:?}");
     }
 
     #[test]
     fn local_throttle_blocks_the_second_call() {
-        let t = AgnesThinker::new(AgnesConfig::default(), ApiKey::new("sk-x"));
+        let t = OpenAiThinker::new(ThinkerConfig::default(), ApiKey::new("sk-x"));
         // 第一次不受本地限流影响（会真的去发请求，但我们只关心限流分支）
         let first = t.think(&ThinkRequest::new(vec![Message::user("hi")]));
         assert!(

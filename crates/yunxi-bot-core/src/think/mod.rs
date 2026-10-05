@@ -18,11 +18,15 @@
 //! 这不是为了省钱的优化，是这个配额下的结构必然。
 
 pub mod agnes;
+pub mod cost;
+pub mod prompt;
+pub mod router;
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub use agnes::{AgnesConfig, AgnesThinker};
+pub use agnes::{OpenAiThinker, ThinkerConfig};
+pub use cost::{Cost, PriceTable, Usage};
 
 /// 对话角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -98,17 +102,6 @@ impl ThinkRequest {
         self.temperature = Some(t);
         self
     }
-}
-
-/// token 用量。常驻进程需要它来观察配额消耗。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Usage {
-    #[serde(default)]
-    pub prompt_tokens: u64,
-    #[serde(default)]
-    pub completion_tokens: u64,
-    #[serde(default)]
-    pub total_tokens: u64,
 }
 
 /// 一次思考的结果。
