@@ -76,13 +76,11 @@ pub fn post_json(endpoint: &str, body: &str, timeout_ms: u64) -> Result<String, 
          {body}",
         host = addr.ip(),
         port = addr.port(),
-        len = body.as_bytes().len(),
+        len = body.len(),
     );
 
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| map_io(e))?;
-    stream.flush().map_err(|e| map_io(e))?;
+    stream.write_all(request.as_bytes()).map_err(map_io)?;
+    stream.flush().map_err(map_io)?;
 
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];

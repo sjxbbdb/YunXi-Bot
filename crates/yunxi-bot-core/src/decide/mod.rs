@@ -473,10 +473,17 @@ mod tests {
 
     #[test]
     fn confidence_of_noul_uses_the_larger_side() {
-        let mut a = Answer::default();
-        a.noul = Some(0.9);
-        assert!((a.confidence().unwrap() - 0.9).abs() < 1e-9);
-        a.noul = Some(0.1);
-        assert!((a.confidence().unwrap() - 0.9).abs() < 1e-9);
+        let high = Answer {
+            noul: Some(0.9),
+            ..Default::default()
+        };
+        assert!((high.confidence().unwrap() - 0.9).abs() < 1e-9);
+
+        // P(true)=0.1 时，"不是真的"才是高置信的一侧
+        let low = Answer {
+            noul: Some(0.1),
+            ..Default::default()
+        };
+        assert!((low.confidence().unwrap() - 0.9).abs() < 1e-9);
     }
 }

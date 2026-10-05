@@ -483,7 +483,7 @@ fn cmd_decide(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 
     if args.iter().any(|a| a == "--demo") {
         println!("决策类别与降级方向（ADR §7.2）:\n");
-        println!("  {:<16} {:<14} {}", "类别", "降级方向", "降级时的保守动作");
+        println!("  {:<16} {:<14} 降级时的保守动作", "类别", "降级方向");
         for c in [
             DecisionClass::Interrupt,
             DecisionClass::Escalate,
