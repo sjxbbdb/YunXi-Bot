@@ -490,7 +490,9 @@ impl Tool for WebFetchTool {
     ///
     /// 解析不出来就返回 `None`——那意味着**每次都问**。宁可多问一句，
     /// 也不能给一个假的粒度让规则莫名其妙地命中。
-    fn specifier(&self, args: &serde_json::Value) -> Option<String> {
+    ///
+    /// 用不到 `ctx`：URL 是绝对的，不依赖工作目录。
+    fn specifier(&self, args: &serde_json::Value, _ctx: &ToolContext) -> Option<String> {
         let raw = args.get("url").and_then(|v| v.as_str())?;
         parse_target(raw).ok().map(|t| t.origin)
     }
@@ -935,7 +937,7 @@ impl Tool for WebSearchTool {
     }
 
     /// 见 [`SEARCH_SCOPE`]：搜索没有单一域名，粒度只能是"搜索"本身。
-    fn specifier(&self, _args: &serde_json::Value) -> Option<String> {
+    fn specifier(&self, _args: &serde_json::Value, _ctx: &ToolContext) -> Option<String> {
         Some(SEARCH_SCOPE.to_string())
     }
 
@@ -1532,6 +1534,12 @@ mod tests {
         ToolContext::new(std::env::temp_dir(), SandboxMode::WorkspaceWrite)
     }
 
+    /// 审批粒度测试用。web 的粒度是 URL origin，与工作目录无关，
+    /// 但和 `call` 用同一套 ctx 构造，才说明两者不矛盾。
+    fn spec_ctx() -> ToolContext {
+        ctx()
+    }
+
     fn fetch_tool(routes: Vec<FakeRoute>) -> WebFetchTool {
         WebFetchTool::with_http(Box::new(FakeHttp::new(routes)))
     }
@@ -1728,17 +1736,23 @@ mod tests {
     fn specifier_returns_url_origin() {
         let tool = fetch_tool(vec![]);
         assert_eq!(
-            tool.specifier(&json!({ "url": "https://docs.rs/rmcp/latest/rmcp/" })),
+            tool.specifier(
+                &json!({ "url": "https://docs.rs/rmcp/latest/rmcp/" }),
+                &spec_ctx()
+            ),
             Some("https://docs.rs".to_string())
         );
         // 大小写与端口都归一化：`HTTPS://Docs.RS:8443` 和 `https://docs.rs` 是同一个站点。
         assert_eq!(
-            tool.specifier(&json!({ "url": "HTTPS://Docs.RS:8443/x" })),
+            tool.specifier(&json!({ "url": "HTTPS://Docs.RS:8443/x" }), &spec_ctx()),
             Some("https://docs.rs".to_string())
         );
         // 解析不出来就没有粒度 → 门禁每次都问。宁可多问，也不给假粒度。
-        assert_eq!(tool.specifier(&json!({ "url": "file:///C:/x" })), None);
-        assert_eq!(tool.specifier(&json!({})), None);
+        assert_eq!(
+            tool.specifier(&json!({ "url": "file:///C:/x" }), &spec_ctx()),
+            None
+        );
+        assert_eq!(tool.specifier(&json!({}), &spec_ctx()), None);
     }
 
     #[test]
@@ -2010,7 +2024,7 @@ mod tests {
         // 搜索没有单一域名，粒度只能是"搜索"本身：编一个假域名比这更糟。
         let (tool, _) = search_tool(&ddg_page(1));
         assert_eq!(
-            tool.specifier(&json!({ "query": "x" })),
+            tool.specifier(&json!({ "query": "x" }), &spec_ctx()),
             Some("搜索".into())
         );
     }

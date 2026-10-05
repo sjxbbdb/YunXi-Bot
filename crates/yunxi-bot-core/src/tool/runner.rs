@@ -293,7 +293,7 @@ impl<'a> ToolRunner<'a> {
         };
 
         let cap = tool.capability();
-        let spec = tool.specifier(&tr.arguments);
+        let spec = tool.specifier(&tr.arguments, &self.ctx);
         let decision = gate(tool, &tr.arguments, &self.policy, &self.ctx, self.decider);
 
         match &decision {
@@ -504,7 +504,7 @@ mod tests {
         fn capability(&self) -> Capability {
             self.cap
         }
-        fn specifier(&self, _args: &Value) -> Option<String> {
+        fn specifier(&self, _args: &Value, _ctx: &ToolContext) -> Option<String> {
             self.spec.clone()
         }
         fn call(

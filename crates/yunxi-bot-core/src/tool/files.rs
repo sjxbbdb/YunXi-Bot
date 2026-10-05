@@ -186,18 +186,30 @@ fn optional_path_arg(args: &Value, ctx: &ToolContext) -> Result<PathBuf, ToolErr
     }
 }
 
-/// 审批粒度 = 模型给的那个路径。
+/// 审批粒度 = **工具实际会操作的那个绝对路径**。
 ///
-/// [`Tool::specifier`] 的签名里没有 [`ToolContext`]，所以这里**没法**把
-/// 相对路径解析成绝对路径。用进程 cwd 硬解析会更糟：审批看到的路径会和工具
-/// 实际动的文件不是同一个（工具一律按 `ctx.cwd` 解析），于是"允许读 A"
-/// 的规则有可能放行对 B 的读。相对路径留给 `gate` 的 `inside_cwd` 去解析，
-/// 它用的正是 `ctx.cwd`。
-fn path_specifier(args: &Value) -> Option<String> {
-    args.get("path")
+/// ## 为什么必须是绝对路径（第一版这里是错的）
+///
+/// 第一版返回模型给的那串字符，理由是"签名里没有 `ToolContext`，用进程 cwd
+/// 硬解析会让审批看到的路径 ≠ 工具实际动的文件"。那个顾虑是对的，
+/// **但结论反了**：正确的修法是给签名加 `ctx`，而不是返回原串。
+///
+/// 返回原串会造成两个问题：
+///
+/// 1. **规则静默失效**：使用者写 `--allow read_file:D:\notes`，
+///    模型给相对路径 `notes\a.md` → 前缀对不上 → 每次都问。
+///    使用者会以为"我明明写了规则怎么还问"，然后开始怀疑整个审批机制。
+/// 2. **更糟的是**：审批提示上显示 `notes\a.md`，而工具真正动的是
+///    `<cwd>\notes\a.md`——**人在批准一个自己没看清的东西**。
+///
+/// 现在用 `ctx.resolve` 解析，与 `call` 里走的是同一个函数，
+/// 所以"审批看到的"和"实际动的"必然是同一个路径。
+fn path_specifier(args: &Value, ctx: &ToolContext) -> Option<String> {
+    let raw = args
+        .get("path")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())?;
+    Some(ctx.resolve(Path::new(raw)).to_string_lossy().to_string())
 }
 
 /// 目录类工具（`list_dir` / `search_files`）的审批粒度。
@@ -206,11 +218,15 @@ fn path_specifier(args: &Value) -> Option<String> {
 /// 而 `gate` 的 `inside_cwd` 会拿 `ctx.cwd` 去解析 `.`，"只读且在工作区内
 /// 免问"这条规则才成立。返回 `None` 会让每一次"在项目里搜一下"都去问人——
 /// 它明明什么都没改。
-fn dir_specifier(args: &Value) -> Option<String> {
-    match args.get("path").and_then(|v| v.as_str()) {
-        Some(p) if !p.trim().is_empty() => Some(p.to_string()),
-        _ => Some(".".to_string()),
-    }
+fn dir_specifier(args: &Value, ctx: &ToolContext) -> Option<String> {
+    // 没给路径 = 工作目录本身。直接给 cwd 而不是 ".".：后者解析出来是
+    // `C:\work\.`，虽然 `inside_cwd` 和规则匹配都能处理，但审批提示上
+    // 显示一个带 `\.` 的路径会让人以为哪里不对。
+    let p = match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) if !p.trim().is_empty() => ctx.resolve(Path::new(p)),
+        _ => ctx.cwd.clone(),
+    };
+    Some(p.to_string_lossy().to_string())
 }
 
 /// 显示路径：能相对工作目录表示就相对表示。
@@ -273,8 +289,8 @@ impl Tool for ReadFileTool {
         Capability::ReadOnly
     }
 
-    fn specifier(&self, args: &Value) -> Option<String> {
-        path_specifier(args)
+    fn specifier(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
+        path_specifier(args, ctx)
     }
 
     fn call(&self, args: &Value, ctx: &mut ToolContext) -> Result<ToolOutput, ToolError> {
@@ -442,8 +458,8 @@ impl Tool for ListDirTool {
         Capability::ReadOnly
     }
 
-    fn specifier(&self, args: &Value) -> Option<String> {
-        dir_specifier(args)
+    fn specifier(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
+        dir_specifier(args, ctx)
     }
 
     fn call(&self, args: &Value, ctx: &mut ToolContext) -> Result<ToolOutput, ToolError> {
@@ -664,8 +680,8 @@ impl Tool for SearchFilesTool {
         Capability::ReadOnly
     }
 
-    fn specifier(&self, args: &Value) -> Option<String> {
-        dir_specifier(args)
+    fn specifier(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
+        dir_specifier(args, ctx)
     }
 
     fn call(&self, args: &Value, ctx: &mut ToolContext) -> Result<ToolOutput, ToolError> {
@@ -777,8 +793,8 @@ impl Tool for WriteFileTool {
         Capability::Write
     }
 
-    fn specifier(&self, args: &Value) -> Option<String> {
-        path_specifier(args)
+    fn specifier(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
+        path_specifier(args, ctx)
     }
 
     fn call(&self, args: &Value, ctx: &mut ToolContext) -> Result<ToolOutput, ToolError> {
@@ -859,8 +875,8 @@ impl Tool for EditFileTool {
         Capability::Write
     }
 
-    fn specifier(&self, args: &Value) -> Option<String> {
-        path_specifier(args)
+    fn specifier(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
+        path_specifier(args, ctx)
     }
 
     fn call(&self, args: &Value, ctx: &mut ToolContext) -> Result<ToolOutput, ToolError> {
@@ -945,6 +961,14 @@ impl Tool for EditFileTool {
 mod tests {
     use super::*;
     use crate::policy::SandboxMode;
+
+    /// 审批粒度测试用的固定工作目录。
+    ///
+    /// 用固定值而不是 `env::temp_dir()`：粒度的断言要逐字符比对路径，
+    /// 而 temp_dir 在不同机器上不一样，断言就变成看运气了。
+    fn spec_ctx() -> ToolContext {
+        ToolContext::new(PathBuf::from(r"C:\work"), SandboxMode::WorkspaceWrite)
+    }
 
     /// 每个测试一个独立子目录，`Drop` 时删掉。
     ///
@@ -1576,36 +1600,57 @@ mod tests {
     }
 
     #[test]
-    fn specifier_is_the_path_as_given() {
-        // 粒度决定"总是允许读这个目录"能不能写得出来。这里锁死"原样返回"：
-        // specifier 拿不到 cwd，一旦有人改成用进程 cwd 解析，
-        // 审批看到的路径就会和工具实际动的文件错位。
+    fn specifier_is_the_resolved_absolute_path() {
+        // **粒度必须是工具实际会动的那个路径，不是模型给的那串字符。**
+        //
+        // 第一版返回原串，理由是"specifier 拿不到 cwd"。那个顾虑对，但结论反了：
+        // 正确的修法是给签名加 ctx。返回原串会让规则静默失效——
+        // 使用者写 --allow read_file:C:\work，模型给相对路径 a.txt，
+        // 前缀对不上，于是每次都问，使用者以为规则坏了。
         assert_eq!(
-            ReadFileTool.specifier(&json!({ "path": "a.txt" })),
-            Some("a.txt".to_string())
+            ReadFileTool.specifier(&json!({ "path": "a.txt" }), &spec_ctx()),
+            Some(r"C:\work\a.txt".to_string()),
+            "相对路径要解析成绝对路径，规则才对得上"
         );
         assert_eq!(
-            ReadFileTool.specifier(&json!({ "path": "D:\\x\\a.txt" })),
-            Some("D:\\x\\a.txt".to_string())
+            ReadFileTool.specifier(&json!({ "path": "D:\\x\\a.txt" }), &spec_ctx()),
+            Some("D:\\x\\a.txt".to_string()),
+            "本来就是绝对路径的不要动它"
         );
         assert_eq!(
-            ReadFileTool.specifier(&json!({})),
+            ReadFileTool.specifier(&json!({}), &spec_ctx()),
             None,
             "没给路径就没有粒度，门禁只能每次都问"
         );
     }
 
     #[test]
+    fn specifier_and_call_agree_on_the_same_path() {
+        // 这条是上面那段注释的机器化表达：**审批看到的 = 实际动的**。
+        // 两者不一致时，人是在批准一个自己没看清的东西。
+        // `c` 故意不是 mut：specifier 不该改动 ctx，
+        // 如果哪天需要 mut 了，说明它有了副作用，那本身就是问题。
+        let c = spec_ctx();
+        let args = json!({ "path": "子目录/文件.txt" });
+        let spec = ReadFileTool.specifier(&args, &c).expect("应有粒度");
+        // 让 call 正常返回需要文件存在；不建文件，只取它解析出的路径做对比
+        let resolved = c.resolve(Path::new("子目录/文件.txt"));
+        assert_eq!(spec, resolved.to_string_lossy());
+        // 顺带确认 ctx 没被 specifier 改动过
+        assert!(!c.has_read(&resolved), "specifier 不该有副作用");
+    }
+
+    #[test]
     fn dir_tools_without_a_path_scope_to_the_working_directory() {
-        // 返回 "." 而不是 None：否则每一次"在项目里搜一下"都要问人，
+        // 返回 cwd 而不是 None：否则每一次"在项目里搜一下"都要问人，
         // 而它明明什么都没改
         assert_eq!(
-            SearchFilesTool.specifier(&json!({ "pattern": "x" })),
-            Some(".".to_string())
+            SearchFilesTool.specifier(&json!({ "pattern": "x" }), &spec_ctx()),
+            Some(r"C:\work".to_string())
         );
         assert_eq!(
-            ListDirTool.specifier(&json!({ "path": "src" })),
-            Some("src".to_string())
+            ListDirTool.specifier(&json!({ "path": "src" }), &spec_ctx()),
+            Some(r"C:\work\src".to_string())
         );
     }
 

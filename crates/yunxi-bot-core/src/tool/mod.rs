@@ -285,7 +285,22 @@ pub trait Tool: Send + Sync {
     /// 有了它，"总是允许读 D:\notes 下的文件"才写得出来。
     /// 返回 `None` 表示这个工具没有可归类的粒度——**那就每次都问**，
     /// 因为记不下规则就等于没有规则。
-    fn specifier(&self, _args: &serde_json::Value) -> Option<String> {
+    ///
+    /// ## 为什么需要 `ctx`
+    ///
+    /// 粒度必须是**工具实际会操作的那个路径**，而不是模型给的那串字符。
+    /// 模型给 `notes\a.md`，工具会把它解析成 `<cwd>\notes\a.md`——
+    /// 如果 specifier 返回前者，就会出两个问题：
+    ///
+    /// 1. **规则静默失效**：使用者写 `--allow read_file:D:\notes`，
+    ///    而模型给的是相对路径 → 前缀对不上 → 每次都要问。
+    ///    使用者会以为"我明明写了规则怎么还问"，然后去怀疑整个审批机制。
+    /// 2. **更糟的一种**：审批提示上显示的是 `notes\a.md`，
+    ///    而工具真正动的是 `<cwd>\notes\a.md`——**人在批准一个自己没看清的东西**。
+    ///    这是"不看参数就批准等于没批准"的上一层。
+    ///
+    /// 所以签名里必须有 `ctx`。第一版没有，是第一版设计错了。
+    fn specifier(&self, _args: &serde_json::Value, _ctx: &ToolContext) -> Option<String> {
         None
     }
 
@@ -555,7 +570,7 @@ pub fn gate(
     decider: Option<&dyn Decider>,
 ) -> GateDecision {
     let name = tool.name();
-    let spec = tool.specifier(args);
+    let spec = tool.specifier(args, ctx);
     let cap = tool.capability();
 
     // ---- 第一层：确定性规则。不花钱、不耗时。 ----
@@ -754,7 +769,7 @@ mod tests {
         fn capability(&self) -> Capability {
             self.cap
         }
-        fn specifier(&self, args: &serde_json::Value) -> Option<String> {
+        fn specifier(&self, args: &serde_json::Value, _ctx: &ToolContext) -> Option<String> {
             match self.spec_kind {
                 SpecKind::Path => args.get("path").and_then(|v| v.as_str()).map(String::from),
                 SpecKind::Domain => args.get("url").and_then(|v| v.as_str()).map(String::from),

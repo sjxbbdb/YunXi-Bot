@@ -116,7 +116,7 @@ impl Tool for NowTool {
         Capability::ReadOnly
     }
 
-    fn specifier(&self, _args: &Value) -> Option<String> {
+    fn specifier(&self, _args: &Value, _ctx: &ToolContext) -> Option<String> {
         Some(LOCAL_SCOPE.to_string())
     }
 
@@ -234,7 +234,9 @@ impl Tool for RunCommandTool {
     /// 代价是它连带放行了该程序的**任何**子命令——允许 `git` 就等于允许
     /// `git push` 和 `git reset --hard`。再往细就得解析子命令，而那既不可靠
     /// （别名、`-C`、`--exec-path`、`!` 前缀都能绕过）又会让规则形同虚设。
-    fn specifier(&self, args: &Value) -> Option<String> {
+    ///
+    /// 用不到 `ctx`：程序名不依赖工作目录（`cwd` 是执行位置，不是执行内容）。
+    fn specifier(&self, args: &Value, _ctx: &ToolContext) -> Option<String> {
         let first = args.get("command")?.as_array()?.first()?.as_str()?.trim();
         // 参数不合法时**不给粒度**：报一个假的粒度比没有粒度更坏，
         // 那会让规则看起来命中了一个其实没发生过的调用。
@@ -512,7 +514,7 @@ impl Tool for AskUserTool {
         Capability::ReadOnly
     }
 
-    fn specifier(&self, _args: &Value) -> Option<String> {
+    fn specifier(&self, _args: &Value, _ctx: &ToolContext) -> Option<String> {
         Some(LOCAL_SCOPE.to_string())
     }
 
@@ -669,6 +671,12 @@ mod tests {
     /// 测试用的执行上下文：工作目录取系统临时目录（绝对路径，跨平台都有）。
     fn tool_ctx() -> ToolContext {
         ToolContext::new(std::env::temp_dir(), SandboxMode::WorkspaceWrite)
+    }
+
+    /// 审批粒度测试用。**与 `tool_ctx` 同源**——粒度必须和 `call` 用同一个
+    /// ctx 构造，否则测试就测不出"审批看到的 = 实际动的"这件事。
+    fn spec_ctx() -> ToolContext {
+        tool_ctx()
     }
 
     /// 本机一定有、且**无害**的 echo 命令。
@@ -862,17 +870,23 @@ mod tests {
         // 有了程序名这一级粒度，使用者才写得出"总是允许 git"。
         assert_eq!(
             RunCommandTool
-                .specifier(&json!({ "command": ["git", "push", "--force"] }))
+                .specifier(
+                    &json!({ "command": ["git", "push", "--force"] }),
+                    &spec_ctx()
+                )
                 .as_deref(),
             Some("git")
         );
         // 参数不合法时不给粒度：宁可每次都问，也不要报一个假的粒度。
         assert_eq!(
-            RunCommandTool.specifier(&json!({ "command": "git push" })),
+            RunCommandTool.specifier(&json!({ "command": "git push" }), &spec_ctx()),
             None
         );
-        assert_eq!(RunCommandTool.specifier(&json!({ "command": [] })), None);
-        assert_eq!(RunCommandTool.specifier(&json!({})), None);
+        assert_eq!(
+            RunCommandTool.specifier(&json!({ "command": [] }), &spec_ctx()),
+            None
+        );
+        assert_eq!(RunCommandTool.specifier(&json!({}), &spec_ctx()), None);
     }
 
     #[test]
@@ -884,7 +898,7 @@ mod tests {
             "/C".to_string(),
             "echo a && echo b".to_string(),
         ];
-        let spec = RunCommandTool.specifier(&json!({ "command": argv }));
+        let spec = RunCommandTool.specifier(&json!({ "command": argv }), &spec_ctx());
         assert_eq!(spec.as_deref(), Some("cmd"));
         // argv 回显用的是转义形式，不是 join(" ")——后者会把带空格的参数
         // 显示成一个根本不存在的命令行。
