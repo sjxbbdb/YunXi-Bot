@@ -112,12 +112,21 @@ cargo run -- companion             # 真实调用本地决策模型
 
 ```bash
 cargo run -- daemon --interval 5000     # 常驻（Ctrl+C 停止，锁自动释放）
-cargo run -- install-autostart          # 注册当前用户登录时自启
+cargo run -- supervise                  # 监督模式：异常退出自动重启
+cargo run -- install-autostart          # 注册当前用户登录时自启（跑的是 supervise）
 cargo run -- autostart-status           # 查看注册状态
 cargo run -- uninstall-autostart        # 取消自启
 ```
 
-自启走**当前用户的「启动」文件夹 + VBS 隐藏启动器**，不需要管理员权限：
+**三层看护**，各管一段：
+
+| 层 | 管什么 |
+|---|---|
+| `daemon` 循环 | 单轮失败不致命；连续 5 次失败才退出，避免空转刷屏 |
+| `supervise` | 进程级崩溃（OOM / panic / 被强杀）后自动重启，指数退避，超过上限就放弃并暴露问题 |
+| `install-autostart` | 登录时拉起 `supervise`，per-user、零权限 |
+
+自启走**当前用户的「启动」文件夹 + VBS 隐藏启动器**：
 
 > 实测 `schtasks /SC ONLOGON` 在普通用户下返回 `ERROR: Access is denied.`，
 > 因此改用 per-user 的启动文件夹；`.cmd` 会弹控制台窗口，故用 VBS 的

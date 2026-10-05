@@ -276,6 +276,44 @@ impl DecisionOutcome {
 /// 熔断前的连续失败阈值。
 pub const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
 
+/// 把一次决策写进台账。
+///
+/// **审计对必须被边界包住**（ADR D6）：`decision_asked` 与 `decision_decided`
+/// 若落在边界之外，就与崩溃残尾无法区分，reload 时会被静默丢弃。所以这里
+/// 开一个边界、写两条、关边界，任何一步失败都不会留下半对记录。
+///
+/// 边界同时是"一次决策是一个原子单位"的表达：要么两条都在，要么都不在。
+pub fn record_decision(
+    ledger: &mut crate::ledger::Ledger,
+    class: DecisionClass,
+    outcome: &DecisionOutcome,
+    question_ids: &[String],
+) -> Result<u64, crate::ledger::LedgerError> {
+    use crate::ledger::EventKind;
+
+    let mut span = ledger.begin_span()?;
+    let span_id = span.id();
+
+    span.ledger().append(
+        EventKind::DecisionAsked,
+        None,
+        serde_json::json!({
+            "class": class,
+            "questions": question_ids,
+        }),
+    )?;
+
+    let mut data = outcome.ledger_data();
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert("class".into(), serde_json::json!(class));
+    }
+    span.ledger()
+        .append(EventKind::DecisionDecided, None, data)?;
+
+    span.close()?;
+    Ok(span_id)
+}
+
 /// 决策引擎：包住一个 [`Decider`]，负责降级与熔断。
 #[derive(Debug)]
 pub struct DecisionEngine<D: Decider> {
@@ -495,5 +533,56 @@ mod tests {
             ..Default::default()
         };
         assert!((low.confidence().unwrap() - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn record_decision_writes_an_audit_pair_inside_one_span() {
+        use crate::ledger::{EventKind, Ledger};
+        let mut p = std::env::temp_dir();
+        p.push(format!("yunxi-decide-span-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+
+        let mut ledger = Ledger::open(&p).expect("打开台账");
+        let outcome = DecisionOutcome::Degraded {
+            class: DecisionClass::Interrupt,
+            direction: DegradationDirection::FailClosed,
+            action: "延后聚合，本轮不打扰",
+            reason: "模型不可用".into(),
+        };
+        let span_id = record_decision(
+            &mut ledger,
+            DecisionClass::Interrupt,
+            &outcome,
+            &["intervention".to_string()],
+        )
+        .expect("写决策");
+
+        let events = ledger.events();
+        assert_eq!(events.len(), 2, "一次决策恰好两条事件");
+        assert_eq!(events[0].kind, EventKind::DecisionAsked);
+        assert_eq!(events[1].kind, EventKind::DecisionDecided);
+        assert!(
+            events.iter().all(|e| e.span == Some(span_id)),
+            "审计对必须落在同一个边界内，否则 reload 时会被当崩溃残尾丢弃"
+        );
+        assert!(!ledger.has_open_span(), "写完应关闭边界");
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn record_decision_is_rejected_without_leaving_partial_state() {
+        use crate::ledger::{EventKind, Ledger};
+        // 直接写审计事件（无边界）必须被拒——这是台账层的硬约束
+        let mut p = std::env::temp_dir();
+        p.push(format!("yunxi-decide-nospan-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+
+        let mut ledger = Ledger::open(&p).expect("打开台账");
+        let err = ledger.append(EventKind::DecisionAsked, None, serde_json::json!({}));
+        assert!(err.is_err(), "边界外的审计事件必须被拒绝");
+        assert!(ledger.events().is_empty(), "拒绝时不得写入任何内容");
+
+        let _ = std::fs::remove_file(&p);
     }
 }

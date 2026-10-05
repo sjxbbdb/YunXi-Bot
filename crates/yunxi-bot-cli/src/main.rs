@@ -53,9 +53,13 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --max-ticks <n>       跑够 n 轮就停（便于演示，默认无限）
       --require-os-isolation  要求 OS 级写入隔离，拿不到就拒绝执行
 
-  yunxi-bot install-autostart    注册当前用户登录时自启（Windows 计划任务）
+  yunxi-bot install-autostart    注册当前用户登录时自启
   yunxi-bot uninstall-autostart  取消自启
   yunxi-bot autostart-status     查看自启注册状态
+
+  yunxi-bot supervise [选项]   监督模式：daemon 异常退出时自动重启
+      --interval <毫秒>     传给 daemon 的轮间隔（默认 5000）
+      --max-restarts <n>    放弃前最多重启几次（默认 10）
 
   yunxi-bot run <id>          立即执行一次（忽略触发条件）
   yunxi-bot list              列出全部任务
@@ -110,6 +114,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "autostart-status" => cmd_autostart(AutostartAction::Status),
         "tick" => cmd_tick(),
         "daemon" => cmd_daemon(rest),
+        "supervise" => cmd_supervise(rest),
         "run" => cmd_run(rest),
         "log" => cmd_log(rest),
         other => {
@@ -450,18 +455,20 @@ fn cmd_autostart(action: AutostartAction) -> Result<i32, Box<dyn std::error::Err
                 std::fs::create_dir_all(&dir)?;
                 let exe = std::env::current_exe()?;
 
-                // 0 = 隐藏窗口，False = 不等待
+                // 0 = 隐藏窗口，False = 不等待。
+                // 启动 `supervise` 而非 `daemon`：前者在 daemon 异常退出时会
+                // 自动重启，这才是"常驻"应有的形态。
                 let script = format!(
                     "' YunXi Bot 常驻守护 —— 由 `yunxi-bot install-autostart` 生成\r\n\
                      ' 删除本文件即可取消自启。\r\n\
-                     CreateObject(\"WScript.Shell\").Run \"\"\"{exe}\"\" daemon\", 0, False\r\n",
+                     CreateObject(\"WScript.Shell\").Run \"\"\"{exe}\"\" supervise\", 0, False\r\n",
                     exe = exe.display()
                 );
                 std::fs::write(&file, script)?;
 
                 println!("已注册自启：当前用户登录时后台启动");
                 println!("  启动器 : {}", file.display());
-                println!("  目标   : {} daemon", exe.display());
+                println!("  目标   : {} supervise（异常退出自动重启）", exe.display());
                 println!("\n取消：yunxi-bot uninstall-autostart");
                 Ok(0)
             }
@@ -490,6 +497,63 @@ fn cmd_autostart(action: AutostartAction) -> Result<i32, Box<dyn std::error::Err
                 }
             }
         }
+    }
+}
+
+/// 监督模式：daemon 异常退出时自动重启。
+///
+/// 为什么需要它：常驻的价值建立在"它一直在"之上。`daemon` 自身已经能扛住
+/// 单轮失败（连续 5 次才退出），但**进程级崩溃**（内存耗尽、未捕获的 panic、
+/// 外部强杀）需要更外层的看护。
+///
+/// 三条设计要点：
+///
+/// 1. **只重启异常退出**：退出码 0 表示守护主动收工（例如 `--max-ticks` 跑完），
+///    这种情况重启会造成无意义的循环。
+/// 2. **指数退避**：连续崩溃说明环境有问题，立刻重启只会刷屏。间隔逐次翻倍。
+/// 3. **有上限**：重启超过上限就放弃并退出，把问题暴露给人，
+///    而不是永远假装一切正常。
+fn cmd_supervise(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    let interval = flag(args, "--interval").unwrap_or("5000");
+    let max_restarts: u32 = flag(args, "--max-restarts")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(10);
+
+    let exe = std::env::current_exe()?;
+    println!("监督模式启动");
+    println!("  子进程 : {} daemon --interval {interval}", exe.display());
+    println!("  上限   : 连续异常退出 {max_restarts} 次后放弃");
+    println!();
+
+    let mut restarts = 0u32;
+    loop {
+        let status = Command::new(&exe)
+            .args(["daemon", "--interval", interval])
+            .status()?;
+
+        if status.success() {
+            println!("\n子进程正常退出（退出码 0），监督结束。");
+            return Ok(0);
+        }
+
+        let code = status.code().unwrap_or(-1);
+        restarts += 1;
+
+        if restarts > max_restarts {
+            eprintln!("\n子进程连续异常退出 {restarts} 次（最后一次退出码 {code}），已达上限。");
+            eprintln!("停止重启——继续重试只会掩盖问题。请检查台账与运行环境。");
+            return Ok(1);
+        }
+
+        // 指数退避，封顶 60 秒：连续崩溃时不刷屏，也不无限等待
+        let backoff = (1u64 << restarts.min(6)).min(60);
+        eprintln!(
+            "子进程异常退出（退出码 {code}），{backoff}s 后重启（第 {restarts}/{max_restarts} 次）"
+        );
+        thread::sleep(Duration::from_secs(backoff));
     }
 }
 
@@ -808,6 +872,11 @@ fn cmd_companion(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         relationship_stage: "熟悉".into(),
     };
 
+    // 决策台账：每次判断都写成一对被边界包住的审计事件。
+    // 没有它，就永远无法回答"当初为什么决定不打扰、事后看对不对"。
+    let mut ledger = Ledger::open(ledger_path())?;
+    let mut recorded = 0usize;
+
     for (hour, label) in [(3u8, "凌晨"), (9, "上午"), (14, "下午"), (23, "深夜")] {
         let decision = if let Some(engine) = stub_engine.as_mut() {
             decide_intervention(engine, &memory, &base, &policy, hour, 10_000_000)
@@ -816,6 +885,28 @@ fn cmd_companion(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         } else {
             unreachable!()
         };
+
+        // 记录决策：asked + decided 一对，落在同一个边界内
+        let outcome = yunxi_bot_core::decide::DecisionOutcome::Degraded {
+            class: yunxi_bot_core::decide::DecisionClass::Interrupt,
+            direction: if decision.action == yunxi_bot_core::companion::Intervention::Speak {
+                yunxi_bot_core::decide::DegradationDirection::FailOpen
+            } else {
+                yunxi_bot_core::decide::DegradationDirection::FailClosed
+            },
+            action: decision.action.label(),
+            reason: decision.reason.clone(),
+        };
+        if yunxi_bot_core::decide::record_decision(
+            &mut ledger,
+            yunxi_bot_core::decide::DecisionClass::Interrupt,
+            &outcome,
+            &["intervention".to_string(), "needs_support".to_string()],
+        )
+        .is_ok()
+        {
+            recorded += 1;
+        }
 
         let suggested = if decision.model_suggested_speak {
             "开口"
@@ -838,6 +929,8 @@ fn cmd_companion(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             mark
         );
     }
+    println!("\n已写入决策台账：{recorded} 对审计事件（asked + decided，各自被边界包住）");
+    println!("台账文件：{}", ledger.path().display());
 
     println!();
     if demo {
