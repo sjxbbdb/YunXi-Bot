@@ -152,23 +152,15 @@ def install(entry: dict, home: Path, force: bool, check_only: bool) -> int:
     print(f"模型: {name}")
     print(f"目标: {dest}")
 
-    if model_ready(dest, required):
-        if not force:
-            print("  已存在且完整，跳过下载。")
-            if entry.get("sha256_archive"):
-                print("  （如需重新校验，用 --force 重下）")
-            return 0
+    if model_ready(dest, required) and not force:
+        print("  已存在且完整，跳过下载。")
+        return 0
     elif check_only:
+        if model_ready(dest, required):
+            print("  存在且完整。")
+            return 0
         print("  ✗ 缺失或不完整")
         return 1
-
-    if check_only:
-        print("  存在且完整。")
-        return 0
-
-    if force and dest.exists():
-        print("  --force：删除已有权重")
-        shutil.rmtree(dest)
 
     archive_name = entry.get("archive")
     url = (
@@ -176,42 +168,64 @@ def install(entry: dict, home: Path, force: bool, check_only: bool) -> int:
         f"{entry['release_tag']}/{archive_name}"
     )
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_zip = Path(tmp) / (archive_name or "model.zip")
-        got = download(url, tmp_zip)
+    # —— 先下到暂存区，校验通过再替换 ——
+    #
+    # 早先版本是"先删旧的、再下新的"。实测踩到：拿`--force`做哈希篡改测试时，
+    # 旧的 487MB 权重被删掉、新的因校验失败没装上，最后**一份都没有**。
+    # 对要花 20 秒以上下载的东西，"先毁后建"是错的顺序。
+    staging = home / "models" / f".staging-{entry['dir']}"
+    if staging.exists():
+        shutil.rmtree(staging)
 
-        if got:
-            expect = entry.get("sha256_archive")
-            if expect:
-                print("  校验 SHA256 ...")
-                actual = sha256_of(tmp_zip)
-                if actual != expect:
-                    print("  ✗ 哈希不匹配，拒绝使用")
-                    print(f"    期望 {expect}")
-                    print(f"    实际 {actual}")
-                    return 2
-                print("  ✓ 哈希一致")
-            else:
-                print("  ⚠ 清单里没有哈希，跳过校验")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_zip = Path(tmp) / (archive_name or "model.zip")
+            got = download(url, tmp_zip)
 
-            print("  解压 ...")
-            dest.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(tmp_zip) as zf:
-                for member in zf.namelist():
-                    # 防 zip slip：拒绝绝对路径与上跳
-                    if member.startswith("/") or ".." in Path(member).parts:
-                        print(f"  ✗ 压缩包含可疑路径，中止: {member}")
+            if got:
+                expect = entry.get("sha256_archive")
+                if expect:
+                    print("  校验 SHA256 ...")
+                    actual = sha256_of(tmp_zip)
+                    if actual != expect:
+                        print("  ✗ 哈希不匹配，拒绝使用")
+                        print(f"    期望 {expect}")
+                        print(f"    实际 {actual}")
+                        if model_ready(dest, required):
+                            print("  已有的旧权重**未被破坏**，继续可用。")
                         return 2
-                zf.extractall(dest)
-        else:
-            print("  Release 资产不可用，尝试 HuggingFace 兜底 ...")
-            if not fetch_from_huggingface(entry, dest):
-                print("  ✗ 所有来源都失败")
-                return 1
+                    print("  ✓ 哈希一致")
+                else:
+                    print("  ⚠ 清单里没有哈希，跳过校验")
 
-    if not model_ready(dest, required):
-        print(f"  ✗ 解压后仍缺少必要文件（需要 {required}）")
-        return 1
+                print("  解压到暂存区 ...")
+                staging.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(tmp_zip) as zf:
+                    for member in zf.namelist():
+                        # 防 zip slip：拒绝绝对路径与上跳
+                        if member.startswith("/") or ".." in Path(member).parts:
+                            print(f"  ✗ 压缩包含可疑路径，中止: {member}")
+                            return 2
+                    zf.extractall(staging)
+            else:
+                print("  Release 资产不可用，尝试 HuggingFace 兜底 ...")
+                if not fetch_from_huggingface(entry, staging):
+                    print("  ✗ 所有来源都失败（旧权重未受影响）")
+                    return 1
+
+        if not model_ready(staging, required):
+            print(f"  ✗ 暂存区缺少必要文件（需要 {required}），放弃替换")
+            shutil.rmtree(staging, ignore_errors=True)
+            return 1
+
+        # 校验都过了，这时才动旧的
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(staging), str(dest))
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
     total = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file())
     print(f"  ✓ 就绪，{total / 1e6:.1f} MB")
