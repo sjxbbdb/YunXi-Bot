@@ -51,8 +51,24 @@ state（含你的偏好与约束）+ 类型化问题
 | `exec` — 子进程执行与凭证剥离 | ✅ 硬超时 + 进程树清理；**拿不到要求的隔离就拒绝执行** |
 | `runner` — 调度循环 | ✅ 把上面五个模块串成一个回合 |
 | **`decide` — 决策层** | ✅ typed questions、响应校验、六类双向降级、熔断 |
-| 常驻守护 | 🔶 `daemon` 可用（单实例锁、开机自启待补） |
+| **`instance` — 单实例锁** | ✅ pid 存活探测；**陈旧锁自动接管**（崩溃过一次不会再也起不来） |
+| 常驻守护 | ✅ 单实例锁、连续失败熔断、开机自启 |
 | 陪伴层 / 记忆层 / 入口层 | ⬜ 待实现 |
+
+### 常驻
+
+```bash
+cargo run -- daemon --interval 5000     # 常驻（Ctrl+C 停止，锁自动释放）
+cargo run -- install-autostart          # 注册当前用户登录时自启
+cargo run -- autostart-status           # 查看注册状态
+cargo run -- uninstall-autostart        # 取消自启
+```
+
+自启走**当前用户的「启动」文件夹 + VBS 隐藏启动器**，不需要管理员权限：
+
+> 实测 `schtasks /SC ONLOGON` 在普通用户下返回 `ERROR: Access is denied.`，
+> 因此改用 per-user 的启动文件夹；`.cmd` 会弹控制台窗口，故用 VBS 的
+> `Run(..., 0, False)` 以隐藏窗口拉起。删除那个 `.vbs` 即可取消自启。
 
 ### 决策层
 

@@ -15,6 +15,7 @@
 
 pub mod decide;
 pub mod exec;
+pub mod instance;
 pub mod job;
 pub mod ledger;
 pub mod policy;

@@ -29,6 +29,11 @@ fn ledger_path() -> PathBuf {
     default_home().join("ledger.jsonl")
 }
 
+/// 单实例锁文件路径。与台账同目录，便于一起备份/清理。
+fn lock_path() -> PathBuf {
+    default_home().join("daemon.lock")
+}
+
 const USAGE: &str = "\
 YunXi Bot —— 陪伴型通用常驻 Agent 助理
 
@@ -47,6 +52,10 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --interval <毫秒>     每轮间隔（默认 5000）
       --max-ticks <n>       跑够 n 轮就停（便于演示，默认无限）
       --require-os-isolation  要求 OS 级写入隔离，拿不到就拒绝执行
+
+  yunxi-bot install-autostart    注册当前用户登录时自启（Windows 计划任务）
+  yunxi-bot uninstall-autostart  取消自启
+  yunxi-bot autostart-status     查看自启注册状态
 
   yunxi-bot run <id>          立即执行一次（忽略触发条件）
   yunxi-bot list              列出全部任务
@@ -91,6 +100,9 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "approve" => cmd_approve(rest),
         "policy" => cmd_policy(),
         "decide" => cmd_decide(rest),
+        "install-autostart" => cmd_autostart(AutostartAction::Install),
+        "uninstall-autostart" => cmd_autostart(AutostartAction::Uninstall),
+        "autostart-status" => cmd_autostart(AutostartAction::Status),
         "tick" => cmd_tick(),
         "daemon" => cmd_daemon(rest),
         "run" => cmd_run(rest),
@@ -313,8 +325,24 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     };
 
     let mut l = Ledger::open(ledger_path())?;
+
+    // 单实例锁：两个守护同时调度同一批任务会导致重复执行。
+    // 锁在进程退出（含 Ctrl+C）时由析构自动释放。
+    let _lock = match yunxi_bot_core::instance::InstanceLock::acquire(lock_path()) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("拒绝启动：{e}");
+            return Ok(2);
+        }
+    };
+
     println!("YunXi Bot 守护启动");
     println!("  台账   : {}", l.path().display());
+    println!(
+        "  锁     : {} (pid {})",
+        _lock.path().display(),
+        _lock.pid()
+    );
     println!("  间隔   : {interval} ms");
     println!(
         "  隔离   : {}",
@@ -330,12 +358,27 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     println!();
 
     let mut n = 0u64;
+    let mut consecutive_errors = 0u32;
     loop {
         n += 1;
-        let r = tick(&mut l, &opts)?;
-        if !r.is_quiet() {
-            print!("[{n:>3}] ");
-            print_report(&r);
+        match tick(&mut l, &opts) {
+            Ok(r) => {
+                consecutive_errors = 0;
+                if !r.is_quiet() {
+                    print!("[{n:>3}] ");
+                    print_report(&r);
+                }
+            }
+            Err(e) => {
+                // 单轮失败不能杀死常驻进程；但连续失败要显式升级为熔断，
+                // 避免一个坏掉的台账让进程空转刷屏。
+                consecutive_errors += 1;
+                eprintln!("[{n:>3}] 本轮失败（连续 {consecutive_errors} 次）: {e}");
+                if consecutive_errors >= 5 {
+                    eprintln!("连续失败达到 5 次，守护退出以免空转。请检查台账与权限。");
+                    return Ok(1);
+                }
+            }
         }
         if max_ticks > 0 && n >= max_ticks {
             break;
@@ -345,6 +388,104 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 
     println!("\n守护已停止（共 {n} 轮）");
     Ok(0)
+}
+
+/// 自启动管理动作。
+#[derive(Debug, Clone, Copy)]
+enum AutostartAction {
+    Install,
+    Uninstall,
+    Status,
+}
+
+/// 自启文件名（放在当前用户的「启动」文件夹里）。
+#[cfg(windows)]
+const AUTOSTART_FILE: &str = "YunXiBot.vbs";
+
+/// 当前用户的「启动」文件夹路径。
+#[cfg(windows)]
+fn startup_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let appdata =
+        std::env::var("APPDATA").map_err(|_| "环境变量 APPDATA 缺失，无法定位启动文件夹")?;
+    Ok(PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("Startup"))
+}
+
+/// 开机自启：在**当前用户的「启动」文件夹**放一个 VBS 启动器。
+///
+/// 为什么不用计划任务：`schtasks /SC ONLOGON` 需要管理员权限，普通用户会被
+/// 拒绝（实测 `ERROR: Access is denied.`）。启动文件夹是 per-user 的，
+/// 零权限、零依赖，符合本项目"数据在 %LOCALAPPDATA%、不碰系统目录"的落地方式。
+///
+/// 为什么用 VBS：`.cmd` 会弹出控制台窗口。VBS 的 `Run(..., 0, False)` 以
+/// **隐藏窗口**方式拉起常驻进程，用户登录后不会看到一个黑框。
+fn cmd_autostart(action: AutostartAction) -> Result<i32, Box<dyn std::error::Error>> {
+    #[cfg(not(windows))]
+    {
+        let _ = action;
+        eprintln!("当前平台未实现自启注册。");
+        eprintln!(
+            "Linux 可自行加一个 systemd user unit 或 ~/.config/autostart 桌面项，\
+             指向 `yunxi-bot daemon`。"
+        );
+        Ok(2)
+    }
+
+    #[cfg(windows)]
+    {
+        let dir = startup_dir()?;
+        let file = dir.join(AUTOSTART_FILE);
+
+        match action {
+            AutostartAction::Install => {
+                std::fs::create_dir_all(&dir)?;
+                let exe = std::env::current_exe()?;
+
+                // 0 = 隐藏窗口，False = 不等待
+                let script = format!(
+                    "' YunXi Bot 常驻守护 —— 由 `yunxi-bot install-autostart` 生成\r\n\
+                     ' 删除本文件即可取消自启。\r\n\
+                     CreateObject(\"WScript.Shell\").Run \"\"\"{exe}\"\" daemon\", 0, False\r\n",
+                    exe = exe.display()
+                );
+                std::fs::write(&file, script)?;
+
+                println!("已注册自启：当前用户登录时后台启动");
+                println!("  启动器 : {}", file.display());
+                println!("  目标   : {} daemon", exe.display());
+                println!("\n取消：yunxi-bot uninstall-autostart");
+                Ok(0)
+            }
+            AutostartAction::Uninstall => {
+                if file.exists() {
+                    std::fs::remove_file(&file)?;
+                    println!("已取消自启（已删除 {}）", file.display());
+                    Ok(0)
+                } else {
+                    println!("自启未注册（{} 不存在）", file.display());
+                    Ok(1)
+                }
+            }
+            AutostartAction::Status => {
+                if file.exists() {
+                    println!("自启已注册：");
+                    println!("  {}", file.display());
+                    let body = std::fs::read_to_string(&file).unwrap_or_default();
+                    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                        println!("  | {}", line.trim());
+                    }
+                    Ok(0)
+                } else {
+                    println!("自启未注册（{} 不存在）", file.display());
+                    Ok(1)
+                }
+            }
+        }
+    }
 }
 
 fn cmd_run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
