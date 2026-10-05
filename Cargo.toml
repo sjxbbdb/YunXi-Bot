@@ -12,9 +12,18 @@ repository = "https://github.com/sjxbbdb/YunXi-Bot"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# 唯一的运行时依赖。理由：cron 必须按【本地时间】解析，
+# 唯一的时区依赖。理由：cron 必须按【本地时间】解析，
 # 而 std 不提供本地时区；个人助理的"每天早上 9 点"不能按 UTC 算。
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# 唯一的网络依赖。理由：Agnes 走 HTTPS，而 std 没有 TLS。
+#
+# 本项目的 HTTP 客户端（decide/http.rs）是纯 TCP 手写的，那对**本地回环**的
+# Laya sidecar 是正确的——不需要 TLS、也不该为此拉依赖树。但远端 API 不同：
+# 自己实现 TLS 是不负责任的，必须用经过审计的实现。
+#
+# ureq 是阻塞式、体积小的选择，底层是 rustls。选它而不是 reqwest：
+# 后者把 tokio 整套异步运行时也带进来，而本项目的守护循环是同步的。
+ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
 yunxi-bot-core = { path = "crates/yunxi-bot-core" }
 
 [profile.release]

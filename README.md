@@ -55,8 +55,10 @@ state（含你的偏好与约束）+ 类型化问题
 | **`win_job` — Windows 隔离** | ✅ Job Object：进程树强制回收 + 内存/进程数上限 |
 | **`memory` — 记忆层** | ✅ 事件溯源投影；`build_decision_state` 主动裁剪 state |
 | **`companion` — 陪伴层** | ✅ 记忆 → 模型判断 → **约束只能更保守** |
+| **`think` — 思考层** | ✅ Agnes（OpenAI 兼容）接入 + 本地限流 + 错误可分重试 |
+| **`agent` — Agent 循环** | ✅ 记忆投影 → 本地判断 → 约束收紧 → 远端表达 → 落台账 |
 | 常驻守护 | ✅ 单实例锁、连续失败熔断、开机自启 |
-| 入口层（语音 / 微信 / Web） | ⬜ 待实现 |
+| 入口层（语音 / 微信 / Web） | ⬜ 待实现（当前是 CLI） |
 
 ### 陪伴层：约束只能更保守
 
@@ -266,3 +268,61 @@ docs/
 ## 许可与致谢
 
 Apache-2.0。设计参考来源见 [`NOTICE`](NOTICE)。
+
+### Agent 循环：三层各管一段
+
+```text
+台账 ──投影──> 记忆 + 现状
+                 │
+                 ├─> 本地决策层（Laya）：该不该介入？   ← 快、免费、离线
+                 │        │
+                 │        └─ 约束层收紧（只能更保守）
+                 │
+                 └─> 只有判定「开口」时才动用远端思考层（Agnes）
+                          ↓
+                      写回决策台账
+```
+
+**顺序不能反。** Agnes 免费档只有 **10 RPM**，常驻进程每轮都打远端几秒就把配额
+烧光。本地那一层先筛，是这套配额下的结构必然，不是优化。
+
+实测（替身判断模型说"该开口"，表达走真实的 Agnes）：
+
+```text
+$ yunxi-bot agent --hour 14
+最终动作 : 主动开口
+依据     : 模型判断：主动开口（无约束限制）
+
+$ yunxi-bot agent --hour 3
+最终动作 : 延后聚合
+依据     : 模型建议「主动开口」，被约束收紧为「延后聚合」：当前处于安静时段（3 点）
+```
+
+### 思考层：Agnes
+
+```bash
+# 密钥放仓库外（%LOCALAPPDATA%\YunXiBot\secrets\agnes.key），或用环境变量
+export YUNXI_BOT_AGNES_KEY=sk-...
+cargo run -- think "用一句话回答：你更擅长什么？"
+```
+
+- Base URL `https://api.agnes-ai.cn/v1`，默认模型 `agnes-3.0-flash`（512K 上下文、支持工具调用）
+- **密钥从类型上就打印不出来**：`ApiKey` 不实现 `Display`，`Debug` 只显示前 6 位
+- **本地限流**先于网络：拿不到配额就返回 `LocalThrottle`，不 sleep 卡住整轮调度
+- **错误分"可重试"与"不可重试"**：429/5xx/网络可重试；401/402/403/404/400 重试只会浪费配额
+
+### Agent 相关命令
+
+```bash
+cargo run -- remember "在准备 AI 岗位的面试" --kind fact
+cargo run -- agent                      # 跑一个完整回合
+cargo run -- agent --show-prompt        # 先看它到底知道什么（排查"为什么不说话"）
+cargo run -- journal                    # 最近的决策记录
+cargo run -- daemon --agent             # 常驻循环里开启判断（每 12 轮一次）
+```
+
+**没装 Laya 时 Agent 不会说话**——判断层降级为 fail-closed（不打扰）。
+这是设计，不是故障，daemon 会提示一次。
+
+`sidecar/mock_laya.py` 是一个**测试替身**：实现相同的线协议但按脚本作答，
+让"判断 → 约束 → 表达 → 台账"这条链路能在不下载 640MB 模型的情况下被验证。

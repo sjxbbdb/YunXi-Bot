@@ -13,6 +13,7 @@
 //! 3. 决策模型的判断不能替代策略——模型给概率，约束层做决定。
 //! 4. 不写入边界外的审计事件——宁可抛错。
 
+pub mod agent;
 pub mod companion;
 pub mod decide;
 pub mod exec;
@@ -22,6 +23,7 @@ pub mod ledger;
 pub mod memory;
 pub mod policy;
 pub mod runner;
+pub mod think;
 pub mod trigger;
 pub mod win_job;
 #[cfg(windows)]

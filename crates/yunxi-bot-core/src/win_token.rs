@@ -496,18 +496,23 @@ pub struct RestrictedOutcome {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// 是否因超时被强制结束。
+    pub timed_out: bool,
 }
 
 /// 以受限令牌启动子进程并等待其结束。
 ///
 /// `env` 是**已经剥离过凭证**的键值对；这里把它编成 Unicode 环境块传进去，
 /// 而不是让子进程继承父环境——继承会把凭证原样带过去。
+#[allow(clippy::too_many_arguments)]
 pub fn run_restricted(
     token: &RestrictedToken,
     argv: &[String],
     cwd: &std::path::Path,
     env: &[(String, String)],
     timeout_ms: u64,
+    memory_limit_bytes: Option<u64>,
+    max_processes: Option<u32>,
 ) -> Result<RestrictedOutcome, TokenError> {
     if argv.is_empty() {
         return Err(TokenError::Invalid("命令为空".into()));
@@ -576,6 +581,22 @@ pub fn run_restricted(
         return Err(TokenError::Spawn(code));
     }
 
+    // 放进 Job Object：进程树强制回收 + 资源上限。
+    //
+    // 必须紧跟着 assign，趁子进程还没派生出孙进程——晚一步就会有孙子跑在 Job
+    // 之外，回收不干净。**没有这一步，写入隔离开着的时候进程树回收和资源上限
+    // 全部失效**，两个机制各管一段却接不上。
+    let _job = crate::win_job::JobObject::create(memory_limit_bytes, max_processes)
+        .ok()
+        .and_then(|j| {
+            // SAFETY: pi.h_process 是刚由 CreateProcessAsUserW 填充的有效句柄，
+            // 且要到下面 GetExitCodeProcess 之后才关闭，此处存活
+            match unsafe { j.assign_raw(pi.h_process) } {
+                Ok(()) => Some(j),
+                Err(_) => None,
+            }
+        });
+
     let stdout = read_all(out_r);
     let stderr = read_all(err_r);
     unsafe {
@@ -584,9 +605,11 @@ pub fn run_restricted(
         CloseHandle(in_r);
     }
 
-    // 等待，带超时；超时则强杀（Job Object 那一层还会兜底回收进程树）
+    // 等待，带超时。**超时必须如实上报**——台账里写 timed_out=false 而进程其实
+    // 是被超时杀掉的，那是在审计日志里说假话。
     let wait = unsafe { WaitForSingleObject(pi.h_process, timeout_ms as u32) };
-    if wait != WAIT_OBJECT_0 {
+    let timed_out = wait != WAIT_OBJECT_0;
+    if timed_out {
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pi.dw_process_id.to_string(), "/T", "/F"])
             .stdout(std::process::Stdio::null())
@@ -605,6 +628,7 @@ pub fn run_restricted(
         exit_code: code as i32,
         stdout,
         stderr,
+        timed_out,
     })
 }
 
@@ -862,7 +886,7 @@ pub fn verify_write_isolation(
     let env: Vec<(String, String)> = crate::exec::strip_credentials(current_env())
         .into_iter()
         .collect();
-    let out = run_restricted(&token, &argv, allowed, &env, 30_000)?;
+    let out = run_restricted(&token, &argv, allowed, &env, 30_000, None, None)?;
 
     let report = IsolationReport {
         allowed_written: allowed_file.exists(),

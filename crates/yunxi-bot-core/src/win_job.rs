@@ -159,8 +159,23 @@ mod imp {
             use std::os::windows::io::AsRawHandle;
             // RawHandle 本身就是 *mut c_void，无需转换
             let proc = child.as_raw_handle();
-            // SAFETY: 两个句柄都来自有效对象，且在本调用期间存活
-            let ok = unsafe { AssignProcessToJobObject(self.handle, proc) };
+            // SAFETY: 句柄来自存活的 Child，本调用期间有效
+            unsafe { self.assign_raw(proc) }
+        }
+
+        /// 直接拿进程句柄放入 Job。
+        ///
+        /// 受限执行走的是 `CreateProcessAsUserW`，拿到的是裸句柄而不是
+        /// `std::process::Child`，所以需要这个入口——否则写入隔离开启时
+        /// 进程树回收与资源上限会整段失效。
+        ///
+        /// # Safety
+        ///
+        /// `process` 必须是**有效且在本调用期间存活**的进程句柄。
+        /// 传垃圾指针会导致未定义行为（Win32 会解引用它）。
+        pub unsafe fn assign_raw(&self, process: *mut c_void) -> Result<(), JobError> {
+            // SAFETY: 由调用方保证句柄有效（见函数文档的 Safety 段）
+            let ok = unsafe { AssignProcessToJobObject(self.handle, process) };
             if ok == 0 {
                 return Err(JobError::Assign(unsafe { GetLastError() }));
             }
@@ -206,6 +221,12 @@ impl JobObject {
         Err(JobError::Unsupported)
     }
     pub fn assign(&self, _child: &std::process::Child) -> Result<(), JobError> {
+        Err(JobError::Unsupported)
+    }
+    /// # Safety
+    ///
+    /// 见 Windows 实现。本平台恒返回 `Unsupported`。
+    pub unsafe fn assign_raw(&self, _process: *mut std::ffi::c_void) -> Result<(), JobError> {
         Err(JobError::Unsupported)
     }
 }

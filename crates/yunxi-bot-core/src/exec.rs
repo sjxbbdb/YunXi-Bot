@@ -301,15 +301,23 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
             .map_err(|e| ExecError::Spawn(format!("准备沙箱目录失败: {e}")))?;
         let env: Vec<(String, String)> = strip_credentials(std::env::vars()).into_iter().collect();
 
-        let out =
-            crate::win_token::run_restricted(&token, command, &sandbox, &env, opts.timeout_ms)
-                .map_err(|e| ExecError::Spawn(format!("受限执行失败: {e}")))?;
+        let out = crate::win_token::run_restricted(
+            &token,
+            command,
+            &sandbox,
+            &env,
+            opts.timeout_ms,
+            opts.memory_limit_bytes,
+            opts.max_processes,
+        )
+        .map_err(|e| ExecError::Spawn(format!("受限执行失败: {e}")))?;
 
         return Ok(ExecOutcome {
             exit_code: out.exit_code,
             stdout: truncate(out.stdout),
             stderr: truncate(out.stderr),
-            timed_out: false,
+            // 如实上报，不再硬编码 false
+            timed_out: out.timed_out,
             duration_ms: started.elapsed().as_millis() as u64,
             isolation: IsolationLevel::WindowsRestrictedToken,
         });

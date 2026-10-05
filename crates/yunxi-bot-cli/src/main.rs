@@ -58,6 +58,13 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
   yunxi-bot autostart-status     查看自启注册状态
 
   yunxi-bot isolation-check      隔离自检：真起受限子进程验证写入隔离是否生效
+  yunxi-bot think <提示词>     调一次思考模型（Agnes），验证连通性与用量
+  yunxi-bot agent [选项]      跑一个完整的 Agent 回合（判断 + 表达）
+      --hour <0-23>         假定当前小时（用于观察安静时段的影响）
+      --no-think            只判断不表达（不消耗远端配额）
+  yunxi-bot remember <内容>   记一条记忆
+      --kind <类别>         fact / preference / relationship / event（默认 fact）
+  yunxi-bot journal [-n N]    查看最近的决策记录（默认 10）
   yunxi-bot supervise [选项]   监督模式：daemon 异常退出时自动重启
       --interval <毫秒>     传给 daemon 的轮间隔（默认 5000）
       --max-restarts <n>    放弃前最多重启几次（默认 10）
@@ -129,6 +136,10 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "decide" => cmd_decide(rest),
         "companion" => cmd_companion(rest),
         "isolation-check" => cmd_isolation_check(),
+        "think" => cmd_think(rest),
+        "agent" => cmd_agent(rest),
+        "remember" => cmd_remember(rest),
+        "journal" => cmd_journal(rest),
         "install-autostart" => cmd_autostart(AutostartAction::Install),
         "uninstall-autostart" => cmd_autostart(AutostartAction::Uninstall),
         "autostart-status" => cmd_autostart(AutostartAction::Status),
@@ -385,6 +396,44 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     if max_ticks > 0 {
         println!("  轮数   : {max_ticks}（跑完即停）");
     }
+
+    // —— Agent 循环 ——
+    //
+    // 只有显式开启才跑。理由：判断要调用本地决策模型，而**没装 Laya 时它会
+    // 每次都降级**——那是正确行为（fail-closed 不打扰），但会在日志里刷屏。
+    // 让它成为一个显式选择，比默认打开再解释噪音要好。
+    let agent_on = args.iter().any(|a| a == "--agent");
+    let judge_every: u64 = flag(args, "--judge-every")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(12);
+    let agent_home = default_home();
+
+    let mut engine = if agent_on {
+        use yunxi_bot_core::agent::agent_engine;
+        use yunxi_bot_core::decide::LayaDecider;
+        let endpoint = flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide");
+        println!("  Agent  : 开启（每 {judge_every} 轮判断一次）");
+        println!("  判断   : {endpoint}（本地）");
+        Some(agent_engine(LayaDecider::new(endpoint)))
+    } else {
+        None
+    };
+    let thinker = if agent_on {
+        match yunxi_bot_core::think::agnes::AgnesThinker::from_home(&agent_home) {
+            Ok(t) => {
+                use yunxi_bot_core::think::Thinker as _;
+                println!("  表达   : {}（{} RPM）", t.model(), t.config().rpm);
+                Some(t)
+            }
+            Err(_) => {
+                println!("  表达   : 不可用（没配密钥）——仍会判断与记账，但开不了口");
+                None
+            }
+        }
+    } else {
+        None
+    };
     println!();
 
     let mut n = 0u64;
@@ -410,6 +459,16 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 }
             }
         }
+
+        // —— Agent 判断回合 ——
+        //
+        // 放在调度之后：先让任务跑完，判断才有新的事实可看。
+        if let Some(engine) = engine.as_mut() {
+            if judge_every > 0 && n % judge_every == 0 {
+                run_agent_round(&mut l, engine, thinker.as_ref(), &agent_home, n);
+            }
+        }
+
         if max_ticks > 0 && n >= max_ticks {
             break;
         }
@@ -418,6 +477,72 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 
     println!("\n守护已停止（共 {n} 轮）");
     Ok(0)
+}
+
+/// 守护进程里的一个 Agent 判断回合。
+///
+/// **判断失败不能杀死常驻进程**：Agent 说不出话，任务该跑还得跑。
+/// 但失败必须可见——静默吞掉会让"Agent 为什么不理我"无从排查。
+fn run_agent_round<D, T>(
+    ledger: &mut Ledger,
+    engine: &mut yunxi_bot_core::decide::DecisionEngine<D>,
+    thinker: Option<&T>,
+    home: &std::path::Path,
+    tick_no: u64,
+) where
+    D: yunxi_bot_core::decide::Decider,
+    T: yunxi_bot_core::think::Thinker,
+{
+    use chrono::Timelike;
+    use yunxi_bot_core::agent::{CycleInput, run_cycle};
+    use yunxi_bot_core::companion::CompanionPolicy;
+    use yunxi_bot_core::memory::Situation;
+
+    let Ok(now_ms) = yunxi_bot_core::now_millis() else {
+        eprintln!("[{tick_no:>3}] Agent 回合跳过：取不到当前时间");
+        return;
+    };
+
+    let policy = CompanionPolicy::default();
+    let input = CycleInput {
+        policy: &policy,
+        local_hour: chrono::Local::now().hour() as u8,
+        now_ms,
+        base: Situation {
+            relationship_stage: "初期".into(),
+            ..Default::default()
+        },
+    };
+
+    let _ = home;
+    match run_cycle(ledger, engine, thinker, &input) {
+        Ok(out) => {
+            if let Some(text) = &out.spoken {
+                println!("[{tick_no:>3}] ◆ 它开口了: {text}");
+            } else if out.throttled {
+                println!("[{tick_no:>3}] Agent：本地限流，本轮未调用远端模型");
+            } else if out.decision.degraded {
+                // 降级会每轮都发生（Laya 没跑），只在首次提示一次
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    println!(
+                        "[{tick_no:>3}] Agent：判断模型不可用，按 fail-closed 保持静默。\
+                         \n      本地决策模型未启动时这是预期行为（不会打扰你）。"
+                    );
+                });
+            } else {
+                // **每个回合都要有痕迹。** 早先版本这条路径是静默的，
+                // 于是"判断正常但选择不说"看起来跟"Agent 没在跑"完全一样。
+                println!(
+                    "[{tick_no:>3}] Agent：判断为「{}」，本轮不打扰",
+                    out.decision.action.label()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("[{tick_no:>3}] Agent 回合失败（不影响任务调度）: {e}");
+        }
+    }
 }
 
 /// 自启动管理动作。
@@ -655,6 +780,295 @@ fn cmd_isolation_check() -> Result<i32, Box<dyn std::error::Error>> {
         yunxi_bot_core::exec::available_isolation().describe()
     );
     Ok(2)
+}
+
+/// 调一次思考模型，验证连通性与用量。
+///
+/// 这个命令存在的意义：**接入层的真伪只能靠真实调用验证**。
+/// 单测能证明错误映射、限流、密钥不泄露，但证明不了"这台机器此刻真的能连上
+/// Agnes 并拿到回复"。
+fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::think::{Message, ThinkRequest, Thinker, agnes::AgnesThinker};
+
+    let prompt: String = if args.is_empty() {
+        "用一句话说明你是谁。".to_string()
+    } else {
+        args.join(" ")
+    };
+
+    let home = default_home();
+    let thinker = match AgnesThinker::from_home(&home) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("无法初始化思考模型: {e}");
+            eprintln!();
+            eprintln!(
+                "密钥应放在: {}",
+                home.join("secrets").join("agnes.key").display()
+            );
+            eprintln!("或用环境变量 YUNXI_BOT_AGNES_KEY 覆盖。");
+            return Ok(2);
+        }
+    };
+
+    println!("模型      : {}", thinker.model());
+    println!("Base URL  : {}", thinker.config().base_url);
+    println!(
+        "限流      : {} RPM（两次调用最小间隔 {:?}）",
+        thinker.config().rpm,
+        thinker.min_interval()
+    );
+    println!("超时      : {:?}", thinker.config().timeout);
+    println!("提示词    : {prompt}");
+    println!();
+
+    let req = ThinkRequest::new(vec![
+        Message::system("你是一个个人助理程序的连通性测试端点。回答简洁。"),
+        Message::user(prompt),
+    ])
+    .with_max_tokens(256)
+    .with_temperature(0.3);
+
+    let started = std::time::Instant::now();
+    match thinker.think(&req) {
+        Ok(resp) => {
+            println!("耗时     : {} ms", started.elapsed().as_millis());
+            println!("模型回执 : {}", resp.model);
+            println!(
+                "结束原因 : {}",
+                resp.finish_reason.unwrap_or_else(|| "-".into())
+            );
+            println!(
+                "用量     : prompt {} / completion {} / total {}",
+                resp.usage.prompt_tokens, resp.usage.completion_tokens, resp.usage.total_tokens
+            );
+            println!();
+            println!("--- 回复 ---");
+            println!("{}", resp.content.trim());
+            Ok(0)
+        }
+        Err(e) => {
+            println!("耗时     : {} ms", started.elapsed().as_millis());
+            eprintln!("调用失败 : {e}");
+            eprintln!(
+                "可重试   : {}",
+                if e.is_retryable() {
+                    "是"
+                } else {
+                    "否（重试无用）"
+                }
+            );
+            Ok(1)
+        }
+    }
+}
+
+/// 跑一个完整的 Agent 回合：投影记忆 → 本地判断 → 约束收紧 → （必要时）远端表达。
+fn cmd_agent(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::agent::{CycleInput, agent_engine, run_cycle};
+    use yunxi_bot_core::companion::CompanionPolicy;
+    use yunxi_bot_core::decide::LayaDecider;
+    use yunxi_bot_core::memory::Situation;
+
+    let no_think = args.iter().any(|a| a == "--no-think");
+    let hour: u8 = flag(args, "--hour")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or_else(|| {
+            use chrono::Timelike;
+            chrono::Local::now().hour() as u8
+        });
+
+    let mut ledger = Ledger::open(ledger_path())?;
+    let policy = CompanionPolicy::default();
+
+    // 想看 Agent 到底知道什么，就先把它看到的提示词打出来。
+    // 判断"为什么它不说话"时，这一行比任何日志都有用。
+    if args.iter().any(|a| a == "--show-prompt") {
+        use yunxi_bot_core::agent::{compose_prompt, derive_situation};
+        use yunxi_bot_core::memory::Memory;
+        let events = ledger.events().to_vec();
+        let now_ms = yunxi_bot_core::now_millis()?;
+        let ctx = derive_situation(&events, now_ms);
+        let memory = Memory::from_events(&events);
+        println!("===== 它看到的提示词 =====");
+        println!("{}", compose_prompt(&ctx, &memory, &events, now_ms));
+        println!("==========================");
+        println!();
+    }
+
+    // 判断走**本地** Laya。它没跑的话会降级成 fail-closed（不打扰）——
+    // 这是设计，不是故障，但要让人看得见。
+    let endpoint = flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide");
+    let decider = LayaDecider::new(endpoint);
+    let mut engine = agent_engine(decider);
+
+    let input = CycleInput {
+        policy: &policy,
+        local_hour: hour,
+        now_ms: yunxi_bot_core::now_millis()?,
+        base: Situation {
+            relationship_stage: "初期".into(),
+            ..Default::default()
+        },
+    };
+
+    println!("判断模型 : {endpoint}（本地）");
+    println!(
+        "当前小时 : {hour}   安静时段: {}:00–{}:00",
+        policy.quiet_start_hour, policy.quiet_end_hour
+    );
+    println!("表达模型 : {}", if no_think { "（跳过）" } else { "Agnes" });
+    println!();
+
+    // 思考层是可选的：没配密钥也能跑判断
+    let home = default_home();
+    let thinker = if no_think {
+        None
+    } else {
+        yunxi_bot_core::think::agnes::AgnesThinker::from_home(&home).ok()
+    };
+    if !no_think && thinker.is_none() {
+        println!("提示：没有可用的思考模型（密钥缺失），本轮只判断不表达。");
+        println!(
+            "      密钥位置: {}",
+            home.join("secrets").join("agnes.key").display()
+        );
+        println!();
+    }
+
+    match thinker.as_ref() {
+        Some(t) => {
+            let out = run_cycle(&mut ledger, &mut engine, Some(t), &input)?;
+            print_cycle(&out);
+        }
+        None => {
+            let out = run_cycle::<_, yunxi_bot_core::think::agnes::StubThinker>(
+                &mut ledger,
+                &mut engine,
+                None,
+                &input,
+            )?;
+            print_cycle(&out);
+        }
+    }
+    Ok(0)
+}
+
+fn print_cycle(out: &yunxi_bot_core::agent::CycleOutcome) {
+    println!("最终动作 : {}", out.decision.action.label());
+    if out.decision.degraded {
+        println!("已降级   : 是（打扰类降级方向 fail-closed，不会打扰你）");
+    }
+    println!("依据     : {}", out.decision.reason);
+    println!("台账边界 : span#{}", out.span_id);
+    println!();
+    match (&out.spoken, out.throttled) {
+        (Some(text), _) => {
+            println!("--- 它开口了 ---");
+            println!("{text}");
+        }
+        (None, true) => println!("（被本地限流挡下，本轮没去打远端模型，也没说话）"),
+        (None, false) => println!("（本轮选择不开口）"),
+    }
+}
+
+/// 记一条记忆。
+fn cmd_remember(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::memory::MemoryKind;
+
+    let kind_str = flag(args, "--kind").unwrap_or("fact");
+    let kind = match kind_str {
+        "fact" => MemoryKind::Fact,
+        "preference" => MemoryKind::Preference,
+        "relationship" => MemoryKind::Relationship,
+        "event" => MemoryKind::Event,
+        other => {
+            eprintln!("未知类别 {other}，可用: fact / preference / relationship / event");
+            return Ok(2);
+        }
+    };
+
+    let text: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| {
+            *a != "--kind" && !(*i > 0 && args.get(i - 1).map(String::as_str) == Some("--kind"))
+        })
+        .map(|(_, a)| a.clone())
+        .collect();
+    let text = text.join(" ").trim().to_string();
+    if text.is_empty() {
+        eprintln!("缺少内容。用法: yunxi-bot remember <内容> [--kind fact]");
+        return Ok(2);
+    }
+
+    let mut ledger = Ledger::open(ledger_path())?;
+    let id = format!("m{}", yunxi_bot_core::now_millis()?);
+    ledger.append(
+        yunxi_bot_core::EventKind::MemoryRecorded,
+        None,
+        serde_json::json!({ "id": id, "kind": kind, "text": text }),
+    )?;
+
+    println!("已记住 [{}] {}", kind.label(), text);
+    println!("  编号 : {id}");
+    println!("  台账 : {}", ledger.path().display());
+    Ok(0)
+}
+
+/// 查看最近的决策记录。
+fn cmd_journal(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::EventKind;
+
+    let n: usize = flag(args, "-n")
+        .or_else(|| flag(args, "--limit"))
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(10);
+
+    let ledger = Ledger::open(ledger_path())?;
+    let decisions: Vec<_> = ledger
+        .events()
+        .iter()
+        .filter(|e| e.kind == EventKind::DecisionDecided)
+        .rev()
+        .take(n)
+        .collect();
+
+    if decisions.is_empty() {
+        println!("还没有任何决策记录。");
+        println!("跑一次 `yunxi-bot agent` 或让 daemon 带 --agent 运行就会产生。");
+        return Ok(0);
+    }
+
+    println!("最近 {} 条决策记录：\n", decisions.len());
+    for e in decisions {
+        let when = chrono::DateTime::from_timestamp_millis(e.at as i64)
+            .map(|d| {
+                use chrono::TimeZone;
+                chrono::Local
+                    .from_utc_datetime(&d.naive_utc())
+                    .format("%m-%d %H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_else(|| e.at.to_string());
+        let degraded = e
+            .data
+            .get("degraded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let action = e.data.get("action").and_then(|v| v.as_str()).unwrap_or("-");
+        let reason = e.data.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+        println!(
+            "  {when}  {action}{}",
+            if degraded { "  [降级]" } else { "" }
+        );
+        if !reason.is_empty() {
+            println!("            {reason}");
+        }
+    }
+    Ok(0)
 }
 
 fn cmd_run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
@@ -986,21 +1400,15 @@ fn cmd_companion(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             unreachable!()
         };
 
-        // 记录决策：asked + decided 一对，落在同一个边界内
-        let outcome = yunxi_bot_core::decide::DecisionOutcome::Degraded {
-            class: yunxi_bot_core::decide::DecisionClass::Interrupt,
-            direction: if decision.action == yunxi_bot_core::companion::Intervention::Speak {
-                yunxi_bot_core::decide::DegradationDirection::FailOpen
-            } else {
-                yunxi_bot_core::decide::DegradationDirection::FailClosed
-            },
-            action: decision.action.label(),
-            reason: decision.reason.clone(),
-        };
+        // 记录决策：asked + decided 一对，落在同一个边界内。
+        // `degraded` 如实来自判断结果。
         if yunxi_bot_core::decide::record_decision(
             &mut ledger,
             yunxi_bot_core::decide::DecisionClass::Interrupt,
-            &outcome,
+            decision.degraded,
+            decision.action.label(),
+            &decision.reason,
+            None,
             &["intervention".to_string(), "needs_support".to_string()],
         )
         .is_ok()

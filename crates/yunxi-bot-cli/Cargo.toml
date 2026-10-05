@@ -14,3 +14,5 @@ path = "src/main.rs"
 [dependencies]
 yunxi-bot-core = { workspace = true }
 serde_json = { workspace = true }
+# 展示决策时间用。核心已依赖它，这里只是复用同一个 workspace 依赖。
+chrono = { workspace = true }

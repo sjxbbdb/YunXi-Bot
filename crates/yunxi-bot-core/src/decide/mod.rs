@@ -282,11 +282,17 @@ pub const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
 /// 若落在边界之外，就与崩溃残尾无法区分，reload 时会被静默丢弃。所以这里
 /// 开一个边界、写两条、关边界，任何一步失败都不会留下半对记录。
 ///
-/// 边界同时是"一次决策是一个原子单位"的表达：要么两条都在，要么都不在。
+/// 各字段由调用方**如实**填入。早先版本要求传一个 [`DecisionOutcome`]，
+/// 结果调用方为了省事无论真实结果如何都构造 `Degraded`——台账于是把成功的判断
+/// 也标成降级。**宁可多几个参数，也不要让"如实上报"变成需要绕过的障碍。**
+#[allow(clippy::too_many_arguments)]
 pub fn record_decision(
     ledger: &mut crate::ledger::Ledger,
     class: DecisionClass,
-    outcome: &DecisionOutcome,
+    degraded: bool,
+    action: &str,
+    reason: &str,
+    model: Option<&str>,
     question_ids: &[String],
 ) -> Result<u64, crate::ledger::LedgerError> {
     use crate::ledger::EventKind;
@@ -303,12 +309,17 @@ pub fn record_decision(
         }),
     )?;
 
-    let mut data = outcome.ledger_data();
-    if let Some(obj) = data.as_object_mut() {
-        obj.insert("class".into(), serde_json::json!(class));
-    }
-    span.ledger()
-        .append(EventKind::DecisionDecided, None, data)?;
+    span.ledger().append(
+        EventKind::DecisionDecided,
+        None,
+        serde_json::json!({
+            "class": class,
+            "degraded": degraded,
+            "action": action,
+            "reason": reason,
+            "model": model,
+        }),
+    )?;
 
     span.close()?;
     Ok(span_id)
@@ -543,16 +554,13 @@ mod tests {
         let _ = std::fs::remove_file(&p);
 
         let mut ledger = Ledger::open(&p).expect("打开台账");
-        let outcome = DecisionOutcome::Degraded {
-            class: DecisionClass::Interrupt,
-            direction: DegradationDirection::FailClosed,
-            action: "延后聚合，本轮不打扰",
-            reason: "模型不可用".into(),
-        };
         let span_id = record_decision(
             &mut ledger,
             DecisionClass::Interrupt,
-            &outcome,
+            true,
+            "延后聚合，本轮不打扰",
+            "模型不可用",
+            None,
             &["intervention".to_string()],
         )
         .expect("写决策");
@@ -566,6 +574,45 @@ mod tests {
             "审计对必须落在同一个边界内，否则 reload 时会被当崩溃残尾丢弃"
         );
         assert!(!ledger.has_open_span(), "写完应关闭边界");
+        // degraded 必须如实落盘——早先版本在这里写死了"降级"
+        assert_eq!(events[1].data["degraded"], serde_json::json!(true));
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn record_decision_does_not_mislabel_a_successful_judgment_as_degraded() {
+        use crate::ledger::{EventKind, Ledger};
+        let mut p = std::env::temp_dir();
+        p.push(format!("yunxi-decide-ok-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+
+        let mut ledger = Ledger::open(&p).expect("打开台账");
+        let _ = record_decision(
+            &mut ledger,
+            DecisionClass::Interrupt,
+            false,
+            "主动开口",
+            "模型判断：主动开口",
+            Some("laya-multilingual"),
+            &["intervention".to_string()],
+        )
+        .expect("写决策");
+
+        let decided = ledger
+            .events()
+            .iter()
+            .find(|e| e.kind == EventKind::DecisionDecided)
+            .expect("应有 decided 事件");
+        assert_eq!(
+            decided.data["degraded"],
+            serde_json::json!(false),
+            "成功的判断不能被标成降级"
+        );
+        assert_eq!(
+            decided.data["model"],
+            serde_json::json!("laya-multilingual")
+        );
 
         let _ = std::fs::remove_file(&p);
     }
