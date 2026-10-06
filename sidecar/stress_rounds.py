@@ -113,11 +113,34 @@ def main() -> int:
         check("**全部轮次都跑完了**", p.returncode == 0, f"退出码 {p.returncode}")
 
         # 每轮用时：从限流等待行推不出来，改数"收到N"出现的位置
-        got = sum(1 for i in range(1, TURNS + 1) if f"收到{i}" in out)
+        # **精确统计：一轮一轮地看，而不是拿子串去凑。**
+        #
+        # `f"收到{i}" in out` 有个坑：`收到1` 会被 `收到15` 命中，
+        # 于是少答一轮也可能数出 15。改成按分隔符切段再逐段找。
+        segments = out.split("›")
+        missed = []
+        for i in range(1, TURNS + 1):
+            if not any(f"收到{i}" in seg for seg in segments):
+                missed.append(i)
+        got = TURNS - len(missed)
         print(f"      应答了 {got}/{TURNS} 轮；总耗时 {total:.1f} 秒"
               f"（平均 {total / max(got, 1):.1f} 秒/轮）")
+
+        # **失败的轮次要说出原因。**
+        #
+        # 这条最初只数了应答数——于是"某一轮失败了"只表现为一个数字变少，
+        # 看不出是限流、是 400、还是别的。**数字变少不是诊断。**
+        fails = [l.strip() for l in out.splitlines() if "这一轮失败了" in l]
+        if fails:
+            print(f"      有 {len(fails)} 轮报错，原因是：")
+            for f in fails[:5]:
+                print(f"        {f}")
+        if missed:
+            print(f"      没应答的轮次：{missed}")
+
         check(f"**{TURNS} 轮全部有应答**", got == TURNS,
-              f"只答了 {got} 轮——跑到后面掉了")
+              f"没答的是第 {missed} 轮"
+              + (f"；报错原话见上" if fails else "；但一轮都没报错——那更可疑"))
 
         # ---------------- 台账增长 ----------------
         print()
