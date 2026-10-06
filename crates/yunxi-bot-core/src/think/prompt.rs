@@ -1229,6 +1229,51 @@ mod tests {
     }
 
     #[test]
+    fn the_fingerprint_changes_exactly_once_and_then_stays_put() {
+        // **这条才是缓存纪律的要害。** 上面那条只验了"变了"——
+        // 而"改人格"这个动作在验收里写的是"指纹**只变一次**"。
+        //
+        // 另一半是：**变完之后必须稳定。**
+        //
+        // 如果 `build_persona` 不是纯函数（比如里面读了时钟、读了会被
+        // 并发写的文件、或者用了 `HashMap` 的遍历顺序），指纹就会
+        // **每一轮都不一样**。后果不是报错，是**缓存永远不命中**——
+        // 而实测命中率是 87.1%，那 87.1% 全靠"同样的输入给同样的字节"。
+        //
+        // **它坏掉的时候没有声音。** 所以这条测试盯着的是"稳定"
+        // 而不是"正确"——前缀内容的正确性由别的测试管。
+        let before = build_persona("云熙", "克制", &[]);
+        let after = build_persona("云熙", "活泼", &[]);
+
+        // 1. 同一个人格，算两次必须逐字一样
+        assert_eq!(
+            before,
+            build_persona("云熙", "克制", &[]),
+            "**同一个输入必须给出同样的前缀**——不然缓存全废"
+        );
+
+        // 2. 换成新人格之后，也要稳定（"只变一次"的那个"一次"）
+        let fp_new = PromptLayout::new(after.clone()).fingerprint();
+        assert_eq!(
+            fp_new,
+            PromptLayout::new(build_persona("云熙", "活泼", &[])).fingerprint(),
+            "换完之后每一轮都还得是同一个指纹，**不能一直变**"
+        );
+
+        // 3. 换了就是换了（和改动前不同），而且不同的人格给出不同的指纹
+        assert_ne!(
+            PromptLayout::new(before).fingerprint(),
+            fp_new,
+            "改了人格指纹就该变"
+        );
+        assert_ne!(
+            fp_new,
+            PromptLayout::new(build_persona("云熙", "冷静", &[])).fingerprint(),
+            "不同的人格要给不同的指纹——否则换了等于没换"
+        );
+    }
+
+    #[test]
     fn rules_are_numbered_deterministically() {
         let p = persona();
         assert!(p.contains("1. 不可逆动作必须人工批准"));
