@@ -334,6 +334,58 @@ pub fn build_persona(name: &str, persona: &str, rules: &[String]) -> String {
     out
 }
 
+/// 动态召回段的字符上限。
+///
+/// **比常驻段小得多**（1200 vs 320）。它进**易变尾**，每轮都要重发、
+/// 不享受缓存——所以每多一个字都是每轮多付一次。
+///
+/// 而它要的东西也比常驻段窄：常驻段回答"使用者是谁"（长期、每次都用），
+/// 动态段只回答"这句话跟哪些往事有关"。
+pub const RECALL_BUDGET_CHARS: usize = 320;
+
+/// 动态召回最多放几条。
+///
+/// 3 条是**刻意压小的**：召回是把双刃剑，多一条相关的收益递减，
+/// 多一条不相干的就是实打实的干扰。宁可少而准。
+pub const RECALL_LIMIT: usize = 3;
+
+/// 拼动态召回段。
+///
+/// 形如：
+///
+/// ```text
+/// # 相关的记忆
+/// - [事件] 上周和客户开了个会
+/// - [关系] 和小李一起做过一个项目
+/// ```
+///
+/// ## 为什么不用"以下是背景知识"这种说法
+///
+/// 记忆是**关于使用者的事实**，不是知识库。说成"背景知识"会让模型
+/// 把它当资料引用，而它其实该用来**调整对使用者的称呼和态度**。
+///
+/// 标题写"记忆"而不是"上下文"，也是为了让它明白这是**它自己记得的事**——
+/// 用户问"你还记得吗"时，它该答得出，而不是说"我的知识库里没有"。
+pub fn build_recall_block(entries: &[&crate::memory::MemoryEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("# 你记得的相关往事\n");
+    let mut used = out.chars().count();
+    for e in entries {
+        let line = format!("- [{}] {}\n", e.kind.label(), e.text);
+        let cost = line.chars().count();
+        if used + cost > RECALL_BUDGET_CHARS {
+            // **截断就是截断，不在这里解释**——这一段每轮都发，
+            // 说明文字比记忆本身还贵。常驻段那边才需要解释（它缓存的）。
+            break;
+        }
+        out.push_str(&line);
+        used += cost;
+    }
+    out
+}
+
 /// 常驻记忆段的字符上限。
 ///
 /// **必须有上限。** 记忆会一直长，而这一段进稳定前缀：
