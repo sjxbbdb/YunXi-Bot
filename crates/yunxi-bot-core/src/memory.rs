@@ -35,6 +35,21 @@ pub enum MemoryKind {
     Relationship,
     /// 值得记住的事件。
     Event,
+    /// **关于某个工作目录的记忆**（这个项目的约定、这个仓库的坑）。
+    ///
+    /// ## 为什么单独一类
+    ///
+    /// 因为它**有作用域**：`Fact` 是关于"这个人"的，在哪儿都成立；
+    /// 而"这个项目用 pytest 不用 unittest"只在**那个目录下**成立。
+    ///
+    /// 混在一起会出两种错：
+    /// - 在 B 项目里召回 A 项目的约定 → **按错的前提干活**
+    /// - A 项目的路径进了常驻层 → 常驻层是**稳定前缀**，而 cwd
+    ///   每次运行都可能变，**前缀一变缓存全废**
+    ///
+    /// 所以这一类的规则不一样：**不进常驻层**（`resident` 只取
+    /// `Fact | Preference`，自动成立），**召回时按 cwd 筛**。
+    Workspace,
 }
 
 impl MemoryKind {
@@ -44,6 +59,7 @@ impl MemoryKind {
             MemoryKind::Preference => "偏好",
             MemoryKind::Relationship => "关系",
             MemoryKind::Event => "事件",
+            MemoryKind::Workspace => "工作目录",
         }
     }
 
@@ -54,6 +70,9 @@ impl MemoryKind {
             MemoryKind::Preference => "preferences",
             MemoryKind::Relationship => "relationship",
             MemoryKind::Event => "recent_events",
+            // **和 facts/preferences 分开**：它们进常驻层（稳定前缀），
+            // 而工作目录记忆只在当前目录命中的那一轮进易变段。
+            MemoryKind::Workspace => "workspace_notes",
         }
     }
 }
@@ -177,6 +196,15 @@ pub struct MemoryEntry {
     pub weight: f64,
     pub created_at: u64,
     pub last_used_at: Option<u64>,
+    /// 这条记忆属于哪个工作目录。**只有 `Workspace` 类会填它**——
+    /// 关于"这个人"的记忆不该跟着目录走。
+    ///
+    /// 存的是**规范化后的目录路径**，不是哈希。不用指纹是为了可排查：
+    /// 台账里出现一个哈希，事后没人能看出它指哪个目录，
+    /// 而"这条记忆为什么没被召回"恰恰是最常要回答的问题。
+    ///
+    /// `None` = **无作用域**，在哪儿都能召回。
+    pub scope: Option<String>,
 }
 
 impl MemoryEntry {
@@ -203,6 +231,13 @@ struct RecordedPayload {
     text: String,
     #[serde(default = "one")]
     weight: f64,
+    /// 这条记忆属于哪个工作目录。只有 `Workspace` 类会用。
+    ///
+    /// **`default` 是必须的**：加这个字段之前写下的台账里没有它，
+    /// 而那些台账要能继续读——**记忆是长期资产，不能因为加了一个字段
+    /// 就让旧记录读不出来。**
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 fn one() -> f64 {
@@ -241,6 +276,14 @@ impl Memory {
                             weight: p.weight.clamp(0.0, 10.0),
                             created_at: e.at,
                             last_used_at: None,
+                            // 只有 `Workspace` 类带作用域。别的类即使事件里
+                            // 写了 scope 也丢掉——关于"这个人"的记忆
+                            // 不该跟着目录走。
+                            scope: if p.kind == MemoryKind::Workspace {
+                                p.scope.clone()
+                            } else {
+                                None
+                            },
                         },
                     );
                 }
@@ -326,6 +369,16 @@ impl Memory {
         limit: usize,
         budget_chars: usize,
         fatigue: &std::collections::HashMap<String, u32>,
+        // **当前工作目录**，用来筛 `Workspace` 记忆。
+        //
+        // 筛选放在召回这一刻，而不是"记的时候"：记忆跨目录共存，
+        // 记的时候筛就得为每个目录重写一遍记忆。
+        //
+        // `None` = 不知道当前目录。这时**所有带作用域的
+        // `Workspace` 记忆都不给**——宁可少给一条，
+        // 也不要在一个未知目录里用别的目录的约定。
+        // （Rust 不允许给函数参数写 `///` 文档注释，所以这里是 `//`。）
+        scope: Option<&str>,
     ) -> Vec<RecallHit<'_>> {
         use crate::embedding::{CHANNEL_DEPTH, RRF_K, embed_with_idf, lexical_overlap, rrf_fuse};
 
@@ -334,7 +387,19 @@ impl Memory {
 
         // 定序的载体：`self.entries` 是 BTreeMap，遍历顺序按 id，
         // **是确定的**——所以下标能稳定地代表某一条。
-        let items: Vec<&MemoryEntry> = self.entries.values().collect();
+        let items: Vec<&MemoryEntry> = self
+            .entries
+            .values()
+            .filter(|e| match (e.kind, e.scope.as_deref()) {
+                // 工作目录记忆：**只有当前目录对得上才给**。
+                // 没有作用域的 `Workspace` 记忆是坏数据（记的时候一定会填），
+                // 不给——它不知道该在哪个目录生效。
+                (MemoryKind::Workspace, Some(owner)) => scope == Some(owner),
+                (MemoryKind::Workspace, None) => false,
+                // 其他类**无作用域**：事实、偏好、关系、事件在哪儿都成立
+                _ => true,
+            })
+            .collect();
 
         // ---- 路 1：语义 ----
         let qv = embed_with_idf(query, &idf);
@@ -475,6 +540,9 @@ impl Memory {
             // 已经在前缀里了，稍微让一让，但不足以翻盘
             MemoryKind::Fact | MemoryKind::Preference => 0.9,
             MemoryKind::Relationship | MemoryKind::Event => 1.0,
+            // 工作目录记忆**只在相关时才该出现**——它讲的是这个目录的事，
+            // 换个话题就不该占位。给低基础权重，靠相似度把它抬上来。
+            MemoryKind::Workspace => 0.8,
         };
         // 近因：90 天半衰期。**比常驻层那个 30 天宽**——
         // 常驻层要的是"长期是谁"，动态层要的是"最近相关"
@@ -894,7 +962,7 @@ mod recall_tests {
         ];
         let mut hit = 0;
         for (q, want) in cases {
-            let r = m.recall_for_prompt(q, 10_000, 3, 400, &no_fatigue());
+            let r = m.recall_for_prompt(q, 10_000, 3, 400, &no_fatigue(), None);
             let picked: Vec<&str> = r
                 .iter()
                 .filter(|h| h.route == RecallRoute::Picked)
@@ -953,7 +1021,14 @@ mod recall_tests {
         // 凑不出溢出的场景——于是这条测试挂在了"没有 DroppedBudget"上。
         // 那**不是断言放宽，是场景失效**：要验的机制是"溢出被标出来"，
         // 就该保证一定溢出。
-        let r = m.recall_for_prompt("颜色 猫 咖啡 杭州 香菜", 10_000, 1, 400, &no_fatigue());
+        let r = m.recall_for_prompt(
+            "颜色 猫 咖啡 杭州 香菜",
+            10_000,
+            1,
+            400,
+            &no_fatigue(),
+            None,
+        );
         let picked = r.iter().filter(|h| h.route == RecallRoute::Picked).count();
         assert!(picked <= 1, "条数上限是 1，实际选了 {picked}");
         assert!(
@@ -968,7 +1043,14 @@ mod recall_tests {
     fn an_unrelated_question_drops_everything_with_a_reason() {
         let items = twenty();
         let m = mem_of(&items);
-        let r = m.recall_for_prompt("量子色动力学的重整化群方程", 10_000, 5, 400, &no_fatigue());
+        let r = m.recall_for_prompt(
+            "量子色动力学的重整化群方程",
+            10_000,
+            5,
+            400,
+            &no_fatigue(),
+            None,
+        );
         let picked = r.iter().filter(|h| h.route == RecallRoute::Picked).count();
         assert_eq!(picked, 0, "跟记忆库完全不相干的问题不该硬塞记忆进去");
         assert!(r.iter().all(|h| h.route == RecallRoute::DroppedUnrelated));
@@ -984,7 +1066,7 @@ mod recall_tests {
         let m = mem_of(&items);
         let q = "我住在哪";
 
-        let fresh = m.recall_for_prompt(q, 10_000, 3, 400, &no_fatigue());
+        let fresh = m.recall_for_prompt(q, 10_000, 3, 400, &no_fatigue(), None);
         let top_fresh = fresh
             .iter()
             .find(|h| h.route == RecallRoute::Picked)
@@ -994,7 +1076,7 @@ mod recall_tests {
         // 同一条已经被召回 200 次
         let mut tired = HashMap::new();
         tired.insert(top_fresh.clone(), 200u32);
-        let after = m.recall_for_prompt(q, 10_000, 3, 400, &tired);
+        let after = m.recall_for_prompt(q, 10_000, 3, 400, &tired, None);
 
         // 它的分数必须明显掉下来（对数惩罚：1/(1+ln(201)) ≈ 0.158）
         let s_fresh = fresh
@@ -1044,7 +1126,7 @@ mod recall_tests {
         // 一开始用的是两条不同的正文，于是"事实分低"到底是因为类别
         // 还是因为本来就不像，根本分不出来——测试挂了我还在猜。
         let m = mem_of(&[("住在杭州", "fact"), ("住在杭州", "event")]);
-        let r = m.recall_for_prompt("杭州", 10_000, 5, 400, &no_fatigue());
+        let r = m.recall_for_prompt("杭州", 10_000, 5, 400, &no_fatigue(), None);
         let fact = r.iter().find(|h| h.entry.kind == MemoryKind::Fact).unwrap();
         let event = r
             .iter()
@@ -1226,5 +1308,158 @@ mod tests {
             ev(EventKind::MemoryRecorded, 2, json!({"id": "x"})),      // 缺 kind/text
         ]);
         assert_eq!(m.len(), 0, "坏数据应跳过而不是崩");
+    }
+}
+
+#[cfg(test)]
+mod workspace_scope_tests {
+    use super::*;
+    use crate::ledger::{Event, EventKind};
+
+    fn ev(at: u64, data: serde_json::Value) -> Event {
+        Event {
+            seq: at,
+            at,
+            kind: EventKind::MemoryRecorded,
+            job: None,
+            span: None,
+            data,
+        }
+    }
+
+    /// 一条"这个项目用 pytest"的工作目录记忆，外加一条无作用域的事实。
+    fn two() -> Memory {
+        Memory::from_events(&[
+            ev(
+                1_000,
+                serde_json::json!({
+                    "id": "w1", "kind": "workspace",
+                    "text": "这个项目用 pytest 不用 unittest",
+                    "scope": "C:\\proj\\a"
+                }),
+            ),
+            ev(
+                1_001,
+                serde_json::json!({"id": "f1", "kind": "fact", "text": "使用者住在杭州"}),
+            ),
+        ])
+    }
+
+    fn ids(hits: &[RecallHit<'_>]) -> Vec<String> {
+        hits.iter().map(|h| h.entry.id.clone()).collect()
+    }
+
+    fn no_fatigue() -> std::collections::HashMap<String, u32> {
+        std::collections::HashMap::new()
+    }
+
+    #[test]
+    fn a_workspace_memory_is_recalled_in_its_own_directory() {
+        let m = two();
+        let hits = m.recall_for_prompt(
+            "这个项目用 pytest 还是 unittest",
+            10_000,
+            5,
+            400,
+            &no_fatigue(),
+            Some("C:\\proj\\a"),
+        );
+        assert!(
+            ids(&hits).contains(&"w1".to_string()),
+            "**在它自己的目录里必须能召回**：{:?}",
+            ids(&hits)
+        );
+    }
+
+    #[test]
+    fn a_workspace_memory_is_not_recalled_in_another_directory() {
+        // **这是这条验收的核心。**
+        //
+        // A 项目的约定在 B 项目里被召回，等于**按错的前提干活**——
+        // 而它会以一种非常像"它记得我"的姿态出现，人不容易察觉。
+        let m = two();
+        let hits = m.recall_for_prompt(
+            "这个项目用 pytest 还是 unittest",
+            10_000,
+            5,
+            400,
+            &no_fatigue(),
+            Some("C:\\proj\\b"),
+        );
+        assert!(
+            !ids(&hits).contains(&"w1".to_string()),
+            "**换个目录就不该给**：{:?}",
+            ids(&hits)
+        );
+    }
+
+    #[test]
+    fn a_workspace_memory_is_not_recalled_when_the_directory_is_unknown() {
+        // 拿不到 cwd 的时候（测试、非交互调用）**宁可少给一条**，
+        // 也不要用一个不知道哪个目录的约定。
+        let m = two();
+        let hits = m.recall_for_prompt(
+            "这个项目用 pytest 还是 unittest",
+            10_000,
+            5,
+            400,
+            &no_fatigue(),
+            None,
+        );
+        assert!(
+            !ids(&hits).contains(&"w1".to_string()),
+            "不知道当前目录时不该给带作用域的记忆：{:?}",
+            ids(&hits)
+        );
+    }
+
+    #[test]
+    fn an_unscoped_memory_is_recalled_anywhere() {
+        // **反过来的那一半**：事实、偏好这类没有作用域的记忆
+        // 在哪个目录都该能召回。筛得太狠会让"它不记得我了"。
+        let m = two();
+        for scope in [Some("C:\\proj\\a"), Some("C:\\proj\\b"), None] {
+            let hits = m.recall_for_prompt("使用者住在哪", 10_000, 5, 400, &no_fatigue(), scope);
+            assert!(
+                ids(&hits).contains(&"f1".to_string()),
+                "无作用域的记忆在 {scope:?} 下也该给：{:?}",
+                ids(&hits)
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_memories_never_enter_the_resident_layer() {
+        // **常驻层是稳定前缀**，而 cwd 每次运行都可能变。
+        // 工作目录记忆一旦进去，前缀就跟着目录变——**缓存全废**。
+        let m = two();
+        let resident: Vec<String> = m.resident(20).iter().map(|e| e.id.clone()).collect();
+        assert!(
+            !resident.contains(&"w1".to_string()),
+            "工作目录记忆不该进常驻层：{resident:?}"
+        );
+        // 事实类还是要在里面——别把正常的也筛掉了
+        assert!(resident.contains(&"f1".to_string()), "{resident:?}");
+    }
+
+    #[test]
+    fn a_workspace_memory_without_a_scope_is_not_given() {
+        // 没有作用域的 `Workspace` 记忆是坏数据（记的时候一定会填）。
+        // **它不知道该在哪个目录生效**，所以哪个目录都不给。
+        let m = Memory::from_events(&[ev(
+            1_000,
+            serde_json::json!({
+                "id": "bad", "kind": "workspace", "text": "这个项目用 pytest"
+            }),
+        )]);
+        let hits = m.recall_for_prompt(
+            "这个项目用 pytest",
+            10_000,
+            5,
+            400,
+            &no_fatigue(),
+            Some("C:\\proj\\a"),
+        );
+        assert!(ids(&hits).is_empty(), "坏数据不该被召回：{:?}", ids(&hits));
     }
 }

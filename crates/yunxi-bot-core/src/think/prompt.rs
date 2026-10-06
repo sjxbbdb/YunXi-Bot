@@ -493,6 +493,9 @@ mod memory_block_tests {
             weight,
             created_at: created,
             last_used_at: None,
+            // 这个测试工厂造的都是无作用域的记忆——**默认值不能是
+            // "某个目录"**，否则测试会因为目录不对而静默漏掉条目。
+            scope: None,
         }
     }
 
