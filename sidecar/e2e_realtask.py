@@ -170,13 +170,37 @@ def main() -> int:
         # ================= 给答案 + 授权写入 =================
         print()
         print("=== 给出人的决定，让它跑完 ===")
-        r2 = subprocess.run(
-            [str(BIN), "resume", task_id, "--yes", "--answer", ANSWER],
-            capture_output=True, text=True, encoding="utf-8",
-            env=env, timeout=1800, cwd=str(work),
-        )
-        out2 = (r2.stdout or "") + (r2.stderr or "")
-        print("\n".join(out2.strip().splitlines()[-6:]))
+        #
+        # **一个任务可能有多个决策点**，而 `resume --answer` 一次答一个。
+        #
+        # 真机上第一次跑就是栽在这儿：答完第一个决策点，任务继续，
+        # 然后又停在第二个（模型在动风险代码之前先问"要不要动手、
+        # 怎么回滚"——**那是好行为**）。脚本却以为答一次就完事，于是判了失败。
+        #
+        # 所以要**循环答**，直到它不再是"等人工"。
+        # 上限是防死循环：真出问题时要停下来报，而不是转到天荒地老。
+        out2 = ""
+        answered = 0
+        for round_no in range(1, 6):
+            rt = subprocess.run([str(BIN), "tasks", task_id],
+                                capture_output=True, text=True, encoding="utf-8",
+                                env=env, timeout=300, cwd=str(work))
+            state_now = (rt.stdout or "") + (rt.stderr or "")
+            if "等人工" not in state_now:
+                break
+            r2 = subprocess.run(
+                [str(BIN), "resume", task_id, "--yes", "--answer", ANSWER],
+                capture_output=True, text=True, encoding="utf-8",
+                env=env, timeout=1800, cwd=str(work),
+            )
+            out2 = (r2.stdout or "") + (r2.stderr or "")
+            if "已记下你对步骤" not in out2:
+                # 没答上（没有待决的决策步骤了，或者状态不让插手）——别再转
+                break
+            answered += 1
+            print(f"      第 {round_no} 轮：答了一个决策点")
+        print(f"      共答了 {answered} 个决策点")
+        print("\n".join(out2.strip().splitlines()[-4:]))
 
         check("**人的决定被记下了**", "已记下你对步骤" in out2,
               "没这句话说明 --answer 根本没落到步骤上")

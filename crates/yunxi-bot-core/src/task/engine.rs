@@ -97,6 +97,75 @@ pub enum StepVerdict {
     Unmarked(String),
 }
 
+/// 指令里**点名提到的**、且确实存在于这个任务里的其他步骤 id。
+///
+/// ## 为什么需要它
+///
+/// 真机上第 9 步的指令是「按 s3 的边界清单逐条核对」，而它的
+/// `depends_on` 里没写 s3。引擎只把**声明过的**依赖当输入，
+/// 于是模型手上没有 s3 的内容，只能如实回
+/// 「无法获取 s3 的边界清单原文」——一步白做，后面依赖它的也被跳过。
+///
+/// 计划是模型写的：**它引用一个步骤，却忘了声明依赖，是很自然的事。**
+/// 而"引用"这件事本身在指令文本里是明摆着的——照着它补上，
+/// 比让这一步白跑一次要划算得多。
+///
+/// ## 只认真正存在的 id
+///
+/// 这样才叫"补一个漏写的依赖"而不是"猜"。指令里出现 `s3` 而任务里
+/// 没有 s3 的话，什么也不补——那多半是模型在说别的（型号、变量名）。
+///
+/// 大小写不敏感（`S3` 也算），因为模型两种都会写。
+fn mentioned_step_ids(instruction: &str, task: &Task) -> Vec<String> {
+    let bytes = instruction.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // 找一个 `s` / `S`，且它前面不是字母数字（避免命中 `was3`、`xs3` 这类）
+        if !bytes[i].eq_ignore_ascii_case(&b's') {
+            i += 1;
+            continue;
+        }
+        let prev_is_word = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if prev_is_word {
+            i += 1;
+            continue;
+        }
+        // 后面必须紧跟数字
+        let start = i + 1;
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == start {
+            i += 1;
+            continue;
+        }
+        // 数字后面不能再接字母数字（`s3x` 不是步骤 id）
+        let after_is_word =
+            end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+        if !after_is_word {
+            let candidate = &instruction[i..end];
+            // **返回任务里真实的那个 id，不是指令里的写法。**
+            //
+            // 指令写 `S3`、任务里是 `s3` 时，返回 `S3` 会让下游按 id
+            // 查结果时对不上——而那种对不上不会报错，只会**静默少一份输入**，
+            // 于是模型又说一次"拿不到"。
+            if let Some(real) = task
+                .steps
+                .iter()
+                .find(|s| s.id.eq_ignore_ascii_case(candidate))
+                .map(|s| s.id.clone())
+                && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(&real))
+            {
+                out.push(real);
+            }
+        }
+        i = end;
+    }
+    out
+}
+
 /// 解析步骤产出。**大小写不敏感**，并容忍全角冒号与行首空白。
 pub fn classify_step_output(raw: &str) -> StepVerdict {
     let t = raw.trim_start();
@@ -602,8 +671,24 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             return self.run_decision(self.decider, task_id, &step, &question, ledger, records);
         }
 
-        let inputs: Vec<(String, String)> = step
-            .depends_on
+        // 输入 = 声明了依赖的那些步骤的结果
+        //      + **指令里点名提到的那些步骤的结果**
+        //
+        // 第二项是真机上补的。第 9 步的指令写着「按 s3 的边界清单逐条核对」，
+        // 而 `depends_on` 里没写 s3——引擎只把声明过的依赖当输入，
+        // 于是模型拿不到 s3 的内容，只能如实回「无法获取 s3 的边界清单原文」。
+        // **一步白做，还连累了依赖它的后面几步。**
+        //
+        // 计划是模型写的，引用一个步骤却忘了声明依赖，是很自然的事
+        // （它不会因为漏写就少引用一次）。指令里点名了谁就把谁的结果给它——
+        // 这是**在补一个模型漏写的依赖，不是在猜**：id 必须真的存在于这个任务里。
+        let mut wanted: Vec<String> = step.depends_on.clone();
+        for id in mentioned_step_ids(&step.instruction, &task) {
+            if !wanted.contains(&id) {
+                wanted.push(id);
+            }
+        }
+        let inputs: Vec<(String, String)> = wanted
             .iter()
             .filter_map(|d| {
                 task.step(d)
@@ -1251,6 +1336,77 @@ mod human_answer_tests {
 }
 
 #[cfg(test)]
+mod mentioned_step_ids_tests {
+    use super::*;
+    use crate::task::Step;
+
+    /// 一个有三步的任务：s1 / s2 / s3。
+    fn task() -> Task {
+        let mut t = Task::new("t1", "目标", 0);
+        for id in ["s1", "s2", "s3"] {
+            t.steps.push(Step::new(id, "做什么", TaskKind::Generation));
+        }
+        t
+    }
+
+    #[test]
+    fn a_mentioned_id_that_exists_is_returned() {
+        // **真机上就是这一种。** 指令写着「按 s3 的边界清单」，而 depends_on
+        // 里没写 s3——模型拿不到内容，只能回"无法获取"。
+        assert_eq!(
+            mentioned_step_ids("按 s3 的边界清单逐条核对", &task()),
+            vec!["s3"]
+        );
+    }
+
+    #[test]
+    fn several_mentions_are_all_returned() {
+        let got = mentioned_step_ids("先看 s1，再对照 s3", &task());
+        assert_eq!(got, vec!["s1", "s3"]);
+    }
+
+    #[test]
+    fn a_repeated_mention_is_returned_once() {
+        assert_eq!(
+            mentioned_step_ids("s2 的内容，s2 的结论", &task()),
+            vec!["s2"]
+        );
+    }
+
+    #[test]
+    fn an_id_that_does_not_exist_is_not_invented() {
+        // **这才叫"补漏写的依赖"而不是"猜"。**
+        // 任务里没有 s9，指令里提到它也不能凭空造一个。
+        assert!(mentioned_step_ids("按 s9 的做法", &task()).is_empty());
+    }
+
+    #[test]
+    fn ordinary_words_are_not_mistaken_for_step_ids() {
+        // `was3` / `xs1` 里的 s 不是步骤引用——前面接着字母就不该认
+        assert!(mentioned_step_ids("the was3 value and xs1", &task()).is_empty());
+        // `s3x` 同理，后面接着字母也不算
+        assert!(mentioned_step_ids("s3x 这个变量", &task()).is_empty());
+    }
+
+    #[test]
+    fn uppercase_mentions_work_too() {
+        // 模型两种大小写都会写
+        assert_eq!(mentioned_step_ids("按 S3 的清单", &task()), vec!["s3"]);
+    }
+
+    #[test]
+    fn a_plain_word_starting_with_s_is_not_a_reference() {
+        // `s` 后面不跟数字就不算
+        assert!(mentioned_step_ids("see the source", &task()).is_empty());
+    }
+
+    #[test]
+    fn text_without_any_mention_returns_nothing() {
+        assert!(mentioned_step_ids("读一下 src/billing.py", &task()).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::decide::StubDecider;
@@ -1269,6 +1425,8 @@ mod tests {
         seen_providers: Vec<String>,
         seen_thinking: Vec<bool>,
         seen_kinds: Vec<TaskKind>,
+        /// 每次执行步骤时拿到的输入。用来断言"指令里点名的步骤，结果真的给了"。
+        seen_inputs: Vec<Vec<(String, String)>>,
     }
 
     impl ScriptedHandler {
@@ -1310,7 +1468,7 @@ mod tests {
         fn execute_step(
             &mut self,
             routing: &Routing,
-            _run: &StepRequest,
+            run: &StepRequest,
             records: &mut Vec<CallRecord>,
         ) -> Result<String, TaskError> {
             let i = self.step_calls;
@@ -1318,6 +1476,7 @@ mod tests {
             self.seen_providers.push(routing.spec.provider.to_string());
             self.seen_thinking.push(routing.thinking);
             self.seen_kinds.push(routing.kind);
+            self.seen_inputs.push(run.inputs.clone());
             records.push(
                 CallRecord::new(
                     routing.spec.provider,
@@ -1918,6 +2077,53 @@ mod tests {
         assert!(
             st.result.clone().unwrap_or_default().contains("含等于"),
             "产物里要有人的决定"
+        );
+    }
+
+    #[test]
+    fn a_step_gets_the_result_of_a_step_its_instruction_names() {
+        // **真机上踩到的**：第 9 步的指令写着「按 s3 的边界清单逐条核对」，
+        // 而 `depends_on` 里没写 s3。引擎只把**声明过的**依赖当输入，
+        // 于是模型手上没有 s3 的内容，只能如实回「无法获取 s3 的边界清单原文」——
+        // **一步白做，后面依赖它的也被跳过。**
+        //
+        // 计划是模型写的：它引用一个步骤却忘了声明依赖，是很自然的事。
+        // 指令里点名了谁就把谁的结果给它——这是补一个漏写的依赖。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan("");
+        handler.plans = vec![serde_json::json!({
+            "steps": [
+                { "id": "s1", "instruction": "查一下有哪些测试", "depends_on": [], "kind": "lookup" },
+                // **注意 depends_on 是空的**，但指令点名了 s1
+                { "id": "s2", "instruction": "按 s1 的清单逐条核对", "depends_on": [], "kind": "analysis" }
+            ]
+        })
+        .to_string()];
+        handler.steps = vec![Ok("OK: 清单是：a、b".into()), Ok("OK: 核对完了".into())];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "核对").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        assert_eq!(handler.seen_inputs.len(), 2, "两步都该被执行");
+        let s2_inputs = &handler.seen_inputs[1];
+        assert!(
+            s2_inputs.iter().any(|(id, _)| id == "s1"),
+            "指令点名了 s1，s1 的结果就必须在输入里——否则模型只能回「拿不到」：{s2_inputs:?}"
+        );
+        assert!(
+            s2_inputs
+                .iter()
+                .any(|(id, r)| id == "s1" && r.contains("清单是")),
+            "给的是 s1 的真实产出：{s2_inputs:?}"
         );
     }
 

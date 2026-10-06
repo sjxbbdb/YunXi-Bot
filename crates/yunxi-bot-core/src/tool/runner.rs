@@ -444,13 +444,21 @@ impl<'a> ToolRunner<'a> {
     fn decide_one(&mut self, tr: &ParsedCall) -> Decided<'a> {
         let Some(tool) = self.registry.get(&tr.name) else {
             // 模型编了一个不存在的工具。这不是异常，报回去让它改。
+            //
+            // **空名字单独说**：那不是"模型编了个工具名"，而是**响应本身不完整**
+            // （分片没拼全，或者服务端给了个畸形的 tool_call）。
+            // 两种情况给模型的信号不一样——前者让它换个工具名，
+            // 后者让它重说一遍。
+            let reason = if tr.name.is_empty() {
+                "这条工具调用没带工具名（响应不完整），无法执行".to_string()
+            } else {
+                format!("没有这个工具: {}", tr.name)
+            };
             return Decided::Settled(ToolCallRecord {
                 tool: tr.name.clone(),
                 arguments: tr.arguments.clone(),
                 capability: Capability::ReadOnly,
-                decision: GateDecision::Deny {
-                    reason: format!("没有这个工具: {}", tr.name),
-                },
+                decision: GateDecision::Deny { reason },
                 output: None,
                 started_at_ms: 0,
                 duration_ms: 0,
@@ -698,15 +706,28 @@ pub fn parse_tool_calls(raw: &[Value]) -> Vec<ParsedCall> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let Some(f) = c.get("function") else { continue };
+        let Some(f) = c.get("function") else {
+            // **没有 function 也要收下。**
+            //
+            // 助手消息里已经带着这条 `tool_calls` 了——**丢掉它会让
+            // "助手说调了 N 个、我们只回 N-1 个结果"**，服务端于是报
+            // 400（"assistant message with tool_calls must be followed by..."），
+            // 而那个报错完全看不出是这里丢的。
+            //
+            // 收下来，让它走"没有这个工具"那条路：模型会收到一条说明，
+            // 数量也就对上了。
+            out.push(ParsedCall {
+                id,
+                name: String::new(),
+                arguments: serde_json::json!({}),
+            });
+            continue;
+        };
         let name = f
             .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        if name.is_empty() {
-            continue;
-        }
         let arguments = match f.get("arguments") {
             Some(Value::String(s)) => {
                 serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({ "__unparsable": s }))
@@ -746,6 +767,153 @@ pub fn render_tool_result(rec: &ToolCallRecord) -> String {
                 format!("工具 {} 未产生输出", rec.tool)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tool_call_shape_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 一个最小工具，只为让注册表非空。
+    struct EchoTool;
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "回显"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn capability(&self) -> Capability {
+            Capability::ReadOnly
+        }
+        fn call(
+            &self,
+            _a: &serde_json::Value,
+            _c: &mut ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::read(""))
+        }
+    }
+
+    struct AlwaysAllow;
+    impl Approver for AlwaysAllow {
+        fn approve(&mut self, _req: &ApprovalRequest) -> Approval {
+            Approval::Once
+        }
+    }
+
+    #[test]
+    fn a_call_without_a_name_is_kept_not_dropped() {
+        // **这是那个间歇性 400 的成因。**
+        //
+        // 助手消息里已经带着这条 `tool_calls` 了。丢掉它会让
+        // "助手说调了 N 个、我们只回 N-1 个结果"——服务端于是报
+        // 400（assistant message with tool_calls must be followed by...），
+        // 而那个报错**完全看不出是这里丢的**。
+        let raw = vec![
+            json!({"id": "c1", "type": "function",
+                   "function": {"name": "read_file", "arguments": "{}"}}),
+            json!({"id": "c2", "type": "function",
+                   "function": {"arguments": "{}"}}), // 没有 name
+        ];
+        let calls = parse_tool_calls(&raw);
+        assert_eq!(
+            calls.len(),
+            2,
+            "数量必须和助手消息里的 tool_calls 对齐，否则必然 400"
+        );
+        assert_eq!(calls[1].id, "c2", "id 要保留，回灌时要用");
+        assert!(calls[1].name.is_empty());
+    }
+
+    #[test]
+    fn a_call_without_a_function_object_is_kept_too() {
+        let raw = vec![json!({"id": "c1", "type": "function"})];
+        let calls = parse_tool_calls(&raw);
+        assert_eq!(calls.len(), 1, "没有 function 也要收下，数量不能少");
+        assert_eq!(calls[0].id, "c1");
+    }
+
+    #[test]
+    fn a_normal_call_still_parses_fully() {
+        // 别为了容错把正常路径弄坏
+        let raw = vec![json!({"id": "c1", "type": "function",
+                              "function": {"name": "read_file",
+                                           "arguments": "{\"path\":\"a.md\"}"}})];
+        let calls = parse_tool_calls(&raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "a.md");
+    }
+
+    #[test]
+    fn an_empty_name_says_the_response_was_incomplete() {
+        // 空名字和"编了个工具名"要给模型不同的信号：
+        // 前者让它重说一遍，后者让它换个工具名。
+        let mut reg = ToolRegistry::new();
+        reg.register(std::sync::Arc::new(EchoTool)).unwrap();
+        let mut policy = ToolPolicy::default();
+        policy.allow.push(Rule {
+            tool: "*".into(),
+            specifier: None,
+        });
+        let mut approver = AlwaysAllow;
+        let mut runner = ToolRunner::new(
+            &reg,
+            policy,
+            &mut approver,
+            ToolContext::new(
+                std::env::temp_dir(),
+                crate::policy::SandboxMode::WorkspaceWrite,
+            ),
+        );
+        let broken = ParsedCall {
+            id: "c1".into(),
+            name: String::new(),
+            arguments: json!({}),
+        };
+        let decided = runner.decide_one(&broken);
+        let rec = runner.finish_one(decided);
+        match &rec.decision {
+            GateDecision::Deny { reason } => {
+                assert!(reason.contains("没带工具名"), "{reason}");
+                assert!(reason.contains("不完整"), "要说清是响应的问题: {reason}");
+            }
+            other => panic!("空工具名该被拒: {other:?}"),
+        }
+        assert!(!rec.executed(), "没执行的不该被算成执行了");
+    }
+
+    #[test]
+    fn an_unknown_name_still_says_there_is_no_such_tool() {
+        let mut reg = ToolRegistry::new();
+        reg.register(std::sync::Arc::new(EchoTool)).unwrap();
+        let policy = ToolPolicy::default();
+        let mut approver = AlwaysAllow;
+        let mut runner = ToolRunner::new(
+            &reg,
+            policy,
+            &mut approver,
+            ToolContext::new(
+                std::env::temp_dir(),
+                crate::policy::SandboxMode::WorkspaceWrite,
+            ),
+        );
+        let bogus = ParsedCall {
+            id: "c1".into(),
+            name: "no_such_tool".into(),
+            arguments: json!({}),
+        };
+        let decided = runner.decide_one(&bogus);
+        let rec = runner.finish_one(decided);
+        match &rec.decision {
+            GateDecision::Deny { reason } => assert!(reason.contains("没有这个工具"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
     }
 }
 
@@ -1886,12 +2054,32 @@ mod tests {
     }
 
     #[test]
-    fn calls_without_a_name_are_skipped() {
+    fn calls_without_a_name_are_kept_so_the_counts_match() {
+        // **这条测试原来断言的是相反的（"没名字的就跳过"），而那个行为
+        // 正是真机上那个间歇性 400 的成因。**
+        //
+        // 助手消息是**原样**带着全部 `tool_calls` 进历史的
+        // （`layout.push_raw(Message::assistant_tool_calls(resp.tool_calls))`）。
+        // 而协议要求**每一条** `tool_call_id` 都有对应的 `tool` 消息回灌。
+        //
+        // 跳掉没名字的那些，就变成"助手说调了 2 个、我们只回 1 个结果"——
+        // 服务端报 400（"assistant message with tool_calls must be followed by..."），
+        // **而那个报错完全看不出是这里丢的**。
+        //
+        // 现在收下来，让它走"没有这个工具"那条路：模型收到一条解释，
+        // 消息条数也就对上了。**不执行它，但要回答它。**
         let raw = vec![
             json!({ "id": "c1", "function": { "arguments": "{}" } }),
             json!({ "id": "c2" }),
         ];
-        assert!(parse_tool_calls(&raw).is_empty());
+        let p = parse_tool_calls(&raw);
+        assert_eq!(
+            p.len(),
+            2,
+            "数量必须和助手消息里的 tool_calls 对齐，否则必然 400"
+        );
+        assert!(p[0].name.is_empty(), "没名字就如实留空，不要编一个");
+        assert_eq!(p[1].id, "c2", "id 要保留——回灌时靠它对应");
     }
 
     #[test]
