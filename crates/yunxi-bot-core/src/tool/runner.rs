@@ -168,6 +168,21 @@ pub enum ToolLoopError {
     /// **这是一个真实的失败形态**，不能当成"模型还没说完"。
     /// 它通常意味着工具一直在返回同样的东西、模型在原地打转。
     RoundsExhausted { rounds: u32 },
+    /// **模型在反复做同一个动作。**
+    ///
+    /// 真机上抓到过（D100）：一次运行调了 40 次工具、最后 12 次里 11 次是
+    /// `write_file`，把 19 行的文件撑到 **49 行**，直到撞上 8 轮上限才停。
+    ///
+    /// ## 为什么单独一个变体，而不是并进 `RoundsExhausted`
+    ///
+    /// **两者给模型的信息完全不同**：
+    ///
+    /// - "轮数用完了"——它对这个毫无办法，因为它不知道自己做错了什么
+    /// - "**你在重复同一个动作**"——它至少能换个做法
+    ///
+    /// 而更实际的是：**这种事本来就不该磨到轮数上限**。
+    /// 磨到上限意味着白花了 5 轮的钱和时间。
+    Repeating { tool: String, times: u32 },
 }
 
 impl std::fmt::Display for ToolLoopError {
@@ -177,6 +192,11 @@ impl std::fmt::Display for ToolLoopError {
             ToolLoopError::RoundsExhausted { rounds } => {
                 write!(f, "工具循环跑了 {rounds} 轮仍未结束——模型可能在原地打转")
             }
+            ToolLoopError::Repeating { tool, times } => write!(
+                f,
+                "连续 {times} 次调用都是同一个动作（{tool}），参数也一样——\
+                 这是在原地打转，不是在做新的事。换个做法，或者说明为什么做不下去。"
+            ),
         }
     }
 }
@@ -275,6 +295,46 @@ impl Decided<'_> {
 ///
 /// 8 轮足够"查一下再算一下再写一下"这类复合任务。再多通常意味着打转，
 /// 而打转的代价是实打实的 token 和配额。
+/// 连续多少次一模一样的调用就判定为"原地打转"。
+///
+/// 定 3 是权衡：
+/// - **2 次太紧**——正常流程里"读一遍、改一下、再读一遍确认"是合理的，
+///   而"读同一个文件两次"完全可能是对的
+/// - **4 次太松**——真机上那次是 11 次连写同一个文件，
+///   等到第 4 次才拦也已经白花了三轮
+///
+/// 3 次的意思是：**同一个工具、同样的参数、连着来三遍**。
+/// 那不像是在做事。
+pub const REPEAT_LIMIT: usize = 3;
+
+/// 末尾是不是连着 N 次一模一样的调用。
+///
+/// **比的是"工具名 + 参数"的完整文本**，不是模糊相似——
+/// 模糊相似会把"读 a.rs、读 b.rs、读 c.rs"这种正常的批量读判成重复。
+/// 要拦的是**字面上一模一样**那种。
+///
+/// 返回 `(工具名, 连续次数)`。
+fn detect_repeat(seen: &[(String, String)], limit: usize) -> Option<(String, u32)> {
+    if seen.len() < limit {
+        return None;
+    }
+    let tail = &seen[seen.len() - limit..];
+    let first = &tail[0];
+    if tail.iter().all(|c| c == first) {
+        // 把**真正连续**的次数报出来（可能不止 limit 次）
+        let mut n = 0usize;
+        for c in seen.iter().rev() {
+            if c == first {
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        return Some((first.0.clone(), n as u32));
+    }
+    None
+}
+
 pub const DEFAULT_MAX_ROUNDS: u32 = 8;
 
 impl<'a> ToolRunner<'a> {
@@ -356,6 +416,10 @@ impl<'a> ToolRunner<'a> {
         // 轮数就是模型调用次数——一轮一次，没有别的调用点。
         // 用 `round` 本身当计数，不另开一个变量（那样 clippy 会认为它是
         // 显式循环计数器，而且两者一旦漂移就是账目不对）。
+        // 这个运行里请求过的每一次工具调用（工具名 + 参数）。
+        // 用来发现"原地打转"——见 `detect_repeat`。
+        let mut seen: Vec<(String, String)> = Vec::new();
+
         for round in 1..=self.max_rounds {
             let messages = layout.build();
             let mut req = ThinkRequest::new(messages).with_max_tokens(max_tokens);
@@ -381,6 +445,17 @@ impl<'a> ToolRunner<'a> {
             };
 
             let reqs = parse_tool_calls(&resp.tool_calls);
+
+            // **先看它是不是在重复，再去执行。**
+            //
+            // 放在执行**之前**：重复的那些调用没必要再跑一遍——
+            // 跑了也只是再拿一次同样的结果，然后下一轮再来。
+            for tr in &reqs {
+                seen.push((tr.name.clone(), tr.arguments.to_string()));
+            }
+            if let Some((tool, times)) = detect_repeat(&seen, REPEAT_LIMIT) {
+                return Err(ToolLoopError::Repeating { tool, times });
+            }
             if reqs.is_empty() {
                 // 没有工具调用 → 这一轮就是最终答复。
                 // 记进历史，让后续轮次的前缀能续上。
@@ -1636,14 +1711,58 @@ mod tests {
     }
 
     #[test]
-    fn rounds_are_bounded() {
-        // 模型一直在请求工具 → 必须停下来，不能无限烧配额
+    fn identical_calls_stop_before_the_round_limit() {
+        // **真机上抓到的形状**（D100）：一次运行调了 40 次工具、
+        // 最后 12 次里 11 次是 `write_file`，把 19 行的文件撑到 49 行，
+        // **直到撞上 8 轮上限才停**。
+        //
+        // "磨到上限"意味着白花了五轮的钱和时间。这条测试盯的是
+        // **提前停**——而且停的理由要说清楚。
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(ScriptTool::new("t", Capability::ReadOnly)))
             .unwrap();
         let mut ap = RefusingApprover;
         let replies: Vec<_> = (0..10)
             .map(|_| ScriptThinker::tool_reply(vec![call_json("c", "t", json!({}))]))
+            .collect();
+        let thinker = ScriptThinker::new(replies);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("q");
+
+        let err = runner(&reg, ToolPolicy::default(), &mut ap)
+            .with_max_rounds(8)
+            .run(&thinker, &mut layout, 512)
+            .unwrap_err();
+        match &err {
+            ToolLoopError::Repeating { tool, times } => {
+                assert_eq!(tool, "t");
+                assert!(*times >= 3, "该报出真实的连续次数：{times}");
+            }
+            other => panic!("一模一样地连着调，该判成打转而不是磨到轮数上限：{other:?}"),
+        }
+        // **消息要能让模型换个做法。**
+        // "轮数用完了"对它毫无信息量——它不知道自己做错了什么。
+        let msg = err.to_string();
+        assert!(msg.contains("同一个动作"), "{msg}");
+        assert!(msg.contains("换个做法"), "{msg}");
+    }
+
+    #[test]
+    fn rounds_are_bounded() {
+        // 模型一直在请求工具 → 必须停下来，不能无限烧配额
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ScriptTool::new("t", Capability::ReadOnly)))
+            .unwrap();
+        let mut ap = RefusingApprover;
+        // **每一轮调用的参数要不一样。**
+        //
+        // 原来这里是 10 次一模一样的调用，于是加"重复检测"之后
+        // 它会在第 3 轮就被 `Repeating` 拦下——**而这条测试要验的是
+        // "轮数有上限"，不是"重复被抓"**。
+        // 两件事都要有人验，但不该混在一条里：混着的话，
+        // 重复检测一上线，轮数上限就再也没人验了。
+        let replies: Vec<_> = (0..10)
+            .map(|i| ScriptThinker::tool_reply(vec![call_json("c", "t", json!({ "i": i }))]))
             .collect();
         let thinker = ScriptThinker::new(replies);
         let mut layout = PromptLayout::new("S");
@@ -2286,5 +2405,89 @@ mod sanitize_tests {
     fn a_call_without_a_function_does_not_panic() {
         let raw = vec![json!({"id": "c1"})];
         assert_eq!(sanitize_tool_calls(&raw).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+
+    fn call(name: &str, args: &str) -> (String, String) {
+        (name.to_string(), args.to_string())
+    }
+
+    #[test]
+    fn three_identical_calls_in_a_row_is_spinning() {
+        // **真机上抓到的形状**：连着 11 次写同一个文件。
+        let seen = vec![
+            call("write_file", "{\"path\":\"b.py\"}"),
+            call("write_file", "{\"path\":\"b.py\"}"),
+            call("write_file", "{\"path\":\"b.py\"}"),
+        ];
+        let (tool, times) = detect_repeat(&seen, REPEAT_LIMIT).expect("该判成打转");
+        assert_eq!(tool, "write_file");
+        assert_eq!(times, 3);
+    }
+
+    #[test]
+    fn a_longer_streak_reports_the_real_count() {
+        // 报"3 次"而实际连了 11 次，会让人低估问题的规模
+        let mut seen = Vec::new();
+        for _ in 0..11 {
+            seen.push(call("write_file", "{}"));
+        }
+        assert_eq!(
+            detect_repeat(&seen, REPEAT_LIMIT),
+            Some(("write_file".into(), 11))
+        );
+    }
+
+    #[test]
+    fn reading_different_files_is_not_spinning() {
+        // **模糊相似会把正常的批量读判成重复。** 比的是完整参数文本。
+        let seen = vec![
+            call("read_file", "{\"path\":\"a.rs\"}"),
+            call("read_file", "{\"path\":\"b.rs\"}"),
+            call("read_file", "{\"path\":\"c.rs\"}"),
+        ];
+        assert_eq!(detect_repeat(&seen, REPEAT_LIMIT), None);
+    }
+
+    #[test]
+    fn two_identical_calls_are_still_allowed() {
+        // **2 次太紧**——"读一遍、改一下、再读一遍确认"是合理的，
+        // 而"读同一个文件两次"完全可能是对的。
+        let seen = vec![
+            call("read_file", "{\"path\":\"a.rs\"}"),
+            call("read_file", "{\"path\":\"a.rs\"}"),
+        ];
+        assert_eq!(detect_repeat(&seen, REPEAT_LIMIT), None);
+    }
+
+    #[test]
+    fn a_break_in_the_streak_resets_it() {
+        // **只看末尾**。中间重复过、但已经换过做法了，就不算还在打转。
+        let seen = vec![
+            call("write_file", "{}"),
+            call("write_file", "{}"),
+            call("read_file", "{}"),
+            call("write_file", "{}"),
+            call("write_file", "{}"),
+        ];
+        assert_eq!(
+            detect_repeat(&seen, REPEAT_LIMIT),
+            None,
+            "末尾只有 2 次连续"
+        );
+    }
+
+    #[test]
+    fn the_same_tool_with_different_arguments_is_not_repeating() {
+        let seen = vec![
+            call("write_file", "{\"path\":\"a\"}"),
+            call("write_file", "{\"path\":\"b\"}"),
+            call("write_file", "{\"path\":\"c\"}"),
+        ];
+        assert_eq!(detect_repeat(&seen, REPEAT_LIMIT), None);
     }
 }
