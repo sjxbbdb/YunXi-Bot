@@ -1436,6 +1436,29 @@ fn cmd_isolation_check() -> Result<i32, Box<dyn std::error::Error>> {
 /// Agnes 并拿到回复"。
 use yunxi_bot_core::think::ThinkerConfig;
 
+/// 把一次 `think` 的用量记进台账。
+///
+/// 抽成函数是为了**只写一处**：成功和失败两条路都要记，
+/// 两处各写一遍的话，"某个分支忘了记"迟早发生——而那种漏记不会报错。
+fn record_think_cost(resp: &yunxi_bot_core::think::ThinkResponse) {
+    let Ok(mut l) = Ledger::open(ledger_path()) else {
+        // 台账打不开不该让命令失败——它只是个记录。
+        // 但要说一声：**"这次没留下记录"本身就是需要人知道的事。**
+        eprintln!("提示：台账打不开，这次调用的用量没有留痕。");
+        return;
+    };
+    let rec = yunxi_bot_core::costlog::CallRecord::new(
+        resp.model.split('-').next().unwrap_or("unknown"),
+        &resp.model,
+        yunxi_bot_core::costlog::peak_now(),
+    )
+    .with_usage(resp.usage)
+    .with_thinking(resp.thinking == yunxi_bot_core::think::Thinking::Enabled);
+    if let Err(e) = l.append(EventKind::ModelCalled, None, serde_json::json!(rec)) {
+        eprintln!("提示：这次调用的用量没写进台账：{e}");
+    }
+}
+
 fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::think::{Message, ThinkRequest, Thinker, agnes::OpenAiThinker};
 
@@ -1501,6 +1524,15 @@ fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     match thinker.think(&req) {
         Ok(resp) => {
+            // **记进台账。**
+            //
+            // 不留痕的话，这条链路的成本完全看不见——`yunxi-bot cost`
+            // 会少报，缓存命中率也测不到它。和 `chat` 那条是同一个问题
+            // （D40 修过一次，这里是同一个坑的另一半）。
+            //
+            // **失败了也要记**：一次失败的网络请求可能照样花了 token，
+            // 而"花了钱却没记录"正是最该避免的事。所以记在 Err 那边也有一份。
+            record_think_cost(&resp);
             println!("耗时     : {} ms", started.elapsed().as_millis());
             println!("模型回执 : {}", resp.model);
             println!(
