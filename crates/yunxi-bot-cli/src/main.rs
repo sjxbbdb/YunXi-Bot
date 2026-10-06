@@ -9,6 +9,7 @@
 //! 以及**工具层**：模型能读文件、跑命令、抓网页，每个动作都过审批门禁。
 
 mod approval;
+mod chat;
 mod chat_handler;
 mod tool_sink;
 mod tooling;
@@ -121,6 +122,10 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --limit <n>           取几封（默认 20）
       --read <uid>          看某封的正文
       --port <n>            sidecar 端口（默认 17871）
+  yunxi-bot chat [选项]       交互式会话（通用 agent 的入口）
+      --resume [--id <名字>]  接着上次聊；不给 --id 就接最近那个
+      chat list             看有哪些会话
+      --thinking auto|on|off 思考模式
   yunxi-bot mcp list          连上配置的 MCP server 并列出它的工具
   yunxi-bot mcp call <s> <t>  调一个 MCP 工具（--args '{...}'）
   yunxi-bot tools             列出工具及其能力类别（不需要模型）
@@ -211,6 +216,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "tools" => cmd_tools(rest),
         "notify" => cmd_notify(rest),
         "mail" => cmd_mail(rest),
+        "chat" => cmd_chat(rest),
         "check" => cmd_check(rest),
         "mcp" => cmd_mcp(rest),
         "feedback" => cmd_feedback(rest),
@@ -2047,6 +2053,98 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             Ok(1)
         }
     }
+}
+
+/// 交互式会话。**通用 agent 的核心入口。**
+///
+/// ## 为什么它值得一条单独的路径
+///
+/// 别的命令都是"做一件事就退"。这一条要**活着**——因为对话的价值在延续：
+/// 你说了"这个文件"，下一句的"它"才有指代对象。
+///
+/// ## 它没有另起一条轻量链路
+///
+/// 底下走的是同一个 `converse`：工具循环、审批门禁、台账留痕、
+/// 缓存前缀全都照旧。**另开一条的话，那条路迟早会绕开审批。**
+fn cmd_chat(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::think::ReasoningEffort;
+    use yunxi_bot_core::think::session::SessionStore;
+
+    let home = default_home();
+    let store = SessionStore::new(&home);
+
+    // `chat list`：看有哪些会话
+    if args.first().map(String::as_str) == Some("list") {
+        return chat::list_sessions(&store);
+    }
+
+    let resume = args.iter().any(|a| a == "--resume");
+    let session_id = match flag(args, "--id") {
+        Some(id) => id.to_string(),
+        None => {
+            // 不给 id 时：`--resume` 接最近那个，否则按时间新建一个。
+            if resume {
+                match store.latest().map_err(|e| e.to_string())? {
+                    Some(f) => f.id,
+                    None => {
+                        eprintln!("还没有任何会话可以接着聊。");
+                        eprintln!("直接跑 `yunxi-bot chat` 开一个新的。");
+                        return Ok(2);
+                    }
+                }
+            } else {
+                let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                format!("chat-{ts}")
+            }
+        }
+    };
+    if let Err(e) = SessionStore::check_id(&session_id) {
+        eprintln!("{e}");
+        return Ok(2);
+    }
+
+    let effort = match flag(args, "--thinking").unwrap_or("auto") {
+        "off" => ReasoningEffort::Never,
+        "on" => ReasoningEffort::Always,
+        _ => ReasoningEffort::Auto,
+    };
+
+    // —— 和 `do` 同一套装配：工具、审批、台账、决策模型 ——
+    let mut handler = chat_handler::ChatHandler::new(
+        home.clone(),
+        "云熙",
+        chat_handler::DEFAULT_PERSONA,
+        chat_handler::default_rules(),
+    );
+    if let Ok(tools) = tooling::default_registry(&home) {
+        let mut tools = tools;
+        match tooling::with_mcp(&mut tools, &home) {
+            Ok((n, problems)) => {
+                if n > 0 {
+                    println!("（{n} 个 MCP 工具已接入）");
+                }
+                for p in problems {
+                    eprintln!("  ✗ MCP: {p}");
+                }
+            }
+            Err(e) => eprintln!("  ✗ MCP: {e}"),
+        }
+        handler = handler.with_tools(tools);
+    }
+
+    // **REPL 里有人在，所以用真审批者。**
+    // 答 `n` 就是拒绝，走的是和别处一样的 `GateDecision::Deny`。
+    handler = handler
+        .with_approver(tooling::approver_from_args(args))
+        .with_policy(tooling::policy_from_args(args))
+        .with_sink(tool_sink_or_warn())
+        .with_decider(std::sync::Arc::new(
+            yunxi_bot_core::decide::LayaDecider::new(
+                flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
+            ),
+        ));
+
+    chat::run(&mut handler, &store, session_id, resume, effort)
 }
 
 /// MCP：列出外部 server 的工具，或者调一个。

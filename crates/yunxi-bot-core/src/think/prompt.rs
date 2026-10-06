@@ -32,7 +32,7 @@
 use super::Message;
 
 /// 三段式提示词布局。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PromptLayout {
     /// 稳定前缀：系统提示词 + 人格 + 工具定义。**跨调用必须字节一致。**
     stable: String,
@@ -91,6 +91,25 @@ impl PromptLayout {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.stable.hash(&mut h);
+        h.finish()
+    }
+
+    /// 换掉稳定前缀。**历史保留。**
+    ///
+    /// 用在"载入会话时前缀变了"的场景（比如刚加载了项目的 `AGENTS.md`）。
+    /// 历史仍然是有效的对话记录，丢它是过度的。
+    pub fn replace_stable(&mut self, stable: impl Into<String>) {
+        self.stable = stable.into();
+    }
+
+    /// 某个候选前缀的指纹。
+    ///
+    /// 载入会话时要拿"当前前缀"和"存档里的指纹"比，
+    /// 而当前前缀还没进布局——所以需要一个不改状态的算法。
+    pub fn fingerprint_for(&self, candidate: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        candidate.hash(&mut h);
         h.finish()
     }
 

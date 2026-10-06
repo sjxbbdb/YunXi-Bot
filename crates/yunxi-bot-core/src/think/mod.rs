@@ -21,6 +21,7 @@ pub mod agnes;
 pub mod cost;
 pub mod prompt;
 pub mod router;
+pub mod session;
 /// 路由阈值。**集中在一处**，便于按实际账单调整。
 pub mod thresholds {
     pub use super::router::thresholds::*;

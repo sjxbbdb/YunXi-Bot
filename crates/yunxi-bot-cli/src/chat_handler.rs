@@ -65,6 +65,50 @@ pub const STEP_SYSTEM: &str = "\
 5. **做不了就说做不了，不要编一个看起来像结果的东西。**
    编出来的结果会让整条链路在错误的前提上继续往下跑。";
 
+/// 通用对话用的系统提示词。
+///
+/// ## 它和另外三个的区别
+///
+/// `PLANNER`/`STEP`/`OPTIONS` 是**任务引擎的内部角色**——它们各自只干一件事，
+/// 而且被引擎约束着（输出格式、只做这一步）。`CHAT` 是**面对使用者的那一个**：
+/// 没有外部编排，它自己决定要不要用工具、要不要拆步骤。
+///
+/// 所以这里的约束方向和那三个相反：那边是"收窄"（只做这一步），
+/// 这边是"放开但要诚实"。
+pub const CHAT_SYSTEM: &str = "\
+你是云熙，一个通用 agent。使用者直接和你说话，你自己决定怎么做。
+
+## 怎么用工具
+
+- **能查就别猜。** 涉及具体事实（文件内容、当前时间、搜索结果）时用工具，
+  不要凭记忆编。你不知道这个项目里有什么文件，去 list_dir 看。
+- **能一步做完就别拆。** 简单的事直接做，不要为了显得有条理而先列计划。
+- **一次可以要多个工具。** 几个互不依赖的读取就一起要，省得来回等。
+- 做事之前先说一句你要做什么（一句话）。使用者需要知道你在干什么。
+
+## 怎么说话
+
+- **直接给结果，不要复述过程。** 使用者看到工具调用，不需要你再说一遍。
+- 简洁。需要几行就几行，不要为了显得完整而灌水。
+- 中文回答（除非使用者用别的语言）。
+
+## 三条硬要求
+
+1. **做不了就说做不了。** 缺信息、缺权限、工具失败了——如实说，
+   并说清缺什么。**不要编一个看起来像结果的东西。**
+   编出来的结果会让整条链路在错误的前提上继续往下跑。
+2. **改了东西要说改了哪。** 用了 write_file / edit_file 之后，
+   一句话说清动了哪个文件、动了什么。
+3. **不确定就说不确定。** 猜的时候要标明是猜的。";
+
+/// 对话会话的固定 key。见 `converse` 里的理由。
+pub const CHAT_SESSION_KEY: &str = "chat";
+
+/// 一轮对话的输出上限。
+///
+/// 比"执行一步"大：对话要能写出完整解释，而单步通常只是一段产出。
+pub const CHAT_MAX_TOKENS: u32 = 4096;
+
 /// 生成决策选项用的系统提示词。
 pub const OPTIONS_SYSTEM: &str = "\
 你在为一个需要拍板的步骤列出可选做法。
@@ -84,6 +128,8 @@ struct SessionKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Intent {
+    /// 面对使用者的通用对话。**没有外部编排——它自己决定怎么做。**
+    Chat,
     Plan,
     Step,
     Options,
@@ -92,6 +138,7 @@ enum Intent {
 impl Intent {
     fn system(self) -> String {
         let base = match self {
+            Intent::Chat => CHAT_SYSTEM,
             Intent::Plan => PLANNER_SYSTEM,
             Intent::Step => STEP_SYSTEM,
             Intent::Options => OPTIONS_SYSTEM,
@@ -113,6 +160,9 @@ pub struct ChatHandler {
     sessions: BTreeMap<SessionKey, PromptLayout>,
     /// 人格 + 硬规则拼成的稳定块。**只在这里存一份。**
     persona: String,
+    /// 对话会话的稳定前缀。**提前算好**——载入会话时要拿它和存档里的
+    /// 指纹比，而"先建会话再比"会覆盖掉存档里的指纹。
+    chat_prefix: String,
     /// 可用的工具。空表示这条链路没有工具（行为与加工具之前完全一致）。
     tools: ToolRegistry,
     /// 谁能回答"批不批准"。默认谁都不问、一律拒绝。
@@ -126,6 +176,9 @@ pub struct ChatHandler {
     sink: Option<std::sync::Arc<dyn yunxi_bot_core::tool::ToolCallSink>>,
     /// 审批策略。
     policy: ToolPolicy,
+    /// 路由。**对话要自己判断"这活复杂不复杂"**——
+    /// 任务引擎那条路由是引擎给的，对话这条得自己算。
+    router: yunxi_bot_core::think::ModelRouter,
 }
 
 impl ChatHandler {
@@ -135,6 +188,11 @@ impl ChatHandler {
             home,
             thinkers: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            chat_prefix: format!(
+                "{}\n\n{}",
+                build_persona(persona_name, persona_text, &rules),
+                CHAT_SYSTEM
+            ),
             persona: build_persona(persona_name, persona_text, &rules),
             tools: ToolRegistry::new(),
             approver: std::sync::Arc::new(std::sync::Mutex::new(RefusingApprover)),
@@ -143,6 +201,7 @@ impl ChatHandler {
             // 默认值是给"这条链路不该记录"的场景留的显式出口。
             sink: None,
             policy: ToolPolicy::default(),
+            router: yunxi_bot_core::think::ModelRouter::default(),
         }
     }
 
@@ -224,6 +283,84 @@ impl ChatHandler {
             .ok_or_else(|| TaskError::Core(yunxi_bot_core::CoreError::Ledger("客户端丢失".into())))
     }
 
+    /// 一轮通用对话。**这是通用 agent 的核心入口。**
+    ///
+    /// ## 和 `plan`/`step` 的区别
+    ///
+    /// 那两条是**任务引擎的内部步骤**：提示词、预算、收尾时机都由引擎决定。
+    /// 这一条是**面对使用者的**：它自己决定要不要用工具、什么时候收尾。
+    ///
+    /// 但底下走的是**同一个 `converse`**——工具循环、审批门禁、台账留痕、
+    /// 缓存前缀全都不变。**另起一条轻量路径的话，那条路迟早会绕开审批。**
+    pub fn chat_turn(
+        &mut self,
+        routing: &Routing,
+        input: &str,
+        records: &mut Vec<CallRecord>,
+    ) -> Result<String, TaskError> {
+        self.converse(
+            routing,
+            Intent::Chat,
+            input.to_string(),
+            CHAT_MAX_TOKENS,
+            records,
+        )
+    }
+
+    /// 把当前对话会话的布局取出来（落盘用）。
+    pub fn chat_layout(&self) -> Option<&PromptLayout> {
+        self.sessions
+            .iter()
+            .find(|(k, _)| k.intent == Intent::Chat)
+            .map(|(_, v)| v)
+    }
+
+    /// 把落盘的布局装回来（`--resume` 用）。
+    pub fn restore_chat_layout(&mut self, layout: PromptLayout, provider: &str) {
+        self.sessions.insert(
+            SessionKey {
+                intent: Intent::Chat,
+                provider: provider.to_string(),
+            },
+            layout,
+        );
+    }
+
+    /// 当前应该用的对话稳定前缀。
+    ///
+    /// 载入会话时要拿它和存档里的指纹比。**必须在建会话之前就能算出来**——
+    /// 算不出来的话就只能"先建再比"，而建了就会覆盖掉存档里的指纹，
+    /// 于是每次都报"前缀变了"。
+    pub fn expected_chat_prefix(&self) -> &str {
+        self.chat_prefix.as_str()
+    }
+
+    /// 给一轮对话路由。
+    ///
+    /// 和任务引擎那条的区别：**那条的路由是引擎按整条任务算的**，
+    /// 这里只能按这一句算。所以任务类型固定为 `Conversation`——
+    /// 一个对话轮次本身不做多步推理，复杂度体现在它要用几次工具上。
+    pub fn route_for(&self, input: &str, effort: ReasoningEffort) -> Routing {
+        use yunxi_bot_core::think::router::{TaskKind, profile_task};
+        // 对话还没拆解，所以步骤数是 0——`profile_task` 会按长度粗估。
+        let profile = profile_task(input, 0);
+        self.router.route(
+            input,
+            TaskKind::Conversation,
+            &profile,
+            effort,
+            self.decider.as_deref(),
+        )
+    }
+
+    /// 丢掉对话历史，开一个新的。**不删任何落盘的东西。**
+    ///
+    /// "想重来"不等于"想把刚才那段扔掉"——删是不可逆的，
+    /// 而落盘那份还在，用 `chat list` 就能找回来。
+    pub fn reset_chat_session(&mut self) {
+        self.sessions.retain(|k, _| k.intent != Intent::Chat);
+    }
+
     /// 一次带会话的调用。返回模型正文。
     ///
     /// 内部走的是**工具循环**：没挂工具时它等价于一次普通调用
@@ -236,9 +373,19 @@ impl ChatHandler {
         max_tokens: u32,
         records: &mut Vec<CallRecord>,
     ) -> Result<String, TaskError> {
+        // **对话用固定的会话键。**
+        //
+        // 使用者的对话是**一条**，不该因为这一轮路由到了另一个模型就断开——
+        // 那会让"刚才说的那个文件"突然变成对不上话的悬空指代。
+        //
+        // 而任务引擎那三条按 provider 分是对的：它们是不同的角色，
+        // 交叉着用同一个历史反而会让提示词和内容对不上。
         let key = SessionKey {
             intent,
-            provider: routing.spec.provider.to_string(),
+            provider: match intent {
+                Intent::Chat => CHAT_SESSION_KEY.to_string(),
+                _ => routing.spec.provider.to_string(),
+            },
         };
         if !self.sessions.contains_key(&key) {
             // 稳定前缀 = 人格 + 该意图的指令。**一次定下，之后不再改。**
@@ -549,6 +696,146 @@ pub fn route_line(routing: &Routing, effort: ReasoningEffort) -> String {
         },
         effort.label()
     )
+}
+
+#[cfg(test)]
+mod chat_session_tests {
+    use super::*;
+
+    fn handler() -> ChatHandler {
+        ChatHandler::new(
+            std::path::PathBuf::from("."),
+            "云熙",
+            DEFAULT_PERSONA,
+            default_rules(),
+        )
+    }
+
+    #[test]
+    fn the_chat_prefix_is_stable_across_calls() {
+        // **这是缓存命中的前提。** 前缀一变，缓存全废——
+        // 而那种失效是静默的，只表现为账单变贵。
+        let h = handler();
+        let a = h.expected_chat_prefix().to_string();
+        let b = h.expected_chat_prefix().to_string();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn the_chat_prefix_contains_the_persona_and_the_chat_rules() {
+        let h = handler();
+        let p = h.expected_chat_prefix();
+        assert!(p.contains("云熙"), "人格该在里面");
+        assert!(p.contains("通用 agent"), "对话指令该在里面");
+    }
+
+    #[test]
+    fn two_handlers_built_the_same_way_have_the_same_prefix() {
+        // 否则每次启动都是新前缀，跨进程的缓存永远命不中
+        assert_eq!(
+            handler().expected_chat_prefix(),
+            handler().expected_chat_prefix()
+        );
+    }
+
+    #[test]
+    fn the_expected_prefix_matches_what_a_session_would_use() {
+        // **载入会话时要拿它和存档里的指纹比。**
+        // 如果这里算出来的和 `converse` 建会话时用的不是同一份，
+        // 就会每次都报"前缀变了"——而那是假警报，会让人去查一个不存在的问题。
+        let h = handler();
+        let expected = h.expected_chat_prefix().to_string();
+        let built = PromptLayout::new(expected.clone());
+        assert_eq!(built.fingerprint(), built.fingerprint_for(&expected));
+    }
+
+    #[test]
+    fn reset_clears_only_the_chat_session() {
+        // 任务引擎那三个会话是**另一个角色**，不该被"清空对话"波及
+        let mut h = handler();
+        h.restore_chat_layout(PromptLayout::new("对话前缀"), CHAT_SESSION_KEY);
+        h.sessions.insert(
+            SessionKey {
+                intent: Intent::Plan,
+                provider: "p".into(),
+            },
+            PromptLayout::new("计划前缀"),
+        );
+        assert!(h.chat_layout().is_some());
+
+        h.reset_chat_session();
+        assert!(h.chat_layout().is_none(), "对话该被清掉");
+        assert!(
+            h.sessions.iter().any(|(k, _)| k.intent == Intent::Plan),
+            "计划会话不该被动到"
+        );
+    }
+
+    #[test]
+    fn restore_then_read_round_trips() {
+        let mut h = handler();
+        let mut l = PromptLayout::new(h.expected_chat_prefix().to_string());
+        l.ask("问题");
+        l.record_reply("回答");
+        let fp = l.fingerprint();
+        h.restore_chat_layout(l, CHAT_SESSION_KEY);
+
+        let got = h.chat_layout().expect("该装回来了");
+        assert_eq!(got.history_len(), 2);
+        assert_eq!(got.fingerprint(), fp);
+    }
+
+    #[test]
+    fn resuming_onto_the_same_prefix_reports_no_change() {
+        // **不能假报变化。** 假警报会让人去查一个不存在的问题。
+        let h = handler();
+        let mut l = PromptLayout::new(h.expected_chat_prefix().to_string());
+        l.ask("q");
+        l.record_reply("a");
+        let f = yunxi_bot_core::think::session::SessionFile {
+            yunxi_bot_session: yunxi_bot_core::think::session::SESSION_FORMAT_VERSION,
+            id: "t".into(),
+            created_at: 0,
+            updated_at: 0,
+            turns: 1,
+            fingerprint: l.fingerprint(),
+            layout: l,
+        };
+        let (_, m) = yunxi_bot_core::think::session::resume_onto(&f, h.expected_chat_prefix());
+        assert_eq!(m, yunxi_bot_core::think::session::PrefixMismatch::Same);
+    }
+
+    #[test]
+    fn a_router_is_available_for_chat_turns() {
+        // 对话要自己判断"这活复杂不复杂"——任务引擎那条路由是引擎给的
+        let h = handler();
+        let r = h.route_for("你好", yunxi_bot_core::think::ReasoningEffort::Auto);
+        assert_eq!(r.spec.provider, "agnes", "闲聊不该走贵的那条");
+    }
+
+    #[test]
+    fn chat_is_a_distinct_intent_with_its_own_prompt() {
+        // 四个意图的提示词不能撞（撞了就等于没有角色区分）
+        let prompts = [
+            Intent::Chat.system(),
+            Intent::Plan.system(),
+            Intent::Step.system(),
+            Intent::Options.system(),
+        ];
+        for i in 0..prompts.len() {
+            for j in (i + 1)..prompts.len() {
+                assert_ne!(prompts[i], prompts[j], "第 {i} 和第 {j} 个提示词撞了");
+            }
+        }
+    }
+
+    #[test]
+    fn the_chat_prompt_requires_honesty_about_failure() {
+        // **编一个看起来像结果的东西会让整条链路在错误前提上继续跑。**
+        let s = CHAT_SYSTEM;
+        assert!(s.contains("做不了就说做不了"), "缺了最重要的一条");
+        assert!(s.contains("不要编"), "要说清编造的后果");
+    }
 }
 
 #[cfg(test)]
