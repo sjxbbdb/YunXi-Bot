@@ -97,6 +97,11 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
   yunxi-bot notify \"<标题>\" [\"<正文>\"]  发一条桌面通知（同时验证通知出口通不通）
       --tag <标签>          替换同类通知而不是堆积
       --console             强制走控制台出口（验证出口可换）
+  yunxi-bot check [选项]      看信息源 -> 判断 -> 该通知你的就通知你（落台账）
+      --limit <n>           判定几封（默认 20）
+      --dry-run             只判定不真发通知（台账照记）
+      --no-notify           完全不出通知，只看判定结果
+      --console             通知打到终端
   yunxi-bot mail [选项]       看未读邮件（只读，不会标成已读）
       --limit <n>           取几封（默认 20）
       --read <uid>          看某封的正文
@@ -189,6 +194,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "tools" => cmd_tools(rest),
         "notify" => cmd_notify(rest),
         "mail" => cmd_mail(rest),
+        "check" => cmd_check(rest),
         "resume" => cmd_resume(rest),
         "cost" => cmd_cost(rest),
         "log" => cmd_log(rest),
@@ -1521,6 +1527,251 @@ fn cmd_notify(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 ///
 /// 这个命令存在的理由：使用者要写 `--allow` 规则，就得知道工具叫什么、
 /// 粒度是什么、默认会不会问。让人去翻源码是把成本推给使用者。
+/// 看一眼信息源，判断，**该通知你的就通知你**，全程落台账。
+///
+/// 这是"助理"这条链路的第一个完整形态：
+///
+/// ```text
+/// 取未读邮件 → 逐条判打扰 → 值得的弹通知 → 全部写台账
+/// ```
+///
+/// ## 三个必须做对的地方
+///
+/// 1. **只有 Speak 才弹通知。** Hold 是"攒着"——攒着的东西弹通知，
+///    安静时段就白设了。
+/// 2. **投递结果如实报。** 勿扰模式下通知只进通知中心，那就说"未确认可见"，
+///    不说"已通知"。
+/// 3. **每条判定都落台账，包括"决定不通知"的那些。** 使用者问
+///    "为什么这封没告诉我"时，答案必须在台账里，不能靠重跑一遍猜。
+fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::companion::CompanionPolicy;
+    use yunxi_bot_core::info::InfoSource;
+    use yunxi_bot_core::info::mail::{MailSource, credentials_path};
+    use yunxi_bot_core::memory::Situation;
+    use yunxi_bot_core::notify::{Notification, Notifier, Urgency};
+    use yunxi_bot_core::triage::triage_item;
+    use yunxi_bot_core::{EventKind, Ledger};
+
+    let port: u16 = flag(args, "--port")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(yunxi_bot_core::info::mail::DEFAULT_PORT);
+    let limit: usize = flag(args, "--limit")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(20);
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let no_notify = args.iter().any(|a| a == "--no-notify");
+
+    let src = MailSource::new(port);
+    if let Err(e) = src.health() {
+        eprintln!("信息源不可用: {e}");
+        eprintln!("配置文件: {}", credentials_path(&default_home()).display());
+        return Ok(1);
+    }
+
+    let mut ledger = Ledger::open(ledger_path())?;
+    let now = now_millis()?;
+
+    let batch = match src.fetch(limit) {
+        Ok(b) => b,
+        Err(e) => {
+            // **取不到要落台账。** 不记的话，"今天没通知"和"今天取不到"
+            // 在事后看是一模一样的——而这两件事的下一步完全不同。
+            ledger.append(
+                EventKind::InfoFetched,
+                None,
+                serde_json::json!({
+                    "source": src.name(),
+                    "ok": false,
+                    "error": e.to_string(),
+                    "at_ms": now,
+                }),
+            )?;
+            eprintln!("取未读失败: {e}");
+            return Ok(1);
+        }
+    };
+
+    ledger.append(
+        EventKind::InfoFetched,
+        None,
+        serde_json::json!({
+            "source": src.name(),
+            "ok": true,
+            "count": batch.items.len(),
+            "total_unseen": batch.total_unseen,
+            // "没看全"必须记下来，否则事后分不清"没有"和"错过了"
+            "skipped": batch.skipped,
+            "at_ms": now,
+        }),
+    )?;
+
+    println!("信息源    : {}", src.name());
+    if let Some(who) = src.describe() {
+        println!("账号      : {who}");
+    }
+    println!("未读总数  : {} 封", batch.total_unseen);
+    println!("本次判定  : {} 封", batch.items.len());
+    if batch.skipped > 0 {
+        println!("取不到    : {} 封", batch.skipped);
+    }
+    println!();
+
+    if batch.items.is_empty() {
+        println!("（没有未读，不打扰你）");
+        return Ok(0);
+    }
+
+    // 判定策略从数据目录读。**文件不存在用默认值**（第一次跑是正常的），
+    // 但读到了却解析不了就报错——静默用默认值会让使用者以为自己写的规则生效了。
+    let triage_policy = match yunxi_bot_core::triage::load_policy(&default_home()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("策略文件有问题: {e}");
+            return Ok(2);
+        }
+    };
+    if !triage_policy.allow_senders.is_empty() || !triage_policy.block_senders.is_empty() {
+        println!(
+            "策略      : 白名单 {} 条 · 黑名单 {} 条（{}）",
+            triage_policy.allow_senders.len(),
+            triage_policy.block_senders.len(),
+            default_home()
+                .join(yunxi_bot_core::triage::POLICY_FILE)
+                .display()
+        );
+    }
+    let companion = CompanionPolicy::default();
+    let ctx = Situation {
+        relationship_stage: "初期".into(),
+        minutes_since_last_interaction: 999,
+        ..Default::default()
+    };
+    use chrono::Timelike;
+    let hour = chrono::Local::now().hour() as u8;
+
+    // 判定引擎：优先本地 Verdict。连不上就是降级——而降级方向是不打扰，
+    // 所以"决策模型没起来"不会导致乱通知。
+    let (_, decider, _) = open_decider(args);
+    let mut engine = yunxi_bot_core::companion::companion_engine(decider);
+
+    let notifier: Box<dyn Notifier> = if no_notify {
+        Box::new(yunxi_bot_core::notify::NullNotifier)
+    } else if args.iter().any(|a| a == "--console") {
+        Box::new(yunxi_bot_core::notify::ConsoleNotifier)
+    } else {
+        #[cfg(windows)]
+        {
+            Box::new(yunxi_bot_core::notify_windows::WindowsToast::new())
+        }
+        #[cfg(not(windows))]
+        {
+            Box::new(yunxi_bot_core::notify::NullNotifier)
+        }
+    };
+
+    let mut notified = 0usize;
+    let mut held = 0usize;
+    let mut silent = 0usize;
+
+    for it in &batch.items {
+        let d = triage_item(&mut engine, it, &triage_policy, &companion, &ctx, hour, now);
+
+        // **每条判定都落台账，包括"决定不通知"的那些。**
+        ledger.append(
+            EventKind::InfoTriaged,
+            None,
+            serde_json::json!({
+                "source": it.source,
+                "id": it.id,
+                "from": it.from_addr,
+                "subject": it.subject,
+                "action": format!("{:?}", d.action),
+                "rule": d.rule,
+                "reason": d.reason,
+                "used_model": d.used_model,
+                "degraded": d.degraded,
+                "constrained": d.constrained,
+                "at_ms": now,
+            }),
+        )?;
+
+        let mark = match d.action {
+            yunxi_bot_core::companion::Intervention::Speak => "通知",
+            yunxi_bot_core::companion::Intervention::Hold => "攒着",
+            yunxi_bot_core::companion::Intervention::Quiet => "不提",
+        };
+        println!(
+            "[{mark}] {:<22} {}",
+            truncate_chars(it.display_from(), 20),
+            truncate_chars(it.display_subject(), 36)
+        );
+        println!("        {}", d.reason);
+
+        if !d.should_notify() {
+            match d.action {
+                yunxi_bot_core::companion::Intervention::Hold => held += 1,
+                _ => silent += 1,
+            }
+            continue;
+        }
+
+        // 验证码这类是有时效的，值得标成紧急；其余一律普通。
+        // **不滥用"紧急"**——一个总在喊紧急的助理会被很快学会忽略。
+        let urgency = if d.rule == Some(yunxi_bot_core::triage::rules::VERIFICATION_CODE) {
+            Urgency::High
+        } else {
+            Urgency::Normal
+        };
+
+        let n = Notification::new(it.display_from(), it.display_subject())
+            .with_tag(format!("mail.{}", it.id))
+            .with_urgency(urgency);
+
+        let delivery = if dry_run {
+            yunxi_bot_core::notify::Delivery::Blocked {
+                reason: "演练模式：没有真的发通知".to_string(),
+            }
+        } else {
+            notifier.notify(&n)
+        };
+
+        ledger.append(
+            EventKind::NoticeSent,
+            None,
+            serde_json::json!({
+                "channel": notifier.name(),
+                "source": it.source,
+                "id": it.id,
+                "title": n.title,
+                "body": n.body,
+                "result": delivery.label(),
+                "detail": delivery.detail(),
+                // **"能不能说通知你了"单独记一位。**
+                // 事后统计"通知了多少"时，只有这一位为真的才算数。
+                "confirmed": delivery.can_claim_user_notified(),
+                "dry_run": dry_run,
+                "at_ms": now,
+            }),
+        )?;
+        println!(
+            "        → 通知：{}（{}）",
+            delivery.label(),
+            delivery.detail()
+        );
+        notified += 1;
+    }
+
+    println!();
+    println!("通知 {notified} 条 · 攒着 {held} 条 · 不提 {silent} 条");
+    println!("台账: {}", ledger_path().display());
+    if dry_run {
+        println!("（演练模式：没有真的发通知，但台账照记）");
+    }
+    Ok(0)
+}
+
 /// 看未读邮件。**只读**——不会把你的邮件标成已读。
 ///
 /// 这个命令存在的理由和 `notify` 一样：使用者需要能**自己确认**助理看到了什么。

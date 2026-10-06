@@ -51,7 +51,11 @@ impl Intervention {
     ///
     /// ⚠️ 用 `max` 而不是 `min`：`Ord` 按声明顺序派生，`Speak < Hold < Quiet`，
     /// 所以**越"大"越保守**。写成 `min` 会拿到最激进的动作，约束收紧会完全失效。
-    fn more_conservative(self, other: Intervention) -> Intervention {
+    ///
+    /// 公开是因为**约束收紧这件事不只陪伴层要用**：信息源触发的介入判定
+    /// （见 [`crate::triage`]）同样要过这一关。两处各写一遍 `max`/`min`
+    /// 迟早会有一处写反——而写反的表现是"约束静默失效"。
+    pub fn more_conservative(self, other: Intervention) -> Intervention {
         self.max(other)
     }
 }

@@ -34,6 +34,8 @@ pub mod runner;
 pub mod task;
 pub mod think;
 pub mod tool;
+/// 打扰判定：这条信息值不值得现在告诉你。
+pub mod triage;
 pub mod trigger;
 pub mod win_job;
 #[cfg(windows)]
