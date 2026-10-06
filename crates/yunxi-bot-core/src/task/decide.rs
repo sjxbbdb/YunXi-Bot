@@ -245,31 +245,45 @@ pub fn decision_point(
     let req = DecisionRequest::new(state, vec![Question::choice(key, question, criteria)]);
 
     let Ok(result) = decider.decide(&req) else {
-        // 服务未启动 / 超时 / 响应非法，都归到"不执行"。失败原因在这一层没有落点
-        //（NeedsHuman 只有问题与选项），但方向是对的：宁可多问一次人，
-        // 也不执行一个没被确认过的选择。这里也不重试——在没有阈值校准之前，
-        // 重试只是把同一个不确定再摇一遍。
-        return Ok(escalate(question, &options));
+        // 服务未启动 / 超时 / 响应非法，都归到"不执行"。方向是对的：
+        // 宁可多问一次人，也不执行一个没被确认过的选择。
+        // 这里也不重试——在没有阈值校准之前，重试只是把同一个不确定再摇一遍。
+        //
+        // **但必须说清这是"模型不可用"，不是"模型弃权"。**
+        // 原来的注释写着"失败原因在这一层没有落点"——那个落点现在补上了。
+        return Ok(escalate(
+            question,
+            &options,
+            "决策模型不可用（服务未启动、超时，或响应非法）——这是故障，不是它在弃权",
+        ));
     };
 
     // 直接调 [`Decider`] 时，`DecisionEngine` 里那层无条件校验不在这条路径上，
     // 必须自己补：未声明的选项、越界的概率都是"不能将就"的响应。
     if crate::decide::laya::validate(&req, &result).is_err() {
-        return Ok(escalate(question, &options));
+        return Ok(escalate(
+            question,
+            &options,
+            "决策模型的响应不合法（未声明的选项或越界的概率）",
+        ));
     }
 
     // 下面三步在 validate 之后其实已经成立，仍然写成 let-else：安全代码里不留 unwrap，
     // 万一哪天校验被放宽，这里的失败方向依旧是"不执行"。
     let Some(answer) = result.answer(key) else {
-        return Ok(escalate(question, &options));
+        return Ok(escalate(question, &options, "决策模型没有回应这个问题"));
     };
     let Some(choice) = answer.choice.as_deref() else {
-        return Ok(escalate(question, &options));
+        return Ok(escalate(
+            question,
+            &options,
+            "决策模型弃权——它没有选任何一项",
+        ));
     };
     // 选项名必须逐字对上。不做 trim、不忽略大小写：宽容匹配等于替模型猜它想说什么，
     // 而这里猜错的代价是执行了另一种做法。
     let Some(picked) = criteria.iter().position(|(name, _)| *name == choice) else {
-        return Ok(escalate(question, &options));
+        return Ok(escalate(question, &options, "决策模型选了一个不存在的选项"));
     };
 
     let alternatives = criteria
@@ -308,9 +322,27 @@ pub fn decision_point(
 ///
 /// 抽成一个函数是因为它是本模块唯一的失败出口——每一条不确定路径都汇到这里，
 /// 于是"失败方向朝不执行"只需要审查一处。
-fn escalate(question: &str, options: &[String]) -> TaskDecision {
+fn escalate(question: &str, options: &[String], why: &str) -> TaskDecision {
     TaskDecision::NeedsHuman {
-        question: question.to_string(),
+        // **原因要能看见——"决策模型不可用"和"决策模型弃权"必须分得开。**
+        //
+        // 在这之前两者都只是"需要你拍板"，长得一模一样。
+        // 而它们的处置完全不同：
+        //
+        // - **弃权**：这是决策模型在正常工作——它判断自己定不了，
+        //   该由人来定。请人拍板就是正确处置。
+        // - **不可用**：这是**故障**——服务没起来、超时、响应非法。
+        //   该做的是去修 sidecar，请人拍板只是把故障伪装成了一次正常决策。
+        //
+        // 真机上抓到过（D104）：Verdict sidecar 因为线程耗尽被杀，
+        // 之后每一次决策都变成"问人"，**而没有任何人知道它已经不在了**。
+        // 那份日志里最后一句是 `OMP: Error #137: Cannot create thread.`，
+        // 而界面上显示的是"任务卡住，需要你拍板"。
+        //
+        // `NeedsHuman` 只有问题和选项两个字段，所以原因写进问题里。
+        // 不新造一个变体：那会牵动引擎、台账、界面三处，
+        // 而这里要的只是"**让原因可见**"。
+        question: format!("{question}\n（{why}）"),
         options: options.to_vec(),
     }
 }
@@ -718,7 +750,15 @@ mod tests {
 
         match got {
             TaskDecision::NeedsHuman { question, options } => {
-                assert_eq!(question, "怎么处理？");
+                // **原来是 `assert_eq!(question, "怎么处理？")`。**
+                // 现在问题里多了"为什么升级"那一行——**那正是这次改动的目的**
+                // （"模型不可用"和"模型弃权"必须分得开）。
+                //
+                // 所以这两条断言换成了更准确的那两条：
+                // **原问题一个字都不能少**，而且**原因要在**。
+                // 这不是放宽——"问题原文被改写"仍然会被抓住。
+                assert!(question.starts_with("怎么处理？"), "{question}");
+                assert!(question.contains("不合法"), "要带上原因：{question}");
                 assert_eq!(options, ["重试", "回滚", "放弃"]);
             }
             other => panic!("未声明的选项必须升级人工，实际 {other:?}"),
@@ -846,5 +886,66 @@ mod tests {
             }
             other => panic!("决策点只该问 choice，实际 {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod escalation_reason_tests {
+    use super::*;
+    use crate::decide::laya::StubDecider;
+
+    fn criteria() -> Vec<(&'static str, &'static str)> {
+        vec![("opt0", "保持 `>` 不动"), ("opt1", "改成 `>=`")]
+    }
+
+    #[test]
+    fn an_unavailable_decider_says_so() {
+        // **这是 D104 那个静默失效的落点。**
+        //
+        // Verdict sidecar 因为线程耗尽被杀之后，每一次决策都变成
+        // "问人"——**而没有任何人知道它已经不在了**。
+        // 界面上显示的是"任务卡住，需要你拍板"，和处理一次正常的
+        // 弃权完全一样。
+        let decider = StubDecider::failing("连接被拒绝");
+        let out = decision_point(&decider, "k", "选哪个？", &criteria()).unwrap();
+        let TaskDecision::NeedsHuman { question, .. } = out else {
+            panic!("模型不可用时该升级人工");
+        };
+        assert!(
+            question.contains("不可用"),
+            "**必须说清是模型不可用，而不是它在弃权**：{question}"
+        );
+        assert!(
+            question.contains("故障"),
+            "还要说清这是故障——处置是去修 sidecar，不是请人拍板：{question}"
+        );
+        // **原问题不能被吞掉**——人要拍板的还是那件事
+        assert!(question.contains("选哪个"), "{question}");
+    }
+
+    #[test]
+    fn an_abstention_does_not_claim_the_model_is_down() {
+        // **反过来的那一半同样要验。**
+        //
+        // 弃权是决策模型**在正常工作**：它判断自己定不了，该由人来定。
+        // 如果它也报"不可用"，那这个区分就白做了——
+        // 人会跑去修一个根本没坏的 sidecar。
+        let decider = StubDecider::succeeding().with_choice("k", "不在选项里");
+        let out = decision_point(&decider, "k", "选哪个？", &criteria()).unwrap();
+        let TaskDecision::NeedsHuman { question, .. } = out else {
+            panic!("选了不存在的选项时该升级人工");
+        };
+        assert!(
+            !question.contains("不可用"),
+            "**弃权不能被说成故障**——那会让人去修一个没坏的服务：{question}"
+        );
+        // **它确实回应了，只是回应得不合法。**
+        // 这条走的是 validate 那道关（未声明的选项），不是
+        // "选了一个不存在的选项"——我第一版把场景想错了，
+        // 而**测试挂出来正好说明这两条路是分开的**。
+        assert!(
+            question.contains("不合法"),
+            "要说清它到底做了什么：{question}"
+        );
     }
 }
