@@ -190,6 +190,84 @@ impl Memory {
         v
     }
 
+    /// **常驻**记忆：关于"使用者是谁"的那几类，按稳定顺序取前若干条。
+    ///
+    /// ## 这个函数必须是纯函数——这是缓存纪律要求的
+    ///
+    /// 常驻记忆要进**稳定前缀**，而稳定前缀的前提是"同样输入永远产出
+    /// 同样字节"（见 `build_persona` 的文档）。
+    ///
+    /// **所以这里不能用 [`Memory::recall`]。** 那个按 `score(now_ms)` 排，
+    /// 而 score 里含 30 天半衰期的时间因子——**同样的记忆，随着时间推移
+    /// 排序会变**，于是前缀**静默变化**、缓存悄悄失效。
+    /// 那种失效不报错、不变慢，只表现为账单变贵。
+    ///
+    /// 这里只按 `(权重降序, 创建时间降序, id)` 排——**全是事件里定死的值，
+    /// 跟"现在几点"无关**。给同一串事件，任何时候调用都得到同样的结果。
+    ///
+    /// ## 为什么分常驻和动态
+    ///
+    /// - **常驻**（Fact / Preference）：关于"使用者是谁"。每次对话都用得上，
+    ///   而且变化很慢——所以进稳定前缀，被缓存。
+    /// - **动态**（Event / Relationship）：跟当前话题相关才用得上，
+    ///   应该按本轮问题召回、放易变尾。
+    ///
+    /// 全塞前缀的话前缀会随记忆无限变大；全放尾部的话每轮都要重发。
+    pub fn resident(&self, per_kind_limit: usize) -> Vec<&MemoryEntry> {
+        let mut v: Vec<&MemoryEntry> = self
+            .entries
+            .values()
+            .filter(|e| matches!(e.kind, MemoryKind::Fact | MemoryKind::Preference))
+            .collect();
+        v.sort_by(|a, b| {
+            // 权重高的先；同权重新的先；再同就按 id——
+            // **最后这个兜底不能省**，否则同权重的两条顺序不定，
+            // 前缀就跟着不定
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        // 每类各留前 N 条，而不是合起来取前 N——
+        // 偏好再多也不该把"使用者是谁"挤掉
+        let mut seen_fact = 0usize;
+        let mut seen_pref = 0usize;
+        v.retain(|e| match e.kind {
+            MemoryKind::Fact => {
+                seen_fact += 1;
+                seen_fact <= per_kind_limit
+            }
+            _ => {
+                seen_pref += 1;
+                seen_pref <= per_kind_limit
+            }
+        });
+        v
+    }
+
+    /// 常驻记忆段的**版本号**：内容决定的短哈希。
+    ///
+    /// 内容是哪些、顺序如何，全都体现在这个串里。所以：
+    /// - 版本没变 → 前缀没变 → **缓存该命中**
+    /// - 版本变了 → 就是这次换了记忆，**一次未命中是预期内的**
+    ///
+    /// 它的价值是**可诊断**：出问题时能一眼看出"前缀到底变没变"，
+    /// 而不是对着一堆字节猜。
+    pub fn resident_version(&self, per_kind_limit: usize) -> String {
+        // 用 DefaultHasher 而不是引新依赖：短哈希够用，
+        // 它只是给人看和给日志比对的，不是密码学用途
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for e in self.resident(per_kind_limit) {
+            e.id.hash(&mut h);
+            e.text.hash(&mut h);
+            // 权重取整参与哈希：免得浮点尾数让版本号无谓地跳
+            ((e.weight * 100.0).round() as i64).hash(&mut h);
+        }
+        format!("{:06x}", h.finish() & 0xff_ffff)
+    }
+
     /// 按正文子串找。**大小写不敏感。**
     ///
     /// 用子串而不是别的匹配方式：使用者要找的是"我记过关于 X 的东西"，

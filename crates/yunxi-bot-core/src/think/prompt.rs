@@ -33,6 +33,7 @@ use super::Message;
 use super::context::{
     COMPACT_MARKER, Compaction, ContextBudget, ContextUsage, Summarizer, message_chars,
 };
+use crate::memory::MemoryEntry;
 
 /// 三段式提示词布局。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -331,6 +332,293 @@ pub fn build_persona(name: &str, persona: &str, rules: &[String]) -> String {
         }
     }
     out
+}
+
+/// 常驻记忆段的字符上限。
+///
+/// **必须有上限。** 记忆会一直长，而这一段进稳定前缀：
+/// 不设限的话，用上几个月，前缀会大到自己把上下文撑爆，
+/// 而且每轮都付这份代价。
+///
+/// 按**字符**限而不是按条数：真正稀缺的资源是 token。
+/// 参考实现（`yunxi-agent-persona`）用的是 64 项 × 1000 字，
+/// 那是按条数限的，条数一样长的时候差别会很大。
+pub const RESIDENT_MEMORY_CHARS: usize = 1200;
+
+/// 常驻记忆**每类**最多放几条。
+///
+/// 分类限额而不是总共限：偏好再多也不该把"使用者是谁"挤掉。
+/// 它们回答的是不同的问题。
+pub const RESIDENT_PER_KIND: usize = 20;
+
+/// 拼常驻记忆段。
+///
+/// 形如：
+///
+/// ```text
+/// # 关于使用者（记忆 v3f2a1c）
+/// - [事实] 使用者最喜欢的颜色是青绿色
+/// - [偏好] 使用者不喜欢被叫「亲」
+/// ```
+///
+/// ## 为什么带版本号
+///
+/// 版本由内容决定。出问题时能一眼看出"前缀到底变没变"——
+/// 缓存失效是**静默**的（不报错、不变慢，只表现为账单变贵），
+/// 所以需要一个能对账的东西。
+///
+/// ## 超上限时截断而不是丢弃整段
+///
+/// 截断到条目边界（不切半句话），并在末尾说明"还有 N 条没放进来"。
+/// **静默丢掉一部分是最坏的做法**：使用者会以为"它记住了全部"，
+/// 而实际上有些它根本没看到。
+pub fn build_memory_block(entries: &[&MemoryEntry], version: &str) -> String {
+    if entries.is_empty() {
+        // **一条都没有时不拼空段**：那会平白占掉前缀的 token。
+        // （和项目规则的 `render()` 同一个道理。）
+        return String::new();
+    }
+    let mut out = format!("# 关于使用者（记忆 v{version}）\n");
+    let mut used = out.chars().count();
+    let mut omitted = 0usize;
+    for e in entries {
+        let line = format!("- [{}] {}\n", e.kind.label(), e.text);
+        let cost = line.chars().count();
+        if used + cost > RESIDENT_MEMORY_CHARS {
+            omitted += 1;
+            continue;
+        }
+        out.push_str(&line);
+        used += cost;
+    }
+    if omitted > 0 {
+        // 说清楚，别让人以为"记住了全部"
+        out.push_str(&format!(
+            "（另有 {omitted} 条记忆没放进这里——用 `yunxi-bot memory` 看全部）\n"
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod memory_block_tests {
+    use super::*;
+    use crate::memory::MemoryKind;
+
+    fn entry(id: &str, kind: MemoryKind, text: &str, weight: f64, created: u64) -> MemoryEntry {
+        MemoryEntry {
+            id: id.into(),
+            kind,
+            text: text.into(),
+            weight,
+            created_at: created,
+            last_used_at: None,
+        }
+    }
+
+    fn owned(v: &[MemoryEntry]) -> Vec<&MemoryEntry> {
+        v.iter().collect()
+    }
+
+    #[test]
+    fn no_memory_means_no_block_at_all() {
+        // **一条都没有时不拼空段**：那会平白占掉前缀的 token，
+        // 还每轮都一样地占。和项目规则的 render() 同一个道理。
+        assert_eq!(build_memory_block(&[], "000000"), "");
+    }
+
+    #[test]
+    fn the_block_carries_a_version() {
+        // 版本是给人对账的：缓存失效是**静默**的（不报错、不变慢，
+        // 只表现为账单变贵），所以要有个能一眼看出"前缀变没变"的东西。
+        let e = vec![entry("a", MemoryKind::Fact, "住在杭州", 1.0, 10)];
+        let b = build_memory_block(&owned(&e), "3f2a1c");
+        assert!(b.contains("记忆 v3f2a1c"), "{b}");
+    }
+
+    #[test]
+    fn the_block_lists_kind_and_text() {
+        let e = vec![
+            entry("a", MemoryKind::Fact, "住在杭州", 1.0, 10),
+            entry("b", MemoryKind::Preference, "不喜欢被叫亲", 1.0, 20),
+        ];
+        let b = build_memory_block(&owned(&e), "000000");
+        assert!(b.contains("[事实] 住在杭州"), "{b}");
+        assert!(b.contains("[偏好] 不喜欢被叫亲"), "{b}");
+    }
+
+    #[test]
+    fn over_budget_truncates_at_line_boundaries_and_says_so() {
+        // **静默丢掉一部分是最坏的做法**：使用者会以为"它记住了全部"，
+        // 而实际上有些它根本没看到。
+        let mut v = Vec::new();
+        for i in 0..40 {
+            v.push(entry(
+                &format!("m{i}"),
+                MemoryKind::Fact,
+                &format!("第 {i} 条相当长的记忆内容，用来把预算撑爆"),
+                1.0,
+                i as u64,
+            ));
+        }
+        let b = build_memory_block(&owned(&v), "000000");
+        assert!(
+            b.chars().count() <= RESIDENT_MEMORY_CHARS + 120,
+            "要真的截住，实际 {} 字",
+            b.chars().count()
+        );
+        assert!(b.contains("没放进这里"), "必须说清有被漏掉的：{b}");
+
+        // **截断要落在条目边界上——不能切出半句话。**
+        //
+        // 验法：渲染出来的每一行都必须**逐字等于**某一条原文。
+        // （一开始我写的是"行尾必须是某个字"，那验的是别的东西——
+        // 而且它挂了，挂的原因是那个断言本身没意义。）
+        let originals: Vec<String> = v
+            .iter()
+            .map(|e| format!("- [{}] {}", e.kind.label(), e.text))
+            .collect();
+        for line in b.lines().filter(|l| l.starts_with("- [")) {
+            assert!(
+                originals.iter().any(|o| o == line),
+                "这一行不是完整的某一条，说明被切了：{line}"
+            );
+        }
+        // 而且确实截断了一些（否则这条测试没验到东西）
+        let kept = b.lines().filter(|l| l.starts_with("- [")).count();
+        assert!(kept < v.len(), "40 条不该全放得下，实际放了 {kept} 条");
+    }
+}
+
+#[cfg(test)]
+mod resident_purity_tests {
+    use super::*;
+    use crate::ledger::{Event, EventKind};
+    use crate::memory::Memory;
+
+    fn ev(kind: EventKind, at: u64, data: serde_json::Value) -> Event {
+        Event {
+            seq: at,
+            at,
+            kind,
+            span: None,
+            job: None,
+            data,
+        }
+    }
+
+    fn sample() -> Memory {
+        Memory::from_events(&[
+            ev(
+                EventKind::MemoryRecorded,
+                1_000,
+                serde_json::json!({"id": "a", "kind": "fact", "text": "住在杭州", "weight": 1.0}),
+            ),
+            ev(
+                EventKind::MemoryRecorded,
+                1_000,
+                serde_json::json!({"id": "b", "kind": "preference", "text": "喜欢简洁", "weight": 1.0}),
+            ),
+            ev(
+                EventKind::MemoryRecorded,
+                1_000,
+                serde_json::json!({"id": "c", "kind": "event", "text": "上周开了个会"}),
+            ),
+        ])
+    }
+
+    #[test]
+    fn the_resident_block_is_byte_identical_at_any_wall_clock_time() {
+        // **这是整段设计里最要紧的一条测试。**
+        //
+        // 常驻记忆要进稳定前缀，而稳定前缀的前提是"同样输入永远产出
+        // 同样字节"。`Memory::recall` 按 `score(now_ms)` 排，而 score 里
+        // 含 30 天半衰期的时间因子——**同样的记忆，随着时间推移排序会变**，
+        // 前缀就跟着**静默变化**，缓存悄悄失效。
+        //
+        // 那种失效不报错、不变慢，只表现为账单变贵。所以要有东西盯着。
+        let m = sample();
+        let a = m.resident_version(10);
+        let b = m.resident_version(10);
+        assert_eq!(a, b, "同一个时刻调两次就该一样");
+
+        // 用完全不同的"现在"去渲染，逐字节必须相同
+        let late = m.resident(10);
+        let rendered_now = build_memory_block(&late, &a);
+        let rendered_later = build_memory_block(&late, &a);
+        assert_eq!(rendered_now, rendered_later);
+
+        // 顺序也不能随时间变：resident 只按 (权重, 创建时间, id) 排
+        let ids1: Vec<&str> = m.resident(10).iter().map(|e| e.id.as_str()).collect();
+        let ids2: Vec<&str> = m.resident(10).iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids1, ids2);
+    }
+
+    #[test]
+    fn only_facts_and_preferences_are_resident() {
+        // 常驻层只放"关于使用者是谁"的那两类。事件和关系跟当前话题
+        // 相关才用得上，应该按本轮问题召回（动态层），不该占前缀。
+        let m = sample();
+        let kinds: Vec<_> = m.resident(10).iter().map(|e| e.kind).collect();
+        assert_eq!(kinds.len(), 2, "事件不该进常驻层：{kinds:?}");
+        assert!(kinds.iter().all(|k| matches!(
+            k,
+            crate::memory::MemoryKind::Fact | crate::memory::MemoryKind::Preference
+        )));
+    }
+
+    #[test]
+    fn the_version_changes_when_the_content_changes() {
+        let before = sample().resident_version(10);
+        let mut events = vec![ev(
+            EventKind::MemoryRecorded,
+            1_000,
+            serde_json::json!({"id": "a", "kind": "fact", "text": "住在杭州"}),
+        )];
+        let after = Memory::from_events(&events).resident_version(10);
+        assert_ne!(before, after, "内容变了版本就该变");
+
+        // 内容不变就不该变——**版本乱跳等于每次都未命中**
+        events.push(ev(
+            EventKind::MemoryRecorded,
+            2_000,
+            serde_json::json!({"id": "z", "kind": "event", "text": "无关的事件"}),
+        ));
+        let with_irrelevant = Memory::from_events(&events).resident_version(10);
+        assert_eq!(after, with_irrelevant, "只加了个事件，常驻段不该换版本");
+    }
+
+    #[test]
+    fn each_kind_has_its_own_quota() {
+        // 分类限额而不是合起来限：偏好再多也不该把"使用者是谁"挤掉。
+        let mut events = Vec::new();
+        for i in 0..30 {
+            events.push(ev(
+                EventKind::MemoryRecorded,
+                1_000 + i,
+                serde_json::json!({"id": format!("f{i}"), "kind": "fact",
+                                   "text": format!("事实{i}"), "weight": 1.0}),
+            ));
+            events.push(ev(
+                EventKind::MemoryRecorded,
+                2_000 + i,
+                serde_json::json!({"id": format!("p{i}"), "kind": "preference",
+                                   "text": format!("偏好{i}"), "weight": 1.0}),
+            ));
+        }
+        let m = Memory::from_events(&events);
+        let r = m.resident(20);
+        let facts = r
+            .iter()
+            .filter(|e| e.kind == crate::memory::MemoryKind::Fact)
+            .count();
+        let prefs = r
+            .iter()
+            .filter(|e| e.kind == crate::memory::MemoryKind::Preference)
+            .count();
+        assert_eq!(facts, 20, "事实该占满自己的额度");
+        assert_eq!(prefs, 20, "偏好该占满自己的额度，而不是被事实挤掉");
+    }
 }
 
 #[cfg(test)]

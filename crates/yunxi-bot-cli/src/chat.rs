@@ -174,8 +174,10 @@ pub fn run(
         match store.load(&session_id) {
             Ok(f) => {
                 // 前缀核对：变了就**保留历史、换新前缀、如实报告**
-                let (layout, mismatch) =
-                    yunxi_bot_core::think::session::resume_onto(&f, handler.expected_chat_prefix());
+                let (layout, mismatch) = yunxi_bot_core::think::session::resume_onto(
+                    &f,
+                    &handler.expected_chat_prefix(),
+                );
                 handler.restore_chat_layout(layout, crate::chat_handler::CHAT_SESSION_KEY);
                 resumed_turns = f.turns;
                 match mismatch {

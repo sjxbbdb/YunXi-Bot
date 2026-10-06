@@ -162,7 +162,9 @@ pub struct ChatHandler {
     persona: String,
     /// 对话会话的稳定前缀。**提前算好**——载入会话时要拿它和存档里的
     /// 指纹比，而"先建会话再比"会覆盖掉存档里的指纹。
-    chat_prefix: String,
+    /// 常驻记忆段（构造时定下）。**单独存着**，因为它要拼进稳定前缀，
+    /// 而稳定前缀只能有一份来源——两份必然漂移（见 `stable_prefix`）。
+    memory_block: String,
     /// 启动时读到的项目规则。**留着是为了能报出来源**——
     /// 模型说"按项目约定应该……"时，使用者得能查到那指的是哪一条。
     project_rules: yunxi_bot_core::rules::RuleSet,
@@ -189,6 +191,30 @@ pub struct ChatHandler {
     router: yunxi_bot_core::think::ModelRouter,
 }
 
+/// 拼"常驻记忆段"——从台账里读记忆，选出关于"使用者是谁"的那些。
+///
+/// ## 台账打不开就不拼，而不是让对话起不来
+///
+/// 记忆是**增强**，不是对话能不能进行的前提。台账坏了的话，
+/// 一个没有记忆的助理远好过一个起不来的助理。
+///
+/// 但要**说一声**——"这次没有记忆"和使用者本来就没记过，
+/// 是两件不同的事，混在一起会让人以为记忆丢了。
+fn resident_memory_block(home: &std::path::Path) -> String {
+    use yunxi_bot_core::memory::Memory;
+    let path = home.join("ledger.jsonl");
+    let Ok(ledger) = yunxi_bot_core::ledger::Ledger::open(&path) else {
+        if path.exists() {
+            eprintln!("提示：台账打不开，这次对话看不到记忆。");
+        }
+        return String::new();
+    };
+    let mem = Memory::from_events(ledger.events());
+    let entries = mem.resident(yunxi_bot_core::think::prompt::RESIDENT_PER_KIND);
+    let version = mem.resident_version(yunxi_bot_core::think::prompt::RESIDENT_PER_KIND);
+    yunxi_bot_core::think::prompt::build_memory_block(&entries, &version)
+}
+
 impl ChatHandler {
     /// `persona_text` 与 `rules` 来自配置；它们会被拼进稳定前缀。
     pub fn new(home: PathBuf, persona_name: &str, persona_text: &str, rules: Vec<String>) -> Self {
@@ -202,25 +228,21 @@ impl ChatHandler {
         // 而不是数据目录在哪。
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let project_rules = yunxi_bot_core::rules::RuleSet::discover(&cwd, &home);
+        // **常驻记忆在构造时读一次，就定下来。**
+        //
+        // 和项目规则同理：它进稳定前缀，而前缀每轮变的话缓存全废。
+        // 所以不能"每轮现读记忆"——那样每记一条新记忆，
+        // 整个会话的缓存都要从头重来一次。
+        //
+        // 代价是：**同一个进程里新记的记忆，这一轮会话看不见**。
+        // 这是可接受的（记记忆本来就该是"下一次对话生效"），
+        // 而且比"每轮前缀都变、缓存永远命中不了"好得多。
+        let memory_block = resident_memory_block(&home);
         Self {
             home,
             thinkers: BTreeMap::new(),
             sessions: BTreeMap::new(),
-            chat_prefix: {
-                let base = format!(
-                    "{}\n\n{}",
-                    build_persona(persona_name, persona_text, &rules),
-                    CHAT_SYSTEM
-                );
-                let rules_text = project_rules.render();
-                // **没有规则时不拼空段**：那会平白占掉前缀的 token，
-                // 还每轮都一样地占。
-                if rules_text.is_empty() {
-                    base
-                } else {
-                    format!("{base}\n\n{rules_text}")
-                }
-            },
+            memory_block,
             project_rules,
             persona: build_persona(persona_name, persona_text, &rules),
             tools: ToolRegistry::new(),
@@ -361,6 +383,77 @@ impl ChatHandler {
         );
     }
 
+    /// 保证这个 key 对应的会话存在，返回它。
+    ///
+    /// 抽出来是为了**可测**：`converse` 要模型才能跑，而"会话用的前缀
+    /// 到底是不是 `expected_chat_prefix`"这件事不该只有跑一次真对话
+    /// 才能验。以前没抽，于是那条测试只能用"自己跟自己比"糊过去——**恒真**。
+    fn ensure_session(
+        &mut self,
+        key: &SessionKey,
+        intent: Intent,
+    ) -> &yunxi_bot_core::think::prompt::PromptLayout {
+        if !self.sessions.contains_key(key) {
+            // 稳定前缀 = 人格 + 记忆 + 该意图的指令（+ 项目规则）。
+            // **一次定下，之后不再改。** 唯一的来源是 `stable_prefix`。
+            let stable = self.stable_prefix(intent);
+            self.sessions.insert(key.clone(), PromptLayout::new(stable));
+        }
+        // 上面那个分支保证它存在
+        self.sessions
+            .get(key)
+            .expect("刚插入过或者本来就有，取不到说明有 bug")
+    }
+
+    /// 某个意图的**稳定前缀**。这是唯一的来源。
+    ///
+    /// ## 为什么要有这个方法（以前是两个地方各拼一份）
+    ///
+    /// 以前有两份：构造时拼的 `chat_prefix`（给指纹用）和 `converse` 里
+    /// 现场拼的那份（真正进请求的）。**它们不一致**：
+    ///
+    /// - `chat_prefix` = 人格 + CHAT_SYSTEM + **项目规则**
+    /// - `converse`   = 人格 + CHAT_SYSTEM            ← **没有项目规则**
+    ///
+    /// 后果有两个，第二个更坏：
+    ///
+    /// 1. **项目规则根本没进对话请求。** 在一个放了 `AGENTS.md` 的目录里
+    ///    对话，那些约定完全不生效——而 `yunxi-bot rules` 和指纹都说
+    ///    "规则加载了"。真机验过：一条"每句话结尾加喵"的规矩，对话里
+    ///    一个字都没喵。
+    ///
+    /// 2. **载入会话时指纹必然对不上**，每次 `--resume` 都报"前缀变了"。
+    ///    那是个**假警报**，会让人去查一个不存在的问题。
+    ///
+    /// 而那条本该拦住它的测试（`the_expected_prefix_matches_what_a_session_would_use`）
+    /// 是**空的**：它拿一个串和它自己比，恒真。这一条现在是真比了。
+    ///
+    /// ## 记忆放在哪
+    ///
+    /// 记忆段跟在人格后面、指令前面。**不进 `intent.system()`**：
+    /// 那是意图的固定指令，记忆是随使用者变的，混在一起以后
+    /// 谁也说不清"这段到底是代码写的还是记出来的"。
+    ///
+    /// 项目规则只给 `Chat`：任务那三条有自己的指令，项目约定对它们
+    /// 是另一回事，混进去会让提示词和内容对不上。
+    fn stable_prefix(&self, intent: Intent) -> String {
+        let mut out = format!("{}\n\n{}", self.persona, intent.system());
+        if intent == Intent::Chat {
+            // **没有内容就不拼空段**：那会平白占掉前缀的 token，
+            // 还每轮都一样地占。
+            if !self.memory_block.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&self.memory_block);
+            }
+            let rules_text = self.project_rules.render();
+            if !rules_text.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&rules_text);
+            }
+        }
+        out
+    }
+
     /// 对话稳定前缀的指纹。
     ///
     /// **它是"前缀没变"的机器可读表示。** 报出来之后，使用者
@@ -368,7 +461,7 @@ impl ChatHandler {
     pub fn chat_prefix_fingerprint(&self) -> u64 {
         // 和 `PromptLayout::fingerprint` 用同一套算法——不然两个数字
         // 对不上，而那种对不上会被误读成"前缀变了"
-        let l = yunxi_bot_core::think::prompt::PromptLayout::new(self.chat_prefix.clone());
+        let l = yunxi_bot_core::think::prompt::PromptLayout::new(self.stable_prefix(Intent::Chat));
         l.fingerprint()
     }
 
@@ -382,8 +475,8 @@ impl ChatHandler {
     /// 载入会话时要拿它和存档里的指纹比。**必须在建会话之前就能算出来**——
     /// 算不出来的话就只能"先建再比"，而建了就会覆盖掉存档里的指纹，
     /// 于是每次都报"前缀变了"。
-    pub fn expected_chat_prefix(&self) -> &str {
-        self.chat_prefix.as_str()
+    pub fn expected_chat_prefix(&self) -> String {
+        self.stable_prefix(Intent::Chat)
     }
 
     /// 给一轮对话路由。
@@ -477,11 +570,7 @@ impl ChatHandler {
                 _ => routing.spec.provider.to_string(),
             },
         };
-        if !self.sessions.contains_key(&key) {
-            // 稳定前缀 = 人格 + 该意图的指令。**一次定下，之后不再改。**
-            let stable = format!("{}\n\n{}", self.persona, intent.system());
-            self.sessions.insert(key.clone(), PromptLayout::new(stable));
-        }
+        self.ensure_session(&key, intent);
 
         let spec = routing.spec.clone();
         let inner = self.thinker(&spec)?;
@@ -1010,10 +1099,40 @@ mod chat_session_tests {
         // **载入会话时要拿它和存档里的指纹比。**
         // 如果这里算出来的和 `converse` 建会话时用的不是同一份，
         // 就会每次都报"前缀变了"——而那是假警报，会让人去查一个不存在的问题。
-        let h = handler();
-        let expected = h.expected_chat_prefix().to_string();
-        let built = PromptLayout::new(expected.clone());
-        assert_eq!(built.fingerprint(), built.fingerprint_for(&expected));
+        //
+        // ## 这条测试原来是空的
+        //
+        // 原来它这么写：
+        //
+        // ```ignore
+        // let expected = h.expected_chat_prefix().to_string();
+        // let built = PromptLayout::new(expected.clone());
+        // assert_eq!(built.fingerprint(), built.fingerprint_for(&expected));
+        // ```
+        //
+        // **它拿一个串和它自己比，恒真。** 它从来没有和 `converse` 真正
+        // 建会话时用的那份比过——所以两份前缀漂移了很久它都没吭声，
+        // 而漂移的后果是**项目规则根本没进对话请求**（真机上验过：
+        // 一条"每句话结尾加喵"的规矩，对话里一个字都没喵）。
+        //
+        // 现在真比：把会话建出来，拿它的头一条消息和期望的前缀比。
+        let mut h = handler();
+        let expected = h.expected_chat_prefix();
+
+        let key = SessionKey {
+            intent: Intent::Chat,
+            provider: "p".into(),
+        };
+        // `head()` 是**历史**的第一条（稳定前缀在下标 0，历史从 1 开始），
+        // 所以这里得走 `build()`。这个偏移很容易看错。
+        let built = h.ensure_session(&key, Intent::Chat).build();
+        let Some(actual) = built.first() else {
+            panic!("建出来的会话该有一条稳定前缀消息");
+        };
+        assert_eq!(
+            actual.content, expected,
+            "**期望的前缀和会话里真正用的不是同一份。**\n这会同时导致两件事：\n  - 项目规则/记忆段没进请求\n  - 每次 resume 都报'前缀变了'（假警报）"
+        );
     }
 
     #[test]
@@ -1068,7 +1187,7 @@ mod chat_session_tests {
             fingerprint: l.fingerprint(),
             layout: l,
         };
-        let (_, m) = yunxi_bot_core::think::session::resume_onto(&f, h.expected_chat_prefix());
+        let (_, m) = yunxi_bot_core::think::session::resume_onto(&f, &h.expected_chat_prefix());
         assert_eq!(m, yunxi_bot_core::think::session::PrefixMismatch::Same);
     }
 
