@@ -2083,9 +2083,20 @@ mod tests {
         assert_eq!(outcome.task.step("d").unwrap().state, StepState::Succeeded);
         let result = outcome.task.step("d").unwrap().result.clone().unwrap();
         assert!(result.contains("激进方案"), "应记录选中的那个: {result}");
-        // **恰好一次**：决策点的路由不该再去问一次本地决策模型，
-        // 它只该被用来"在选项里选一个"。
-        assert_eq!(decider.calls(), 1, "决策点必须问本地决策模型，且只问一次");
+        // **这个数字从 1 变成了 3。**
+        //
+        // 原来写"恰好一次"，前提是路由"确定性信号有把握就不问决策模型"。
+        // 改成**每次都问**之后，拆解路由和步骤路由也各问一次，
+        // 于是这里是 3。**这是设计变更的直接后果，不是回归。**
+        //
+        // **但它保护的意图必须守住**，所以把"至少问过一次"和
+        // "选项生成只调一次模型"分开断言——后者原来就是独立的
+        // 一条（`observe_calls`），现在仍然是精确的 `== 1`。
+        //
+        // 顺带记一条债：如果"每次会话输入问一次"就够了，
+        // 那拆解和步骤路由这两次是**多余的**，该在入口处判一次然后复用。
+        // 这一轮没做。
+        assert!(decider.calls() >= 1, "决策点必须问本地决策模型");
         assert_eq!(handler.observe_calls, 1);
         // 落盘的是选项原文，不是 opt0/opt1 这种占位键
         assert!(!result.contains("opt0"), "台账里不该出现占位键: {result}");

@@ -703,26 +703,62 @@ impl ModelRouter {
         // ---- 模型轴：三层，从便宜到贵 ----
         //
         // 这里先按**调用次数**定档，但后面还要被思考轴否决一次，见下。
-        let (tier, mut reason, used_decider) = match profile.heuristic_tier() {
-            Some(tier) => (
-                tier,
-                format!(
-                    "档位由确定性信号定：预计 {calls} 次调用（{} 字 / {} 步 / 多条={} / 代码={}）",
-                    profile.prompt_chars,
-                    profile.step_count,
-                    profile.explicit_multi,
-                    profile.has_code
-                ),
+        let (tier, mut reason, used_decider) = if kind == TaskKind::Conversation {
+            // ---- 寒暄 / 陪伴：**不问决策模型，也不花钱** ----
+            //
+            // 这类输入没有可拆解的步骤，也不需要推理，走免费端点就够。
+            // 而且它占了日常交互的绝大多数——**每次多问一次本地模型
+            // 虽然不花钱，但没必要**：这里根本不存在"该不该花钱"的问题。
+            (
+                Tier::Cheap,
+                "寒暄/陪伴类：固定走免费端点".to_string(),
                 false,
-            ),
-            None => match decider.and_then(|d| self.ask_call_count(d, task_text)) {
+            )
+        } else {
+            // ---- 真实任务：**每次都问决策模型** ----
+            //
+            // 原来这里是 `match profile.heuristic_tier()`：
+            // **确定性信号有把握时直接给答案、跳过决策模型**。
+            // 后果是"有时问有时不问"——行为不可预测，而且真机上抓到过
+            // **整整一次任务里决策模型完全没参与**（e2e_allmodules 那条 ✗）。
+            //
+            // Verdict 跑在 `127.0.0.1`，**本地、无网络、无限流**
+            // （`decide/` 那一套里一个限流器都没有），一次几毫秒。
+            // 所以"每次都问"的成本可以忽略，换来的是**确定性**。
+            match decider.and_then(|d| self.ask_call_count(d, task_text)) {
                 Some(tier) => (tier, "档位由本地决策模型判定调用次数".to_string(), true),
-                None => (
-                    self.default_tier,
-                    "档位信号不足且本地判断弃权，回落默认档（免费）".to_string(),
-                    false,
-                ),
-            },
+                None => {
+                    // **决策模型弃权或不可用时**，才回落到确定性信号——
+                    // 那时候它至少是个有依据的答案，比"默认档"强。
+                    //
+                    // 而且这条回落本身是有信息的：`used_decider=false`
+                    // 会让理由里看得出"这次决策模型没给答案"，
+                    // 而不是让人以为它参与了。
+                    match profile.heuristic_tier() {
+                        Some(tier) => (
+                            tier,
+                            format!(
+                                "决策模型没给档位，回落确定性信号：预计 {calls} 次调用（{} 字 / {} 步 / 多条={} / 代码={}）",
+                                profile.prompt_chars,
+                                profile.step_count,
+                                profile.explicit_multi,
+                                profile.has_code
+                            ),
+                            false,
+                        ),
+                        None => (
+                            self.default_tier,
+                            format!(
+                                "决策模型没给档位，且确定性信号也判不出来，回落默认档（免费端点 {}）",
+                                self.spec(self.default_tier)
+                                    .map(|s| s.model)
+                                    .unwrap_or("未知")
+                            ),
+                            false,
+                        ),
+                    }
+                }
+            }
         };
 
         let mut spec = self.spec(tier).cloned().unwrap_or(ModelSpec::AGNES_FLASH);
@@ -941,8 +977,8 @@ mod tests {
         );
         assert_eq!(r.tier, Tier::Standard, "判断失败应回落免费档");
         assert!(
-            r.reason.contains("免费"),
-            "理由要说清回落到了哪: {}",
+            r.reason.contains("免费端点") && r.reason.contains("agnes"),
+            "理由要说清回落到了哪一档、哪个模型: {}",
             r.reason
         );
     }
