@@ -14,6 +14,12 @@
 //! 4. 不写入边界外的审计事件——宁可抛错。
 
 pub mod agent;
+/// 助理巡览：取信息 → 判断 → 通知 → 落台账。
+///
+/// 放在内核里而不是 CLI 里，是因为它有**两个调用方**：
+/// `yunxi-bot check`（你主动问）和 daemon 的每一轮（它自己看）。
+/// 抄两份的话两边迟早漂移，而漂移的表现是"手动跑没问题，常驻跑出问题"。
+pub mod assistant;
 pub mod companion;
 pub mod costlog;
 pub mod decide;

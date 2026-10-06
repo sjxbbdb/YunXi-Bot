@@ -403,6 +403,188 @@ fn print_report(r: &yunxi_bot_core::TickReport) {
     );
 }
 
+/// 助理回合的固定配置。启动时定好，每轮不变。
+///
+/// 打包成一个结构不是为了少敲几个字，而是因为**这五项是一组**：
+/// 它们共同定义"看哪个源、怎么通知、按谁的规则"。
+/// 散成五个参数时，调用点很容易把 `limit` 和 `dry_run` 传反——
+/// 而那样的错误不会编译失败，只会让行为悄悄不对。
+struct AssistantRound<'a> {
+    source: &'a yunxi_bot_core::info::mail::MailSource,
+    notifier: &'a dyn yunxi_bot_core::notify::Notifier,
+    home: &'a std::path::Path,
+    limit: usize,
+    dry_run: bool,
+}
+
+/// 助理回合：**daemon 自己看一遍信息源，有事才叫你。**
+///
+/// ## 这是"常驻"两个字的落点
+///
+/// 在此之前，整条助理链路只能靠人手敲 `yunxi-bot check` 触发——
+/// 那不叫常驻，那叫"你问我答"。这一轮让它在**你不问的时候也看着**。
+///
+/// ## 四件必须做对的事
+///
+/// 1. **失败不能杀死守护进程。** 邮件服务器抖一下、sidecar 没起来，
+///    都不该让一个跑了三天的常驻进程退出。报一行、下一轮再试。
+/// 2. **信息源挂了要能自己恢复。** 这一条是端到端测试逼出来的：
+///    最初的写法在**启动时**探一次健康，探不到就把通道永久关掉——
+///    于是"sidecar 还没起来"变成了"这个守护再也不看邮件了"。
+///    对一个要跑几天的进程，那是错的。现在每轮都探，
+///    **只在状态变化时打印**（好→坏、坏→好），既不刷屏也不会永久失能。
+/// 3. **不重复打扰。** 这是 `run_pass` 里 `already_seen` 的活——
+///    手动跑一次重复通知只是烦一下，常驻跑就是反复弹到你读掉为止。
+/// 4. **无事发生时不刷屏。** 每 5 分钟打一行"没有新邮件"，
+///    代价不是难看，是**你会开始不看它**——然后真正重要的那行也被漏掉。
+fn run_assistant_round(
+    ledger: &mut Ledger,
+    engine: &mut yunxi_bot_core::decide::DecisionEngine<impl yunxi_bot_core::decide::Decider>,
+    cfg: &AssistantRound<'_>,
+    tick_no: u64,
+    health_ok: &mut Option<bool>,
+) {
+    use chrono::Timelike;
+    use yunxi_bot_core::assistant::{PassInput, run_pass};
+    use yunxi_bot_core::companion::CompanionPolicy;
+    use yunxi_bot_core::info::InfoSource;
+    use yunxi_bot_core::memory::Situation;
+    use yunxi_bot_core::triage::load_policy;
+
+    let AssistantRound {
+        source,
+        notifier,
+        home,
+        limit,
+        dry_run,
+    } = *cfg;
+
+    // **每轮都探一次信息源。** 见上面第 2 条：启动时探一次就永久关掉
+    // 是错的——sidecar 可能只是还没起来。
+    let now_healthy = source.health().is_ok();
+    match (*health_ok, now_healthy) {
+        (Some(false), true) => {
+            println!("[{tick_no:>3}] 信件：信息源恢复了，继续看着");
+        }
+        (Some(true), false) => {
+            // 报出来但**不停**：下一轮还会再试。运行中挂掉比启动时没起来更值得说。
+            if let Err(e) = source.health() {
+                println!("[{tick_no:>3}] 信件：信息源断了（{e}），会继续重试");
+            }
+        }
+        (None, false) => {
+            // 首次就没探到。说一次，然后安静重试。
+            if let Err(e) = source.health() {
+                println!("[{tick_no:>3}] 信件：暂时用不了（{e}）——会继续重试");
+            }
+        }
+        _ => {}
+    }
+    *health_ok = Some(now_healthy);
+    if !now_healthy {
+        return;
+    }
+
+    // **每轮重读策略。** 常驻进程不该要求重启才能生效——
+    // 你说一句"以后别烦我"，下一轮就该算数。文件很小，读一次不值一提。
+    let policy = match load_policy(home) {
+        Ok(p) => p,
+        Err(e) => {
+            // 策略坏了**不能退回默认值继续跑**——那会让你以为规则生效了。
+            // 但也不能杀进程：打印出来，这一轮按默认（更保守方向不成立，
+            // 所以只报错不猜），下一轮再试。
+            println!("[{tick_no:>3}] 助理：策略文件有问题，本轮跳过（{e}）");
+            return;
+        }
+    };
+
+    let Ok(now) = now_millis() else {
+        eprintln!("[{tick_no:>3}] 助理回合跳过：取不到当前时间");
+        return;
+    };
+
+    // **今天已经打扰过几次要每轮重算。** 写死 0 的话，
+    // 每日上限这道闸就永远不会合上——使用者会被无限打扰。
+    let ctx = Situation {
+        relationship_stage: "初期".into(),
+        minutes_since_last_interaction: 999,
+        interventions_today: interventions_today(ledger, now),
+        ..Default::default()
+    };
+
+    let mut input = PassInput {
+        source,
+        engine,
+        notifier,
+        policy,
+        companion: CompanionPolicy::default(),
+        ctx,
+        local_hour: chrono::Local::now().hour() as u8,
+        now_ms: now,
+        limit,
+        dry_run,
+    };
+
+    match run_pass(ledger, &mut input) {
+        Ok(r) => {
+            // **无事发生就不吭声。** 见上面第 3 条。
+            if r.is_quiet() && r.held == 0 && r.silent == 0 {
+                return;
+            }
+            println!("[{tick_no:>3}] 助理：{}", r.summary());
+            if !r.is_complete() {
+                // **"没看全"必须说出来。** 一个助理说"没有新邮件"而其实
+                // 有 3 封没读到，比它不说更糟——你会因此不再自己去看。
+                println!(
+                    "[{tick_no:>3}]       注意：这一轮没看全，有 {} 条取不到",
+                    r.skipped
+                );
+            }
+        }
+        Err(e) => {
+            // 失败不杀进程：邮件服务器抖一下不该让跑了几天的守护退出。
+            println!("[{tick_no:>3}] 助理：这一轮没取到信息（{e}）");
+        }
+    }
+}
+
+/// 今天（本地日）已经打扰过几次。**从台账数，不另存计数器。**
+///
+/// 另存一个计数器就有了两个真相，而它们迟早不一致——那时"今天到底打扰了
+/// 几次"就没有答案了。台账是唯一事实来源（ADR D11）。
+///
+/// 判据是**确认送达**的通知，以及"已交给系统"的那些。
+/// 演练模式不算——它没到你眼前，不该占用你的每日额度。
+fn interventions_today(ledger: &Ledger, now_ms: u64) -> u32 {
+    use yunxi_bot_core::EventKind;
+    // 本地日的起点：往回退到当天 00:00
+    let day_start = {
+        use chrono::{Local, TimeZone};
+        let now = Local.timestamp_millis_opt(now_ms as i64).single();
+        match now {
+            Some(t) => {
+                let midnight = t
+                    .date_naive()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap_or_else(|| t.naive_local());
+                Local
+                    .from_local_datetime(&midnight)
+                    .single()
+                    .map(|x| x.timestamp_millis() as u64)
+                    .unwrap_or(now_ms)
+            }
+            None => now_ms,
+        }
+    };
+
+    ledger
+        .events()
+        .iter()
+        .filter(|e| e.kind == EventKind::NoticeSent && e.at >= day_start)
+        .filter(|e| e.data.get("dry_run").and_then(|v| v.as_bool()) != Some(true))
+        .count() as u32
+}
+
 fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let interval: u64 = flag(args, "--interval")
         .map(str::parse)
@@ -412,6 +594,21 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         .map(str::parse)
         .transpose()?
         .unwrap_or(0);
+    // 助理巡览的间隔（秒）。**0 表示关闭。**
+    //
+    // 按时间而不是按轮数：轮数会和 --interval 耦合，
+    // `--interval 1000` 配"每 5 轮"就是每 5 秒去登一次 IMAP——
+    // 那不是勤快，那是在撞服务端的连接频率限制。
+    let assistant_secs: u64 = flag(args, "--assistant-interval")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(300);
+    let assistant_dry: bool = args.iter().any(|a| a == "--assistant-dry-run");
+    let mail_port: u16 = flag(args, "--port")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(yunxi_bot_core::info::mail::DEFAULT_PORT);
+
     let opts = TickOptions {
         require_os_isolation: args.iter().any(|a| a == "--require-os-isolation"),
         ..Default::default()
@@ -461,11 +658,22 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         .unwrap_or(12);
     let agent_home = default_home();
 
-    let mut engine = if agent_on {
+    // **决策引擎在两个功能之间共用。**
+    //
+    // 陪伴回合和助理回合都需要它，而且都是 Interrupt 类、降级方向都是不打扰。
+    // 所以只要有**任一**功能开着就得建——最初这里只看 `agent_on`，
+    // 结果是"只开助理不开陪伴"时引擎是 None，助理回合被静默跳过。
+    // 那个 bug 是端到端测试抓到的：启动日志说"信件：每 2 秒看一次"，
+    // 然后两秒一轮跑了 25 秒，一封邮件都没发现。
+    let need_engine = agent_on || assistant_secs > 0;
+
+    let mut engine = if need_engine {
         use yunxi_bot_core::agent::agent_engine;
         use yunxi_bot_core::decide::LayaDecider;
         let endpoint = flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide");
-        println!("  Agent  : 开启（每 {judge_every} 轮判断一次）");
+        if agent_on {
+            println!("  Agent  : 开启（每 {judge_every} 轮判断一次）");
+        }
         println!("  判断   : {endpoint}（本地）");
         Some(agent_engine(LayaDecider::new(endpoint)))
     } else {
@@ -491,8 +699,86 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     };
     println!();
 
+    // —— 助理巡览的组件 ——
+    //
+    // 与"陪伴回合"是两件事：
+    //   陪伴回合：看**内部状态**（记忆、关系），决定要不要主动开口
+    //   助理回合：看**外部信息**（邮件），决定要不要把事告诉你
+    //
+    // 两者共用同一个决策引擎——都是 Interrupt 类，降级方向都是不打扰。
+    let assistant_source: Option<yunxi_bot_core::info::mail::MailSource> = if assistant_secs > 0 {
+        use yunxi_bot_core::info::InfoSource as _;
+        let src = yunxi_bot_core::info::mail::MailSource::new(mail_port);
+        // **启动时探一次只为把话说清楚，不决定要不要用它。**
+        //
+        // 最初这里写的是"探不到就设成 None，永不启用"——端到端测试立刻
+        // 抓到了它的后果：sidecar 只是还没起来，而守护进程从此再也不看邮件。
+        // 对一个要跑几天的进程，任何"启动时的一次失败决定长期行为"都是错的。
+        match src.health() {
+            Ok(()) => {
+                println!(
+                    "  信件   : 每 {} 秒看一次{}",
+                    assistant_secs,
+                    src.describe()
+                        .map(|w| format!("（{w}）"))
+                        .unwrap_or_default()
+                );
+            }
+            Err(e) => {
+                // 说清楚它**还会再试**，不然使用者会以为这条通道废了
+                println!(
+                    "  信件   : 每 {} 秒试一次（现在还连不上：{e}）",
+                    assistant_secs
+                );
+            }
+        }
+        Some(src)
+    } else {
+        println!("  信件   : 关闭（--assistant-interval 0）");
+        None
+    };
+
+    let assistant_notifier: Box<dyn yunxi_bot_core::notify::Notifier> =
+        if args.iter().any(|a| a == "--console") {
+            Box::new(yunxi_bot_core::notify::ConsoleNotifier)
+        } else {
+            #[cfg(windows)]
+            {
+                Box::new(yunxi_bot_core::notify_windows::WindowsToast::new())
+            }
+            #[cfg(not(windows))]
+            {
+                Box::new(yunxi_bot_core::notify::NullNotifier)
+            }
+        };
+
+    let assistant_limit: usize = flag(args, "--limit")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(20);
+
+    if assistant_source.is_some() {
+        println!(
+            "  通知   : {}{}",
+            assistant_notifier.name(),
+            if assistant_dry {
+                "（演练：只判定不真发）"
+            } else {
+                ""
+            }
+        );
+    }
+    println!();
+
     let mut n = 0u64;
     let mut consecutive_errors = 0u32;
+    // 上一次助理巡览的时刻。用**时间**而不是轮数：
+    // 轮数会和 --interval 耦合，那样 --interval 1000 配"每 5 轮"
+    // 就成了每 5 秒登一次 IMAP——不是勤快，是在撞服务端的连接频率限制。
+    let mut last_assistant_ms: u64 = 0;
+    // 上一轮信息源健不健康。**只在状态变化时打印**——
+    // 每轮都打"连不上"会让日志变成噪音，而噪音的代价是你不再看它。
+    let mut assistant_health: Option<bool> = None;
     loop {
         n += 1;
         match tick(&mut l, &opts) {
@@ -521,6 +807,27 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         if let Some(engine) = engine.as_mut() {
             if judge_every > 0 && n % judge_every == 0 {
                 run_agent_round(&mut l, engine, thinker.as_ref(), &agent_home, n);
+            }
+
+            // —— 助理巡览 ——
+            //
+            // **这一段就是"常驻"两个字的落点。** 在此之前整条助理链路
+            // 只能靠人手敲 `check` 触发——那不叫常驻，叫"你问我答"。
+            if let Some(src) = assistant_source.as_ref() {
+                let now = now_millis().unwrap_or(0);
+                let due = last_assistant_ms == 0
+                    || now.saturating_sub(last_assistant_ms) >= assistant_secs * 1000;
+                if due {
+                    last_assistant_ms = now;
+                    let cfg = AssistantRound {
+                        source: src,
+                        notifier: assistant_notifier.as_ref(),
+                        home: &agent_home,
+                        limit: assistant_limit,
+                        dry_run: assistant_dry,
+                    };
+                    run_assistant_round(&mut l, engine, &cfg, n, &mut assistant_health);
+                }
             }
         }
 
@@ -1687,13 +1994,14 @@ fn cmd_feedback(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 /// 3. **每条判定都落台账，包括"决定不通知"的那些。** 使用者问
 ///    "为什么这封没告诉我"时，答案必须在台账里，不能靠重跑一遍猜。
 fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
-    use yunxi_bot_core::companion::CompanionPolicy;
+    use yunxi_bot_core::Ledger;
+    use yunxi_bot_core::assistant::{PassInput, run_pass};
+    use yunxi_bot_core::companion::{CompanionPolicy, companion_engine};
     use yunxi_bot_core::info::InfoSource;
     use yunxi_bot_core::info::mail::{MailSource, credentials_path};
     use yunxi_bot_core::memory::Situation;
-    use yunxi_bot_core::notify::{Notification, Notifier, Urgency};
-    use yunxi_bot_core::triage::triage_item;
-    use yunxi_bot_core::{EventKind, Ledger};
+    use yunxi_bot_core::notify::Notifier;
+    use yunxi_bot_core::triage::load_policy;
 
     let port: u16 = flag(args, "--port")
         .map(str::parse)
@@ -1713,91 +2021,15 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         return Ok(1);
     }
 
-    let mut ledger = Ledger::open(ledger_path())?;
-    let now = now_millis()?;
-
-    let batch = match src.fetch(limit) {
-        Ok(b) => b,
-        Err(e) => {
-            // **取不到要落台账。** 不记的话，"今天没通知"和"今天取不到"
-            // 在事后看是一模一样的——而这两件事的下一步完全不同。
-            ledger.append(
-                EventKind::InfoFetched,
-                None,
-                serde_json::json!({
-                    "source": src.name(),
-                    "ok": false,
-                    "error": e.to_string(),
-                    "at_ms": now,
-                }),
-            )?;
-            eprintln!("取未读失败: {e}");
-            return Ok(1);
-        }
-    };
-
-    ledger.append(
-        EventKind::InfoFetched,
-        None,
-        serde_json::json!({
-            "source": src.name(),
-            "ok": true,
-            "count": batch.items.len(),
-            "total_unseen": batch.total_unseen,
-            // "没看全"必须记下来，否则事后分不清"没有"和"错过了"
-            "skipped": batch.skipped,
-            "at_ms": now,
-        }),
-    )?;
-
-    println!("信息源    : {}", src.name());
-    if let Some(who) = src.describe() {
-        println!("账号      : {who}");
-    }
-    println!("未读总数  : {} 封", batch.total_unseen);
-    println!("本次判定  : {} 封", batch.items.len());
-    if batch.skipped > 0 {
-        println!("取不到    : {} 封", batch.skipped);
-    }
-    println!();
-
-    if batch.items.is_empty() {
-        println!("（没有未读，不打扰你）");
-        return Ok(0);
-    }
-
-    // 判定策略从数据目录读。**文件不存在用默认值**（第一次跑是正常的），
+    // 策略从数据目录读。**文件不存在用默认值**（第一次跑是正常的），
     // 但读到了却解析不了就报错——静默用默认值会让使用者以为自己写的规则生效了。
-    let triage_policy = match yunxi_bot_core::triage::load_policy(&default_home()) {
+    let triage_policy = match load_policy(&default_home()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("策略文件有问题: {e}");
             return Ok(2);
         }
     };
-    if !triage_policy.allow_senders.is_empty() || !triage_policy.block_senders.is_empty() {
-        println!(
-            "策略      : 白名单 {} 条 · 黑名单 {} 条（{}）",
-            triage_policy.allow_senders.len(),
-            triage_policy.block_senders.len(),
-            default_home()
-                .join(yunxi_bot_core::triage::POLICY_FILE)
-                .display()
-        );
-    }
-    let companion = CompanionPolicy::default();
-    let ctx = Situation {
-        relationship_stage: "初期".into(),
-        minutes_since_last_interaction: 999,
-        ..Default::default()
-    };
-    use chrono::Timelike;
-    let hour = chrono::Local::now().hour() as u8;
-
-    // 判定引擎：优先本地 Verdict。连不上就是降级——而降级方向是不打扰，
-    // 所以"决策模型没起来"不会导致乱通知。
-    let (_, decider, _) = open_decider(args);
-    let mut engine = yunxi_bot_core::companion::companion_engine(decider);
 
     let notifier: Box<dyn Notifier> = if no_notify {
         Box::new(yunxi_bot_core::notify::NullNotifier)
@@ -1814,129 +2046,90 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         }
     };
 
-    // 从台账里取出"已经真的通知过你的"。**这是"同一类不该反复问"的落点。**
-    let seen = yunxi_bot_core::feedback::seen(ledger.events());
-    let mut notified = 0usize;
-    let mut held = 0usize;
-    let mut silent = 0usize;
-    let mut skipped_seen = 0usize;
+    // 判定引擎：优先本地 Verdict。连不上就是降级——而降级方向是不打扰，
+    // 所以"决策模型没起来"不会导致乱通知。
+    let (_, decider, _) = open_decider(args);
+    let mut engine = companion_engine(decider);
 
-    for it in &batch.items {
-        // **已经真的通知过你的，不再判第二次。**
-        //
-        // 没有这一句时，`check` 每跑一轮就把所有未读重判一遍——
-        // 一封已经通知过的邮件会在下一轮再被通知一次。那不是"判定不准"，
-        // 是**没有记忆**。
-        //
-        // 判定成 Hold 的不在此列：攒着的意思就是"以后再说"，
-        // 把它们也跳过会让攒着的东西永远不再被提及。
-        if yunxi_bot_core::feedback::already_seen(&seen, it) {
-            skipped_seen += 1;
+    let now = now_millis()?;
+    use chrono::Timelike;
+    let mut input = PassInput {
+        source: &src,
+        engine: &mut engine,
+        notifier: notifier.as_ref(),
+        policy: triage_policy,
+        companion: CompanionPolicy::default(),
+        ctx: Situation {
+            relationship_stage: "初期".into(),
+            // 命令行是使用者主动问的，不该被"距上次互动"挡住
+            minutes_since_last_interaction: 999,
+            ..Default::default()
+        },
+        local_hour: chrono::Local::now().hour() as u8,
+        now_ms: now,
+        limit,
+        dry_run,
+    };
+
+    let mut ledger = Ledger::open(ledger_path())?;
+    let r = match run_pass(&mut ledger, &mut input) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("取信息失败: {e}");
+            return Ok(1);
+        }
+    };
+
+    println!("信息源    : {}", src.name());
+    if let Some(who) = src.describe() {
+        println!("账号      : {who}");
+    }
+    if !input.policy.allow_senders.is_empty() || !input.policy.block_senders.is_empty() {
+        println!(
+            "策略      : 白名单 {} 条 · 黑名单 {} 条（{}）",
+            input.policy.allow_senders.len(),
+            input.policy.block_senders.len(),
+            default_home()
+                .join(yunxi_bot_core::triage::POLICY_FILE)
+                .display()
+        );
+    }
+    println!("未读总数  : {} 封", r.total_unseen);
+    println!("本次判定  : {} 封", r.fetched);
+    if r.skipped > 0 {
+        println!("取不到    : {} 封（这些没被看到）", r.skipped);
+    }
+    println!();
+
+    // **逐条回放这一轮的判定**，让使用者能核对每一项决定。
+    // 从台账读回来而不是在内存里传：这样回放的就是**真正记下来的东西**，
+    // 不是"我以为记下来的东西"。
+    let start_seq = ledger.events().len() as u64;
+    for ev in ledger.events() {
+        if ev.kind != yunxi_bot_core::EventKind::InfoTriaged {
             continue;
         }
-
-        let d = triage_item(&mut engine, it, &triage_policy, &companion, &ctx, hour, now);
-
-        // **每条判定都落台账，包括"决定不通知"的那些。**
-        ledger.append(
-            EventKind::InfoTriaged,
-            None,
-            serde_json::json!({
-                "source": it.source,
-                "id": it.id,
-                "from": it.from_addr,
-                "subject": it.subject,
-                "action": format!("{:?}", d.action),
-                "rule": d.rule,
-                "reason": d.reason,
-                "used_model": d.used_model,
-                "degraded": d.degraded,
-                "constrained": d.constrained,
-                "at_ms": now,
-            }),
-        )?;
-
-        let mark = match d.action {
-            yunxi_bot_core::companion::Intervention::Speak => "通知",
-            yunxi_bot_core::companion::Intervention::Hold => "攒着",
-            yunxi_bot_core::companion::Intervention::Quiet => "不提",
+        let mark = match ev.data["action"].as_str().unwrap_or("") {
+            "Speak" => "通知",
+            "Hold" => "攒着",
+            _ => "不提",
         };
         println!(
             "[{mark}] {:<22} {}",
-            truncate_chars(it.display_from(), 20),
-            truncate_chars(it.display_subject(), 36)
+            truncate_chars(ev.data["from"].as_str().unwrap_or(""), 20),
+            truncate_chars(ev.data["subject"].as_str().unwrap_or(""), 36)
         );
-        println!("        {}", d.reason);
-
-        if !d.should_notify() {
-            match d.action {
-                yunxi_bot_core::companion::Intervention::Hold => held += 1,
-                _ => silent += 1,
-            }
-            continue;
-        }
-
-        // 验证码这类是有时效的，值得标成紧急；其余一律普通。
-        // **不滥用"紧急"**——一个总在喊紧急的助理会被很快学会忽略。
-        let urgency = if d.rule == Some(yunxi_bot_core::triage::rules::VERIFICATION_CODE) {
-            Urgency::High
-        } else {
-            Urgency::Normal
-        };
-
-        let n = Notification::new(it.display_from(), it.display_subject())
-            .with_tag(format!("mail.{}", it.id))
-            .with_urgency(urgency);
-
-        let delivery = if dry_run {
-            yunxi_bot_core::notify::Delivery::Blocked {
-                reason: "演练模式：没有真的发通知".to_string(),
-            }
-        } else {
-            notifier.notify(&n)
-        };
-
-        ledger.append(
-            EventKind::NoticeSent,
-            None,
-            serde_json::json!({
-                "channel": notifier.name(),
-                "source": it.source,
-                "id": it.id,
-                // **结构化字段要和渲染好的 title/body 一起记。**
-                //
-                // 只记 title/body 是不够的：`feedback --last` 要从这条记录里
-                // 推出"拉黑谁"，而 title/body 是给通知用的展示串，
-                // 格式随时可能变。规则必须建在结构化字段上——
-                // 这个坑是端到端测试抓到的（`from` 读出来是空的，
-                // 于是"以后别烦我"报"这条信息没有发件人地址"）。
-                "from": it.from_addr,
-                "from_name": it.from_name,
-                "subject": it.subject,
-                "title": n.title,
-                "body": n.body,
-                "result": delivery.label(),
-                "detail": delivery.detail(),
-                // **"能不能说通知你了"单独记一位。**
-                // 事后统计"通知了多少"时，只有这一位为真的才算数。
-                "confirmed": delivery.can_claim_user_notified(),
-                "dry_run": dry_run,
-                "at_ms": now,
-            }),
-        )?;
-        println!(
-            "        → 通知：{}（{}）",
-            delivery.label(),
-            delivery.detail()
-        );
-        notified += 1;
+        println!("        {}", ev.data["reason"].as_str().unwrap_or(""));
     }
+    let _ = start_seq;
 
     println!();
-    println!("通知 {notified} 条 · 攒着 {held} 条 · 不提 {silent} 条");
-    if skipped_seen > 0 {
-        // **说清"没重判"这件事**，否则使用者会以为漏了
-        println!("已经告诉过你 {skipped_seen} 条（不重复打扰）");
+    println!(
+        "通知 {} 条 · 攒着 {} 条 · 不提 {} 条",
+        r.notified, r.held, r.silent
+    );
+    if r.already_seen > 0 {
+        println!("已经告诉过你 {} 条（不重复打扰）", r.already_seen);
     }
     println!("台账: {}", ledger_path().display());
     if dry_run {
@@ -1944,13 +2137,6 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     }
     Ok(0)
 }
-
-/// 看未读邮件。**只读**——不会把你的邮件标成已读。
-///
-/// 这个命令存在的理由和 `notify` 一样：使用者需要能**自己确认**助理看到了什么。
-/// 一个说"我帮你处理邮件了"的助理，你得有办法核实它到底看到了哪些。
-///
-/// 它也是"信息源"这一层的验证入口——三种失败会被明确分开报：
 /// sidecar 没起来 / 起来了但没配邮箱 / 配好了但取不到。
 /// 第三种会转述 sidecar 的原话（比如"QQ 用的是授权码不是登录密码"）。
 fn cmd_mail(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
