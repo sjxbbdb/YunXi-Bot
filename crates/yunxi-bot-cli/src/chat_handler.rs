@@ -350,6 +350,17 @@ impl ChatHandler {
         );
     }
 
+    /// 对话稳定前缀的指纹。
+    ///
+    /// **它是"前缀没变"的机器可读表示。** 报出来之后，使用者
+    /// （和测试）不用花一次模型调用来验证跨启动的一致性。
+    pub fn chat_prefix_fingerprint(&self) -> u64 {
+        // 和 `PromptLayout::fingerprint` 用同一套算法——不然两个数字
+        // 对不上，而那种对不上会被误读成"前缀变了"
+        let l = yunxi_bot_core::think::prompt::PromptLayout::new(self.chat_prefix.clone());
+        l.fingerprint()
+    }
+
     /// 启动时加载到的项目规则。
     pub fn project_rules(&self) -> &yunxi_bot_core::rules::RuleSet {
         &self.project_rules
@@ -620,19 +631,41 @@ where
 {
     let mut rounds = 0u32;
     loop {
-        match call() {
-            Err(ThinkError::LocalThrottle { wait }) if rounds < MAX_THROTTLE_ROUNDS => {
-                let wait = wait.min(MAX_THROTTLE_WAIT);
-                if wait.is_zero() {
-                    // 等一下也没用，别空转
-                    return Err(ThinkError::LocalThrottle { wait });
-                }
-                on_wait(wait);
-                std::thread::sleep(wait);
-                rounds += 1;
-            }
-            other => return other,
+        let err = match call() {
+            Ok(r) => return Ok(r),
+            Err(e) => e,
+        };
+        if rounds >= MAX_THROTTLE_ROUNDS || !err.is_retryable() {
+            return Err(err);
         }
+        let wait = match &err {
+            // 本地限流器说等多久就等多久
+            ThinkError::LocalThrottle { wait } => *wait,
+            // **服务端 429 也要等。**
+            //
+            // 这是 D17 那条教训第三次以新面孔出现：本地限流等，
+            // 服务端的 429 却直接判失败——而两者是同一件事。
+            // 表现是连着跑几个脚本就开始"这一轮失败了"，
+            // 看起来像产品坏了，其实只是需要等几秒。
+            //
+            // 服务端给了 `Retry-After` 就听它的；没给就按轮次退避。
+            ThinkError::RateLimited { retry_after, .. } => retry_after
+                .unwrap_or_else(|| std::time::Duration::from_millis(1500 * (rounds as u64 + 1))),
+            // 网络抖动和服务端 5xx：短退避
+            ThinkError::Transient { .. } | ThinkError::Network(_) => {
+                std::time::Duration::from_millis(800 * (rounds as u64 + 1))
+            }
+            // `is_retryable` 说不会走到这里
+            _ => return Err(err),
+        };
+        let wait = wait.min(MAX_THROTTLE_WAIT);
+        if wait.is_zero() {
+            // 等一下也没用，别空转
+            return Err(err);
+        }
+        on_wait(wait);
+        std::thread::sleep(wait);
+        rounds += 1;
     }
 }
 
@@ -830,6 +863,30 @@ mod chat_session_tests {
     }
 
     #[test]
+    fn the_prefix_fingerprint_is_available_without_a_model_call() {
+        // **确定性断言不该挂在概率性的东西上。**
+        //
+        // 端到端一开始是读会话文件里的指纹——而那个文件只在
+        // "有过成功的一轮"之后才写。模型一失败（限流、超时），
+        // 指纹就是 None，被误报成"前缀不一致"。
+        //
+        // 所以指纹要能不花一次模型调用就拿到。
+        let h = handler();
+        let a = h.chat_prefix_fingerprint();
+        let b = h.chat_prefix_fingerprint();
+        assert_eq!(a, b, "同一次进程里两次算出来必须一样");
+    }
+
+    #[test]
+    fn the_reported_fingerprint_matches_what_a_session_would_record() {
+        // **两个数字对不上会被误读成"前缀变了"。**
+        // 上报的指纹和 `PromptLayout` 落盘的那个必须是同一套算法。
+        let h = handler();
+        let layout = PromptLayout::new(h.expected_chat_prefix());
+        assert_eq!(h.chat_prefix_fingerprint(), layout.fingerprint());
+    }
+
+    #[test]
     fn the_chat_prefix_is_stable_across_calls() {
         // **这是缓存命中的前提。** 前缀一变，缓存全废——
         // 而那种失效是静默的，只表现为账单变贵。
@@ -979,6 +1036,104 @@ mod tests {
     /// 真实运行里 Agnes 免费档 10 RPM，一个任务连着几步必然撞限流。
     /// 第一版把它当普通错误抛上去，引擎就把它算成"步骤失败"、消耗重试次数，
     /// 最后一步都跑不完——而实际上只需要等几秒。
+    /// 一个成功的假响应。测试不该需要网络。
+    fn ok_response() -> ThinkResponse {
+        ThinkResponse {
+            content: "好了".into(),
+            model: "m".into(),
+            usage: Default::default(),
+            finish_reason: None,
+            reasoning: None,
+            thinking: yunxi_bot_core::think::Thinking::Disabled,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_server_side_429_is_retried_not_failed() {
+        // **这是 D17 那条教训第三次以新面孔出现。**
+        //
+        // 本地限流等得好好的，服务端的 429 却直接判失败——
+        // 而两者是同一件事。表现是连着跑几个脚本就开始"这一轮失败了"，
+        // 看起来像产品坏了，其实只是需要等几秒。
+        let mut calls = 0;
+        let r = retry_throttled(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(ThinkError::RateLimited {
+                        retry_after: Some(Duration::from_millis(1)),
+                        detail: String::new(),
+                    })
+                } else {
+                    Ok(ok_response())
+                }
+            },
+            |_| {},
+        );
+        assert!(r.is_ok(), "429 该被等过去: {r:?}");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn a_429_without_retry_after_still_backs_off() {
+        // 服务端没给 `Retry-After` 时不能立刻重发——那只会再撞一次
+        let mut waits = Vec::new();
+        let mut calls = 0;
+        let _ = retry_throttled(
+            || {
+                calls += 1;
+                if calls < 2 {
+                    Err(ThinkError::RateLimited {
+                        retry_after: None,
+                        detail: String::new(),
+                    })
+                } else {
+                    Err(ThinkError::Auth("停".into()))
+                }
+            },
+            |w| waits.push(w),
+        );
+        assert_eq!(waits.len(), 1, "该等一次");
+        assert!(!waits[0].is_zero(), "退避不能是 0");
+    }
+
+    #[test]
+    fn a_non_retryable_error_is_not_retried() {
+        // **重试认证错误只是浪费时间和配额。**
+        let mut calls = 0;
+        let r = retry_throttled(
+            || {
+                calls += 1;
+                Err::<ThinkResponse, _>(ThinkError::Auth("密钥不对".into()))
+            },
+            |_| {},
+        );
+        assert!(r.is_err());
+        assert_eq!(calls, 1, "不该重试");
+    }
+
+    #[test]
+    fn transient_errors_are_retried() {
+        let mut calls = 0;
+        let r = retry_throttled(
+            || {
+                calls += 1;
+                if calls < 2 {
+                    Err(ThinkError::Transient {
+                        status: Some(503),
+                        detail: String::new(),
+                    })
+                } else {
+                    Ok(ok_response())
+                }
+            },
+            |_| {},
+        );
+        assert!(r.is_ok(), "5xx 该被等过去");
+        assert_eq!(calls, 2);
+    }
+
     #[test]
     fn local_throttle_is_waited_out_not_failed() {
         let mut calls = 0;

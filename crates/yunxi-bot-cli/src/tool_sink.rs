@@ -95,6 +95,15 @@ impl LedgerToolSink {
         serde_json::json!({
             "tool": call.tool,
             "capability": format!("{:?}", call.capability),
+            // **时序也记下来。**
+            //
+            // 一是让"并行"可证：两个调用的
+            // `[started, started+duration]` 区间重叠就是并行最直接的证据
+            // ——本地文件读得太快，光看总耗时看不出痕迹。
+            //
+            // 二是能看到哪个工具慢。而"慢"往往正是模型反复调它的原因。
+            "started_at_ms": call.started_at_ms,
+            "duration_ms": call.duration_ms,
             "arguments": args_text,
             // **"我截断了"必须能看出来。** 不写这一位，读台账的人
             // 会以为那就是参数的全部。
@@ -211,6 +220,8 @@ mod tests {
             capability: Capability::Write,
             decision,
             output,
+            started_at_ms: 0,
+            duration_ms: 0,
         }
     }
 

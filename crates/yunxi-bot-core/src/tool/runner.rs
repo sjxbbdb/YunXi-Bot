@@ -41,8 +41,12 @@ use crate::decide::Decider;
 use crate::think::prompt::PromptLayout;
 use crate::think::{Message, ThinkError, ThinkRequest, Thinker};
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
 use super::{
-    Capability, GateDecision, Rule, ToolContext, ToolError, ToolPolicy, ToolRegistry, gate,
+    Capability, GateDecision, Rule, Tool, ToolContext, ToolError, ToolOutput, ToolPolicy,
+    ToolRegistry, gate,
 };
 
 /// 审批请求。给前端（CLI / 守护进程 / 未来的语音或微信）看的东西。
@@ -97,6 +101,18 @@ pub struct ToolCallRecord {
     pub decision: GateDecision,
     /// 执行结果。`None` 表示没执行（被拒绝 / 需人工但没人应答）。
     pub output: Option<Result<String, ToolError>>,
+    /// 开始执行的时刻（Unix 毫秒）。没执行时为 0。
+    ///
+    /// **加这个是因为"并行"需要可证。** 本地文件读得太快，
+    /// 光看总耗时看不出并行的痕迹；而两个调用的
+    /// `[started, started+duration]` 区间重叠，就是并行最直接的证据。
+    ///
+    /// 顺带的好处：能看到哪个工具慢。
+    #[serde(default)]
+    pub started_at_ms: u64,
+    /// 执行耗时（毫秒）。没执行时为 0。
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 impl ToolCallRecord {
@@ -188,6 +204,53 @@ pub struct ToolRunner<'a> {
     sink: Option<std::sync::Arc<dyn ToolCallSink>>,
     /// 一轮对话最多几次工具往返。
     pub max_rounds: u32,
+}
+
+/// 一次工具调用的**判定结果**。
+///
+/// ## 为什么要把判定和执行拆开
+///
+/// 判定阶段（门禁 + 问人）**必须串行**：
+///
+/// - 审批者是一个 `&mut`，同时问它没有意义
+/// - 更重要的是那是人的现实——**同时弹三个审批框，使用者根本不知道
+///   自己在批哪一条**
+///
+/// 执行阶段才可以并行，而且只有只读的可以（见 [`Decided::parallelizable`]）。
+enum Decided<'a> {
+    /// 已经有结论，不用执行（工具不存在、被拒绝、没人应答）。
+    Settled(ToolCallRecord),
+    /// 批准了，待执行。
+    Run {
+        tool: &'a dyn Tool,
+        call: ParsedCall,
+        capability: Capability,
+        reason: String,
+    },
+}
+
+impl Decided<'_> {
+    /// 这个调用能不能和旁边的调用**同时**跑。
+    ///
+    /// ## 只并行只读，理由有三条
+    ///
+    /// 1. **并行写同一个文件是灾难。** 两个 `write_file` 同时改一个文件，
+    ///    结果取决于调度——而那种不确定性事后完全无法复现。
+    /// 2. **有副作用的调用之间有隐式依赖。** 模型可能在一次里既建目录又写文件，
+    ///    并行就会让写文件先跑而失败。
+    /// 3. **`Network` 也不并行**：搜索和抓取有各自的限流，并发打过去只会
+    ///    更快撞上配额——这和任务层"限流器是共享状态"是同一条理由。
+    ///
+    /// 只读没有这些问题：它们不改变任何状态，跑多少次、什么顺序都不影响结果。
+    fn parallelizable(&self) -> bool {
+        matches!(
+            self,
+            Decided::Run {
+                capability: Capability::ReadOnly,
+                ..
+            }
+        )
+    }
 }
 
 /// 默认轮数上限。
@@ -294,8 +357,14 @@ impl<'a> ToolRunner<'a> {
             // 助手请求调工具的那条消息必须**原样**进历史：字段少一个服务端就报 400
             layout.push_raw(Message::assistant_tool_calls(resp.tool_calls.clone()));
 
-            for tr in reqs {
-                let record = self.execute_one(&tr);
+            // **先全部判定（串行），再批量执行（只读的并行）。**
+            //
+            // 判定必须串行：审批是 `&mut`，而且同时弹三个审批框
+            // 使用者根本不知道自己在批哪一条。
+            let decided: Vec<Decided<'a>> = reqs.iter().map(|tr| self.decide_one(tr)).collect();
+            let records = self.execute_batch(decided);
+
+            for (tr, record) in reqs.into_iter().zip(records) {
                 // **每一次调用都交给 sink。**
                 //
                 // 放在回灌模型之前、放进 `calls` 之前——因为那两步之后
@@ -322,11 +391,21 @@ impl<'a> ToolRunner<'a> {
         })
     }
 
-    /// 执行一次工具调用：解析 → 门禁 → 审批 → 执行。
-    fn execute_one(&mut self, tr: &ParsedCall) -> ToolCallRecord {
+    /// 判定一次调用：解析 → 门禁 → 审批。**不执行。**
+    ///
+    /// ## 为什么判定和执行要分开
+    ///
+    /// 判定阶段（门禁 + 问人）**必须串行**：
+    ///
+    /// - 审批者是一个 `&mut`，同时问它没有意义
+    /// - 更重要的是那是人的现实——**同时弹三个审批框，使用者根本不知道
+    ///   自己在批哪一条**
+    ///
+    /// 执行阶段才可以并行，而且只有只读的可以（见 [`Decided::parallelizable`]）。
+    fn decide_one(&mut self, tr: &ParsedCall) -> Decided<'a> {
         let Some(tool) = self.registry.get(&tr.name) else {
             // 模型编了一个不存在的工具。这不是异常，报回去让它改。
-            return ToolCallRecord {
+            return Decided::Settled(ToolCallRecord {
                 tool: tr.name.clone(),
                 arguments: tr.arguments.clone(),
                 capability: Capability::ReadOnly,
@@ -334,31 +413,31 @@ impl<'a> ToolRunner<'a> {
                     reason: format!("没有这个工具: {}", tr.name),
                 },
                 output: None,
-            };
+                started_at_ms: 0,
+                duration_ms: 0,
+            });
         };
 
         let cap = tool.capability();
         let spec = tool.specifier(&tr.arguments, &self.ctx);
         let decision = gate(tool, &tr.arguments, &self.policy, &self.ctx, self.decider);
 
-        match &decision {
-            GateDecision::Deny { .. } => ToolCallRecord {
+        match decision {
+            GateDecision::Deny { .. } => Decided::Settled(ToolCallRecord {
                 tool: tr.name.clone(),
                 arguments: tr.arguments.clone(),
                 capability: cap,
                 decision,
                 output: None,
+                started_at_ms: 0,
+                duration_ms: 0,
+            }),
+            GateDecision::Allow { reason } => Decided::Run {
+                tool,
+                call: tr.clone(),
+                capability: cap,
+                reason,
             },
-            GateDecision::Allow { .. } => {
-                let out = tool.call(&tr.arguments, &mut self.ctx);
-                ToolCallRecord {
-                    tool: tr.name.clone(),
-                    arguments: tr.arguments.clone(),
-                    capability: cap,
-                    decision,
-                    output: Some(out.map(|o| o.text)),
-                }
-            }
             GateDecision::Ask { reason } => {
                 // 参数原文要给人看：不看参数就批准等于没批准
                 let args_head: String = tr.arguments.to_string().chars().take(800).collect();
@@ -370,7 +449,7 @@ impl<'a> ToolRunner<'a> {
                     reason: reason.clone(),
                 };
                 match self.approver.approve(&req) {
-                    Approval::Deny => ToolCallRecord {
+                    Approval::Deny => Decided::Settled(ToolCallRecord {
                         tool: tr.name.clone(),
                         arguments: tr.arguments.clone(),
                         capability: cap,
@@ -382,25 +461,157 @@ impl<'a> ToolRunner<'a> {
                             reason: format!("人工拒绝：{reason}"),
                         },
                         output: None,
-                    },
+                        started_at_ms: 0,
+                        duration_ms: 0,
+                    }),
                     verdict => {
                         if verdict == Approval::Always {
                             self.record_always(&tr.name, spec.as_deref(), cap);
                         }
-                        let out = tool.call(&tr.arguments, &mut self.ctx);
-                        ToolCallRecord {
-                            tool: tr.name.clone(),
-                            arguments: tr.arguments.clone(),
+                        Decided::Run {
+                            tool,
+                            call: tr.clone(),
                             capability: cap,
-                            decision: GateDecision::Allow {
-                                reason: format!("人工批准（{reason}）"),
-                            },
-                            output: Some(out.map(|o| o.text)),
+                            reason: format!("人工批准（{reason}）"),
                         }
                     }
                 }
             }
         }
+    }
+
+    /// 执行一次已经判定过的调用（串行路径）。
+    fn finish_one(&mut self, d: Decided<'a>) -> ToolCallRecord {
+        match d {
+            Decided::Settled(r) => r,
+            Decided::Run {
+                tool,
+                call,
+                capability,
+                reason,
+            } => {
+                let started = crate::now_millis().unwrap_or(0);
+                let out = tool.call(&call.arguments, &mut self.ctx);
+                let duration = crate::now_millis()
+                    .unwrap_or(started)
+                    .saturating_sub(started);
+                ToolCallRecord {
+                    tool: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    capability,
+                    decision: GateDecision::Allow { reason },
+                    output: Some(out.map(|o| o.text)),
+                    started_at_ms: started,
+                    duration_ms: duration,
+                }
+            }
+        }
+    }
+
+    /// 按批执行：**连续的只读调用并行，其余串行。**
+    ///
+    /// 顺序不能乱——工具结果要按模型请求的顺序回灌，否则它会以为
+    /// 结果和调用对不上。
+    fn execute_batch(&mut self, decided: Vec<Decided<'a>>) -> Vec<ToolCallRecord> {
+        let mut out = Vec::with_capacity(decided.len());
+        let mut iter = decided.into_iter().peekable();
+        while let Some(d) = iter.next() {
+            if !d.parallelizable() {
+                out.push(self.finish_one(d));
+                continue;
+            }
+            // 起一段连续的只读调用
+            let mut batch = vec![d];
+            while iter.peek().is_some_and(Decided::parallelizable) {
+                batch.push(iter.next().expect("peek 说过有"));
+            }
+            if batch.len() >= 2 {
+                out.extend(self.run_parallel(batch));
+            } else {
+                // 只有一个——并行没有收益，还要多付线程开销
+                for one in batch {
+                    out.push(self.finish_one(one));
+                }
+            }
+        }
+        out
+    }
+
+    /// 一段只读调用并行跑。
+    ///
+    /// 用 `std::thread::scope` 而不是 spawn 出去 join：
+    /// **作用域线程能借用栈上的东西**，而 spawn 要求 `'static`——
+    /// 那会逼着把工具和参数都拷一遍。
+    fn run_parallel(&mut self, batch: Vec<Decided<'a>>) -> Vec<ToolCallRecord> {
+        let base = self.ctx.clone();
+        type ParallelResult = (Result<ToolOutput, ToolError>, BTreeSet<PathBuf>, u64, u64);
+        let results: Vec<ParallelResult> = std::thread::scope(|s| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|d| {
+                    let Decided::Run { tool, call, .. } = d else {
+                        // `parallelizable` 保证了这里只可能是 Run
+                        unreachable!("只读批次里不该有已定案项")
+                    };
+                    // **每个线程一份自己的 ctx。** 共享一个 `&mut` 就没法并行了；
+                    // 跑完把 `read_files` 并回来，"先读后写"仍然成立。
+                    let mut ctx = base.clone();
+                    s.spawn(move || {
+                        // **在每个线程里各量各的开始时刻。**
+                        // 在外面量只能得到一个总区间，而"谁和谁重叠"
+                        // 正是要证明的东西。
+                        let started = crate::now_millis().unwrap_or(0);
+                        let out = tool.call(&call.arguments, &mut ctx);
+                        let dur = crate::now_millis()
+                            .unwrap_or(started)
+                            .saturating_sub(started);
+                        (out, ctx.read_files, started, dur)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| match h.join() {
+                    Ok(v) => v,
+                    // 工具实现 panic 了：**不能把整个循环带走**——
+                    // 那会让一次坏工具杀掉整场对话。
+                    Err(_) => (
+                        Err(ToolError::Failed {
+                            detail: "工具执行时 panic 了".to_string(),
+                        }),
+                        BTreeSet::new(),
+                        0,
+                        0,
+                    ),
+                })
+                .collect()
+        });
+
+        let mut out = Vec::with_capacity(batch.len());
+        for (d, (result, read, started, duration)) in batch.into_iter().zip(results) {
+            let Decided::Run {
+                call,
+                capability,
+                reason,
+                ..
+            } = d
+            else {
+                unreachable!("只读批次里不该有已定案项")
+            };
+            // 把并行读到的文件并回主 ctx —— "先读后写"这条规则
+            // 不能因为走了并行路径就失效
+            self.ctx.read_files.extend(read);
+            out.push(ToolCallRecord {
+                tool: call.name.clone(),
+                arguments: call.arguments.clone(),
+                capability,
+                decision: GateDecision::Allow { reason },
+                output: Some(result.map(|o| o.text)),
+                started_at_ms: started,
+                duration_ms: duration,
+            });
+        }
+        out
     }
 
     /// 记住"总是允许"。
@@ -491,6 +702,395 @@ pub fn render_tool_result(rec: &ToolCallRecord) -> String {
                 format!("工具 {} 未产生输出", rec.tool)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use crate::policy::SandboxMode;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// 一个**只读**工具：记下同时在跑的峰值，并睡一会儿。
+    struct SlowRead {
+        name: &'static str,
+        concurrent: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        sleep_ms: u64,
+    }
+
+    impl Tool for SlowRead {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "慢速只读工具"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn capability(&self) -> Capability {
+            Capability::ReadOnly
+        }
+        fn call(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &mut ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            let now = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(self.sleep_ms));
+            self.concurrent.fetch_sub(1, Ordering::SeqCst);
+            Ok(ToolOutput::read(format!("{} 读完", self.name)))
+        }
+    }
+
+    /// 一个**有副作用**的工具：同样统计并发峰值。
+    struct SlowWrite {
+        concurrent: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        sleep_ms: u64,
+    }
+
+    impl Tool for SlowWrite {
+        fn name(&self) -> &str {
+            "slow_write"
+        }
+        fn description(&self) -> &str {
+            "慢速写入工具"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn capability(&self) -> Capability {
+            Capability::Write
+        }
+        fn call(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &mut ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            let now = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(self.sleep_ms));
+            self.concurrent.fetch_sub(1, Ordering::SeqCst);
+            Ok(ToolOutput::changed("写完了"))
+        }
+    }
+
+    /// 给纯判定测试用的占位工具。
+    struct StubTool;
+    impl Tool for StubTool {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn description(&self) -> &str {
+            "占位"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn capability(&self) -> Capability {
+            Capability::ReadOnly
+        }
+        fn call(
+            &self,
+            _a: &serde_json::Value,
+            _c: &mut ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::read(""))
+        }
+    }
+
+    struct AlwaysAllow;
+    impl Approver for AlwaysAllow {
+        fn approve(&mut self, _req: &ApprovalRequest) -> Approval {
+            Approval::Once
+        }
+    }
+
+    fn ctx() -> ToolContext {
+        ToolContext::new(std::env::temp_dir(), SandboxMode::WorkspaceWrite)
+    }
+
+    fn pcall(name: &str) -> ParsedCall {
+        ParsedCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: json!({}),
+        }
+    }
+
+    fn open_policy() -> ToolPolicy {
+        let mut p = ToolPolicy::default();
+        p.allow.push(Rule {
+            tool: "*".into(),
+            specifier: None,
+        });
+        p
+    }
+
+    // ---- 不变量：只有只读能并行 ----
+
+    #[test]
+    fn only_read_only_calls_are_parallelizable() {
+        // **这是整个特性的核心不变量。**
+        let stub = StubTool;
+        for cap in [
+            Capability::Write,
+            Capability::Execute,
+            Capability::Network,
+            Capability::Outbound,
+            Capability::Unknown,
+        ] {
+            let d = Decided::Run {
+                tool: &stub,
+                call: pcall("x"),
+                capability: cap,
+                reason: String::new(),
+            };
+            assert!(!d.parallelizable(), "{cap:?} 不该被并行");
+        }
+        let ok = Decided::Run {
+            tool: &stub,
+            call: pcall("x"),
+            capability: Capability::ReadOnly,
+            reason: String::new(),
+        };
+        assert!(ok.parallelizable());
+    }
+
+    #[test]
+    fn a_settled_decision_is_not_parallelizable() {
+        let d = Decided::Settled(ToolCallRecord {
+            tool: "x".into(),
+            arguments: json!({}),
+            capability: Capability::ReadOnly,
+            decision: GateDecision::Deny {
+                reason: "拒绝".into(),
+            },
+            output: None,
+            started_at_ms: 0,
+            duration_ms: 0,
+        });
+        assert!(!d.parallelizable());
+    }
+
+    // ---- 真并行 ----
+
+    #[test]
+    fn three_read_only_calls_actually_run_concurrently() {
+        // **耗时证据 + 并发峰值证据。** 只看总耗时会"调度恰好快"就误判，
+        // 所以两边都要看。
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        for n in ["r1", "r2", "r3"] {
+            reg.register(Arc::new(SlowRead {
+                name: n,
+                concurrent: concurrent.clone(),
+                peak: peak.clone(),
+                sleep_ms: 300,
+            }))
+            .unwrap();
+        }
+        let mut approver = AlwaysAllow;
+        let mut runner = ToolRunner::new(&reg, open_policy(), &mut approver, ctx());
+
+        let decided: Vec<Decided> = ["r1", "r2", "r3"]
+            .iter()
+            .map(|n| Decided::Run {
+                tool: reg.get(n).unwrap(),
+                call: pcall(n),
+                capability: Capability::ReadOnly,
+                reason: String::new(),
+            })
+            .collect();
+
+        let started = Instant::now();
+        let out = runner.execute_batch(decided);
+        let elapsed = started.elapsed();
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            3,
+            "三个只读没有同时跑——峰值并发 {}",
+            peak.load(Ordering::SeqCst)
+        );
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "耗时 {elapsed:?}，看起来还是串行的（串行要 900ms）"
+        );
+    }
+
+    #[test]
+    fn write_calls_never_run_concurrently() {
+        // **并行写同一个文件是灾难。** 结果取决于调度，
+        // 而那种不确定性事后完全无法复现。
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(SlowWrite {
+            concurrent: concurrent.clone(),
+            peak: peak.clone(),
+            sleep_ms: 50,
+        }))
+        .unwrap();
+        let mut approver = AlwaysAllow;
+        let mut runner = ToolRunner::new(&reg, open_policy(), &mut approver, ctx());
+
+        let decided: Vec<Decided> = (0..3)
+            .map(|_| Decided::Run {
+                tool: reg.get("slow_write").unwrap(),
+                call: pcall("slow_write"),
+                capability: Capability::Write,
+                reason: String::new(),
+            })
+            .collect();
+        let out = runner.execute_batch(decided);
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "写入并发跑了——峰值 {}",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn a_mixed_batch_keeps_order() {
+        // 顺序不能乱：工具结果要按模型请求的顺序回灌，
+        // 否则它会以为结果和调用对不上
+        let conc = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        for n in ["r1", "r2"] {
+            reg.register(Arc::new(SlowRead {
+                name: n,
+                concurrent: conc.clone(),
+                peak: peak.clone(),
+                sleep_ms: 30,
+            }))
+            .unwrap();
+        }
+        reg.register(Arc::new(SlowWrite {
+            concurrent: conc.clone(),
+            peak: peak.clone(),
+            sleep_ms: 30,
+        }))
+        .unwrap();
+        let mut approver = AlwaysAllow;
+        let mut runner = ToolRunner::new(&reg, open_policy(), &mut approver, ctx());
+
+        let seq = ["r1", "r2", "slow_write", "r1"];
+        let decided: Vec<Decided> = seq
+            .iter()
+            .map(|n| {
+                let t = reg.get(n).unwrap();
+                Decided::Run {
+                    tool: t,
+                    call: pcall(n),
+                    capability: t.capability(),
+                    reason: String::new(),
+                }
+            })
+            .collect();
+        let out = runner.execute_batch(decided);
+
+        let names: Vec<&str> = out.iter().map(|r| r.tool.as_str()).collect();
+        assert_eq!(names, seq, "结果顺序必须和请求顺序一致");
+    }
+
+    #[test]
+    fn a_lone_read_only_call_does_not_pay_thread_overhead() {
+        let conc = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(SlowRead {
+            name: "r1",
+            concurrent: conc.clone(),
+            peak: peak.clone(),
+            sleep_ms: 10,
+        }))
+        .unwrap();
+        let mut approver = AlwaysAllow;
+        let mut runner = ToolRunner::new(&reg, open_policy(), &mut approver, ctx());
+
+        let out = runner.execute_batch(vec![Decided::Run {
+            tool: reg.get("r1").unwrap(),
+            call: pcall("r1"),
+            capability: Capability::ReadOnly,
+            reason: String::new(),
+        }]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- 并行读到的文件要并回主 ctx ----
+
+    #[test]
+    fn files_read_in_parallel_are_recorded_for_read_before_write() {
+        // **"先读后写"不能因为走了并行路径就失效。**
+        //
+        // 并行时每个线程一份自己的 ctx（不然没法并行），跑完要把
+        // `read_files` 并回来——漏了的话，模型读完再改会被拒，
+        // 而报错说"还没读过"，看起来就像它没读。
+        struct ReadingTool;
+        impl Tool for ReadingTool {
+            fn name(&self) -> &str {
+                "reading"
+            }
+            fn description(&self) -> &str {
+                "读一个文件并记下来"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            fn capability(&self) -> Capability {
+                Capability::ReadOnly
+            }
+            fn call(
+                &self,
+                args: &serde_json::Value,
+                ctx: &mut ToolContext,
+            ) -> Result<ToolOutput, ToolError> {
+                let p = std::path::PathBuf::from(args["path"].as_str().unwrap_or("a"));
+                ctx.note_read(p);
+                Ok(ToolOutput::read("ok"))
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ReadingTool)).unwrap();
+        let mut approver = AlwaysAllow;
+        let mut runner = ToolRunner::new(&reg, open_policy(), &mut approver, ctx());
+
+        let decided: Vec<Decided> = ["f1", "f2", "f3"]
+            .iter()
+            .map(|p| Decided::Run {
+                tool: reg.get("reading").unwrap(),
+                call: ParsedCall {
+                    id: "c".into(),
+                    name: "reading".into(),
+                    arguments: json!({"path": p}),
+                },
+                capability: Capability::ReadOnly,
+                reason: String::new(),
+            })
+            .collect();
+        runner.execute_batch(decided);
+
+        for p in ["f1", "f2", "f3"] {
+            assert!(
+                runner.ctx.has_read(std::path::Path::new(p)),
+                "{p} 没被并回主 ctx——并行路径漏了 read_files"
+            );
+        }
     }
 }
 
@@ -1268,6 +1868,8 @@ mod tests {
             capability: Capability::Write,
             decision,
             output,
+            started_at_ms: 0,
+            duration_ms: 0,
         };
         let denied = render_tool_result(&base(
             GateDecision::Deny {
@@ -1306,6 +1908,8 @@ mod tests {
                 reason: "ok".into(),
             },
             output: Some(Ok("原始产出".into())),
+            started_at_ms: 0,
+            duration_ms: 0,
         };
         assert_eq!(render_tool_result(&rec), "原始产出");
     }
@@ -1321,6 +1925,8 @@ mod tests {
                 reason: "只读且在工作区内".into(),
             },
             output: Some(Ok("内容".into())),
+            started_at_ms: 0,
+            duration_ms: 0,
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert_eq!(v["tool"], "read_file");

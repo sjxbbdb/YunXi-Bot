@@ -194,7 +194,10 @@ impl std::fmt::Display for ToolError {
 impl std::error::Error for ToolError {}
 
 /// 工具执行上下文。
-#[derive(Debug)]
+///
+/// `Clone` 是给并行执行用的：**只读工具每个线程一份自己的 ctx**，
+/// 跑完把 `read_files` 并回来。共享一个 `&mut` 的话就没法并行了。
+#[derive(Debug, Clone)]
 pub struct ToolContext {
     /// 工作目录。只读工具在工作区内免问，出界要问——照抄 Claude Code 的规则。
     pub cwd: PathBuf,

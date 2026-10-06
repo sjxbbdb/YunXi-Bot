@@ -21,7 +21,6 @@
 """
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -100,17 +99,39 @@ def main() -> int:
         check("**答得出编造的构建命令**", SECRET_BUILD in out2,
               "靠常识猜不到，只能是读到了规则")
 
+        # 一个和 clean 有不同规则的目录，用来验"换目录前缀就变"
+        nested_preview = root / "preview"
+        (nested_preview / ".git").mkdir(parents=True)
+        (nested_preview / "AGENTS.md").write_text("- 另一套约定：用 pytest\n", encoding="utf-8")
+
         # ================= 前缀稳定 =================
         print()
         print("=== 稳定前缀跨进程一致 ===")
-        sp = home / "sessions" / "r-fp1.json"
-        chat(["说「好」", "/exit"], clean, "r-fp1")
-        fp1 = json.loads(sp.read_text(encoding="utf-8")).get("fingerprint") if sp.exists() else None
-        chat(["说「好」", "/exit"], clean, "r-fp2")
-        sp2 = home / "sessions" / "r-fp2.json"
-        fp2 = json.loads(sp2.read_text(encoding="utf-8")).get("fingerprint") if sp2.exists() else None
-        check("两次启动都拿到了指纹", fp1 is not None and fp2 is not None, f"{fp1} / {fp2}")
+
+        def fingerprint_of(cwd: Path, sid: str) -> str | None:
+            """从 `/rules` 里取指纹。
+
+            **不依赖模型调用。** 最初的写法是读会话文件里的指纹——
+            而那个文件只在"有过成功的一轮"之后才写。于是模型一失败
+            （限流、超时），指纹就是 None，而那被误报成"前缀不一致"。
+            **把确定性的断言挂在概率性的东西上，就是在制造假失败。**
+            """
+            r = chat(["/rules", "/exit"], cwd, sid)
+            text = (r.stdout or "") + (r.stderr or "")
+            for line in text.splitlines():
+                if "前缀指纹" in line:
+                    return line.split("：", 1)[-1].strip()
+            return None
+
+        fp1 = fingerprint_of(clean, "r-fp1")
+        fp2 = fingerprint_of(clean, "r-fp2")
+        check("两次都拿到了指纹", fp1 is not None and fp2 is not None, f"{fp1} / {fp2}")
         check("**同一目录前缀一致**", fp1 == fp2, "不一致的话每次启动都缓存未命中")
+
+        # 换个目录（规则不同）指纹就该不同
+        fp3 = fingerprint_of(nested_preview, "r-fp3")
+        check("**换了目录前缀就变**", fp3 is not None and fp3 != fp1,
+              "规则不同 → 前缀不同，这是对的（会换来一次缓存未命中）")
 
         # ================= 项目边界 =================
         print()
