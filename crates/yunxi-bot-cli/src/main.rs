@@ -204,6 +204,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "think" => cmd_think(rest),
         "agent" => cmd_agent(rest),
         "remember" => cmd_remember(rest),
+        "memory" => cmd_memory(rest),
         "journal" => cmd_journal(rest),
         "install-autostart" => cmd_autostart(AutostartAction::Install),
         "uninstall-autostart" => cmd_autostart(AutostartAction::Uninstall),
@@ -1715,6 +1716,105 @@ fn cmd_remember(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     println!("已记住 [{}] {}", kind.label(), text);
     println!("  编号 : {id}");
     println!("  台账 : {}", ledger.path().display());
+    Ok(0)
+}
+
+/// 看它记住了什么 / 找 / 忘。
+///
+/// ## 为什么这个命令很要紧
+///
+/// 在此之前记忆是**只写不读**的：`remember` 存得进、编号也给，
+/// 但**没有任何办法看里面有什么**——连使用者自己都看不到。
+///
+/// 一份看不见的记忆是**不可信**的：
+/// - 记错了不知道
+/// - 记重复了不知道
+/// - "它怎么不记得了"无从查起
+///
+/// 分层对不对也得靠这个命令核对（比如"这条明明是偏好，怎么归到事实了"）。
+fn cmd_memory(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::memory::Memory;
+
+    let ledger = Ledger::open(ledger_path())?;
+    let memory = Memory::from_events(ledger.events());
+    let now = yunxi_bot_core::now_millis()?;
+
+    // ---- 忘记 ----
+    if let Some(id) = flag(args, "--forget") {
+        if memory.get(id).is_none() {
+            eprintln!("没有编号为 {id} 的记忆。用 `yunxi-bot memory` 看有哪些。");
+            return Ok(2);
+        }
+        let mut ledger = Ledger::open(ledger_path())?;
+        ledger.append(
+            yunxi_bot_core::EventKind::MemoryForgotten,
+            None,
+            serde_json::json!({ "id": id }),
+        )?;
+        println!("已忘记：{id}");
+        println!("  （台账里保留了这条记录——**忘记是可追溯的**，不是抹掉）");
+        return Ok(0);
+    }
+
+    // ---- 搜索 ----
+    if let Some(needle) = flag(args, "--search") {
+        let hits = memory.search(needle);
+        if hits.is_empty() {
+            println!("没找到含「{needle}」的记忆。");
+            return Ok(0);
+        }
+        println!("含「{needle}」的记忆 {} 条：", hits.len());
+        for e in hits {
+            println!("  [{}] {}  {}", e.kind.label(), e.id, e.text);
+        }
+        return Ok(0);
+    }
+
+    // ---- 列表 ----
+    if memory.is_empty() {
+        println!("还没有任何记忆。");
+        println!("记一条：yunxi-bot remember \"使用者喜欢简洁的回答\" --kind preference");
+        return Ok(0);
+    }
+
+    let kind_filter = flag(args, "--kind");
+    let all = memory.all_sorted(now);
+    let shown: Vec<_> = all
+        .iter()
+        .filter(|e| kind_filter.is_none_or(|k| e.kind.state_key() == k))
+        .collect();
+
+    println!(
+        "共 {} 条记忆{}：",
+        memory.len(),
+        kind_filter
+            .map(|k| format!("（只显示 {k}）"))
+            .unwrap_or_default()
+    );
+    println!();
+
+    let mut last_kind = None;
+    let mut shown_count = 0usize;
+    for e in &shown {
+        if last_kind != Some(e.kind) {
+            println!("── {} ──", e.kind.label());
+            last_kind = Some(e.kind);
+        }
+        // 权重和时效都显示出来：**分数是怎么来的要看得见**，
+        // 否则"为什么这条排前面"没法核对
+        let age_days =
+            (now.saturating_sub(e.last_used_at.unwrap_or(e.created_at))) as f64 / 86_400_000.0;
+        println!(
+            "  {}  {}  权重 {:.2}  最近 {} 天前",
+            e.id, e.text, e.weight, age_days as u64
+        );
+        shown_count += 1;
+    }
+    if shown_count == 0 {
+        println!("  （这个类别下没有）");
+    }
+    println!();
+    println!("搜：yunxi-bot memory --search <词>    忘：yunxi-bot memory --forget <编号>");
     Ok(0)
 }
 

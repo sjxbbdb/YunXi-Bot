@@ -168,6 +168,43 @@ impl Memory {
         self.entries.get(id)
     }
 
+    /// 全部记忆，**按类别分组、组内按有效分数降序**。
+    ///
+    /// ## 为什么按分数排而不是按时间
+    ///
+    /// 使用者打开"它记住了什么"时想知道的是**它最看重什么**，而不是
+    /// "最近记了什么"。而分数里已经含了权重和近因（30 天半衰期），
+    /// 所以按分数排等于"既看重要度也看新鲜度"。
+    ///
+    /// 分类别是为了**能核对分层对不对**——比如"这条明明是偏好，
+    /// 怎么记成事实了"。
+    pub fn all_sorted(&self, now_ms: u64) -> Vec<&MemoryEntry> {
+        let mut v: Vec<&MemoryEntry> = self.entries.values().collect();
+        v.sort_by(|a, b| {
+            a.kind.cmp(&b.kind).then_with(|| {
+                b.score(now_ms)
+                    .partial_cmp(&a.score(now_ms))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        v
+    }
+
+    /// 按正文子串找。**大小写不敏感。**
+    ///
+    /// 用子串而不是别的匹配方式：使用者要找的是"我记过关于 X 的东西"，
+    /// 那是个很粗的筛子，不该要求他记得原话。
+    pub fn search(&self, needle: &str) -> Vec<&MemoryEntry> {
+        let n = needle.trim().to_lowercase();
+        if n.is_empty() {
+            return Vec::new();
+        }
+        self.entries
+            .values()
+            .filter(|e| e.text.to_lowercase().contains(&n))
+            .collect()
+    }
+
     /// 按类别召回，按有效分数降序。
     pub fn recall(&self, kind: MemoryKind, now_ms: u64, limit: usize) -> Vec<&MemoryEntry> {
         let mut v: Vec<&MemoryEntry> = self.entries.values().filter(|e| e.kind == kind).collect();
@@ -263,6 +300,133 @@ impl Default for Situation {
             interventions_today: 0,
             relationship_stage: "初期".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use crate::ledger::{Event, EventKind};
+
+    fn ev(kind: EventKind, at: u64, data: serde_json::Value) -> Event {
+        Event {
+            seq: at,
+            at,
+            kind,
+            span: None,
+            job: None,
+            data,
+        }
+    }
+
+    fn three() -> Memory {
+        Memory::from_events(&[
+            ev(
+                EventKind::MemoryRecorded,
+                1_000,
+                serde_json::json!({"id": "a", "kind": "event", "text": "开过一次会"}),
+            ),
+            ev(
+                EventKind::MemoryRecorded,
+                1_000,
+                serde_json::json!({"id": "b", "kind": "fact", "text": "住在杭州"}),
+            ),
+            ev(
+                EventKind::MemoryRecorded,
+                1_000,
+                serde_json::json!({"id": "c", "kind": "preference", "text": "喜欢简洁的回答"}),
+            ),
+        ])
+    }
+
+    #[test]
+    fn all_sorted_groups_by_kind() {
+        // **按类别分组是为了能核对分层对不对**——比如"这条明明是偏好，
+        // 怎么记成事实了"。分组之后一眼看得出来。
+        let m = three();
+        let all = m.all_sorted(2_000);
+        assert_eq!(all.len(), 3);
+        // MemoryKind 的声明顺序：Fact < Preference < Relationship < Event
+        let kinds: Vec<MemoryKind> = all.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![MemoryKind::Fact, MemoryKind::Preference, MemoryKind::Event],
+            "同类的要挨在一起"
+        );
+    }
+
+    #[test]
+    fn all_sorted_puts_the_heavier_one_first_within_a_kind() {
+        // 组内按分数：使用者想知道"它最看重什么"，
+        // 而不是"最近记了什么"。分数里已经含了权重和近因。
+        let m = Memory::from_events(&[
+            ev(
+                EventKind::MemoryRecorded,
+                1_000,
+                serde_json::json!({"id": "low", "kind": "fact", "text": "轻的", "weight": 0.2}),
+            ),
+            ev(
+                EventKind::MemoryRecorded,
+                1_000,
+                serde_json::json!({"id": "high", "kind": "fact", "text": "重的", "weight": 5.0}),
+            ),
+        ]);
+        let all = m.all_sorted(2_000);
+        assert_eq!(all[0].id, "high", "权重高的排前面");
+        assert_eq!(all[1].id, "low");
+    }
+
+    #[test]
+    fn search_matches_a_substring() {
+        // 用子串：使用者要找的是"我记过关于 X 的东西"，
+        // 那是个很粗的筛子，不该要求他记得原话。
+        let m = three();
+        let hits = m.search("杭州");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "b");
+    }
+
+    #[test]
+    fn search_is_case_insensitive() {
+        let m = Memory::from_events(&[ev(
+            EventKind::MemoryRecorded,
+            1_000,
+            serde_json::json!({"id": "a", "kind": "fact", "text": "用 Rust 写的"}),
+        )]);
+        assert_eq!(m.search("rust").len(), 1, "小写也该找到");
+        assert_eq!(m.search("RUST").len(), 1, "大写也该找到");
+    }
+
+    #[test]
+    fn an_empty_needle_finds_nothing_rather_than_everything() {
+        // **空串返回全部是个陷阱**：调用方一不小心就会把整本记忆倒出来。
+        // 什么都不返回更安全，而且调用方本来就该先判空。
+        let m = three();
+        assert!(m.search("").is_empty());
+        assert!(m.search("   ").is_empty());
+    }
+
+    #[test]
+    fn a_forgotten_memory_disappears_from_listing_and_search() {
+        // **忘记要真的从列表和搜索里消失**，而不只是台账里多一条事件。
+        let mut m = three();
+        assert_eq!(m.all_sorted(2_000).len(), 3);
+        assert_eq!(m.search("杭州").len(), 1);
+
+        m = Memory::from_events(&[
+            ev(
+                EventKind::MemoryRecorded,
+                1_000,
+                serde_json::json!({"id": "b", "kind": "fact", "text": "住在杭州"}),
+            ),
+            ev(
+                EventKind::MemoryForgotten,
+                2_000,
+                serde_json::json!({"id": "b"}),
+            ),
+        ]);
+        assert!(m.all_sorted(3_000).is_empty(), "忘了就不该还在列表里");
+        assert!(m.search("杭州").is_empty(), "忘了就不该还能搜到");
     }
 }
 
