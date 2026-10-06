@@ -388,8 +388,56 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
                 task = self.load(task_id)?;
 
                 if task.all_settled() {
-                    self.finish(task_id, TaskState::Done)?;
-                    continue;
+                    // **"所有步骤都尘埃落定"不等于"目标达成了"。**
+                    //
+                    // `all_settled()` 的定义是"完成/失败/跳过**都算终态**"，
+                    // 所以它回答的是"还有没有在跑的步骤"，**不是**
+                    // "目标达成没有"。真机上抓到过（D93）：`s5` 因为
+                    // "需要使用者拍板"而 BLOCKED（**那是对的行为**），
+                    // 依赖它的全跳过，而任务状态报的是"**完成**"、
+                    // 文件一个字没改。**12 次里出现 2 次。**
+                    //
+                    // **D18 那条契约管的是单步输出，管不到整条链。**
+                    // 这里补的就是整条链那一层。
+                    let broken: Vec<String> = task
+                        .steps
+                        .iter()
+                        .filter(|s| {
+                            matches!(
+                                s.state,
+                                crate::task::StepState::Failed | crate::task::StepState::Skipped
+                            )
+                        })
+                        .map(|s| s.id.clone())
+                        .collect();
+                    if broken.is_empty() {
+                        self.finish(task_id, TaskState::Done)?;
+                        // `Done` **是**终态，所以下一轮会在 `is_terminal()`
+                        // 那里提前返回——这里 `continue` 是对的。
+                        continue;
+                    }
+                    // **这一段必须 `break`，不能 `continue`。**
+                    //
+                    // `Stalled` **不是终态**——`is_terminal()` 只认
+                    // `Done | Failed | Cancelled`。所以回到循环顶之后
+                    // `all_settled()` 仍然为真、`broken` 仍非空，
+                    // 会**无限设 Stalled**。
+                    //
+                    // 上一版我写的就是 `continue`，理由是"假设下一轮会在
+                    // `is_terminal()` 处退出"——**那个假设没验证就写进了代码**，
+                    // 结果是测试套件挂死（D94）。
+                    // **设完状态就把 outcome 交出去，不要指望循环顶去兜。**
+                    self.set_state(task_id, TaskState::Stalled)?;
+                    // `break` 要把 outcome 交出去——**这个 `loop` 的值就是
+                    // 函数的返回值**，所以不能光 `break`，也不能靠 `continue`
+                    // 回到循环顶去兜（`Stalled` 不是终态，回不去）。
+                    break Ok(EngineOutcome {
+                        task: self.load(task_id)?,
+                        used_model_calls: ledger.used(),
+                        advance: Advance::Waiting {
+                            reason: TaskError::Stalled { remaining: broken }.to_string(),
+                        },
+                    });
                 }
 
                 let ready = ready_steps(&task);
@@ -1865,6 +1913,35 @@ mod tests {
     }
 
     #[test]
+    fn a_task_where_every_step_succeeded_is_still_done() {
+        // **改"有步骤失败就不叫完成"的时候，最容易顺手把正常路径弄坏。**
+        //
+        // 这个对照测试盯的就是它：每一步都成了，就必须还是 `Done`——
+        // 否则"修复"变成了"所有任务都报卡住"，那比原来的 bug 更坏
+        // （它会让所有人都不再相信"完成"这个状态）。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[]), ("b", &["a"])]));
+        handler.steps = vec![Ok("OK: 甲".into()), Ok("OK: 乙".into())];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "做两件事").unwrap();
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        assert_eq!(
+            outcome.task.state,
+            TaskState::Done,
+            "每一步都成了就该是完成"
+        );
+    }
+
+    #[test]
     fn a_step_that_keeps_failing_settles_as_failed() {
         let router = ModelRouter::default();
         let decider = StubDecider::succeeding();
@@ -1892,7 +1969,22 @@ mod tests {
         .run("t1")
         .unwrap();
         assert_eq!(outcome.task.step("a").unwrap().state, StepState::Failed);
-        assert_eq!(outcome.task.state, TaskState::Done, "全部终态就是收工");
+        // **这条断言原来写的是 `Done`，理由"全部终态就是收工"——
+        // 它把 bug 写成了规格。**
+        //
+        // `all_settled()` 的定义是"完成/失败/跳过**都算终态**"，
+        // 所以它回答的是"还有没有在跑的步骤"，**不是"目标达成没有"**。
+        //
+        // 按旧断言，一步都没成、任务却报"完成"——**那正是"报告说做完了
+        // 而实际没做"**（真机上 12 次里出现 2 次，D93）。
+        //
+        // **这不是"断言放宽"，是旧断言把 bug 当成了正确行为**，
+        // 和 D50 那次 `calls_without_a_name_are_skipped` 是同一类。
+        assert_eq!(
+            outcome.task.state,
+            TaskState::Stalled,
+            "有步骤失败就不叫完成——就算别的步骤都尘埃落定了"
+        );
     }
 
     #[test]
