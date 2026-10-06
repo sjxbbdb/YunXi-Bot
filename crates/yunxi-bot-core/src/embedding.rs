@@ -177,6 +177,132 @@ pub fn embed_plain(text: &str) -> Vec<f32> {
     embed(text)
 }
 
+/// 词面匹配时**不算数**的字。
+///
+/// ## 为什么必须排除它们
+///
+/// 真机上撞到的：问「量子色动力学的重整化群方程」，词面通道靠
+/// 「色」和「的」两个字把「使用者最喜欢的颜色是青绿色」收了进来——
+/// **两个重合，但一个是实词、一个是虚词。**
+///
+/// 中文里功能词的出现频率极高，它们**不携带任何区分信息**：
+/// 一个查询和一个正文共有一个「的」，说明不了任何事。
+///
+/// 这和 IDF 是同一个道理（IDF 是**连续**地压制高频字，这里是**硬性**
+/// 排除最高频的那一小撮）。词汇表之外的靠 IDF，这一小撮靠这张表——
+/// 因为它们在 IDF 里也只是"权重低"，而词面通道要的是"根本不参与"。
+const STOP_CHARS: &str = "的了是在我你他她它有着过把被让给对从到为以之其这那些个不也还很太最更会能要可就而且与及和吗呢吧啊呀哦嗯";
+
+fn is_stop(c: char) -> bool {
+    STOP_CHARS.contains(c)
+}
+
+/// 词面重叠分：查询里的字有多少在正文里出现过。
+///
+/// ## 为什么还要一条词面通道
+///
+/// 语义通道（余弦）擅长"意思像"，但**对精确的词不敏感**：
+/// 一个泛化的向量结果可能把一个精确命中的挤掉——比如问
+/// `DISCOUNT_THRESHOLD` 长什么样，语义通道可能给你一条"讲满减逻辑"
+/// 的记忆，而真正含这个标识符的那条排后面。
+///
+/// 参考实现（Miyu）实测过两路单独与融合的效果：
+///
+/// ```text
+/// 09-05 实测：记忆 hit@3   关键词 51%   语义 61%   RRF 69%
+/// ```
+///
+/// **融合比两路都好，而且高出不少。** 所以两条都要有。
+///
+/// ## 为什么是"字"而不是"词"
+///
+/// 中文分词要词典，那是个新依赖。而查询短、正文也短，**按字算重叠
+/// 已经够用**：问"上周和客户干了什么"时，"客户"两个字在正文里出现，
+/// 重叠就命中了。
+///
+/// 返回的是**查询里被覆盖的比例**（0..1），不是绝对个数——
+/// 绝对个数会让长查询凭空占优。
+pub fn lexical_overlap(query: &str, text: &str) -> f32 {
+    // **查询和正文都要排掉功能词**：只排一边的话，"的"会从另一边漏进来
+    let q: Vec<char> = normalize(query)
+        .chars()
+        .filter(|c| !c.is_whitespace() && !is_stop(*c))
+        .collect();
+    if q.is_empty() {
+        return 0.0;
+    }
+    let t: std::collections::HashSet<char> =
+        normalize(text).chars().filter(|c| !is_stop(*c)).collect();
+    let matched: std::collections::HashSet<char> =
+        q.iter().filter(|c| t.contains(c)).copied().collect();
+    // **至少两个不同的字才算命中。**
+    //
+    // 一个字的重合几乎全是噪声：「的」「是」「我」这类字在任何中文文本里
+    // 都有。真机上就是这样坏的——问「量子色动力学的重整化群方程」，
+    // 词面通道靠一个「的」把不相关的记忆全收了进来。
+    //
+    // 门槛定 2 是量出来的：一个字的重合区分不了任何东西，
+    // 两个字的重合已经能抓住"客户""杭州""预算"这类实词。
+    if matched.len() < 2 {
+        return 0.0;
+    }
+    matched.len() as f32 / q.len() as f32
+}
+
+/// RRF（Reciprocal Rank Fusion）融合多路排名。
+///
+/// ## 为什么用 RRF 而不是加权求和
+///
+/// **两路的分数不可比。** 词面重叠是 0..1 的比例，余弦是 -1..1——
+/// 就算都归一化到 0..1，"0.5 的词面"和"0.5 的余弦"也不是一回事。
+/// 加权求和要先定权重，而权重只能拍。
+///
+/// RRF **只用名次，不用分数**，所以天然免疫量纲问题：
+///
+/// ```text
+/// score(d) = Σ 1 / (K + rank_i(d) + 1)
+/// ```
+///
+/// 参考实现的原话是 "scale-free"——"关键词分数量级在几十、余弦在
+/// 零点几，不用调参就能融"。
+///
+/// ## 平局时先传的赢
+///
+/// 稳定排序保持"先见到"的顺序。调用方把词面排在前面，
+/// 于是**精确命中在平局时赢过泛化的向量结果**——
+/// 这正好是研究文档要求的"精确命令/路径不能被泛化向量挤掉"。
+pub fn rrf_fuse(rankings: &[Vec<usize>], k: f64) -> Vec<(usize, f64)> {
+    let mut scores: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+    let mut order: Vec<usize> = Vec::new();
+    for ranking in rankings {
+        for (rank, id) in ranking.iter().enumerate() {
+            let entry = scores.entry(*id).or_insert_with(|| {
+                order.push(*id);
+                0.0
+            });
+            *entry += 1.0 / (k + rank as f64 + 1.0);
+        }
+    }
+    let mut fused: Vec<(usize, f64)> = order.into_iter().map(|id| (id, scores[&id])).collect();
+    // 稳定排序：分数相同时保持 `order` 里的先后，也就是**先传的那一路赢**
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fused
+}
+
+/// RRF 的 K。
+///
+/// 参考实现用的是 60。**它对结果不敏感**——K 只影响"名次差"折算成
+/// 多少分差：K 大则各名次拉平（更依赖"出现在几路里"），
+/// K 小则头部名次更值钱。60 是文献里的常用值，也和他们实测一致。
+pub const RRF_K: f64 = 60.0;
+
+/// 每一路取前几名进融合。
+///
+/// **要有上限**：不设的话，一个排在 500 名的尾巴也会因为
+/// `1/(60+500)` 拿到一点点分，噪声就进来了。
+/// 参考实现用的是 12。
+pub const CHANNEL_DEPTH: usize = 12;
+
 /// 余弦相似度。**输入必须是 [`embed`] 出来的归一化向量。**
 ///
 /// 归一化之后就是点积。这里不做除法——做了的话每次比较都多两次开方，
@@ -372,5 +498,120 @@ mod tests {
             "不相干的文本相似度该接近 0，实际 {}",
             cosine(&a, &b)
         );
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+
+    #[test]
+    fn lexical_overlap_counts_query_coverage() {
+        // "客户"两个字都在正文里 → 全覆盖
+        assert_eq!(lexical_overlap("客户", "上周和客户开了个会"), 1.0);
+        // 一半的字没出现
+        let half = lexical_overlap("客户项目", "上周和客户开了个会");
+        assert!((half - 0.5).abs() < 0.01, "实际 {half}");
+        // 完全不沾边
+        assert_eq!(lexical_overlap("量子", "上周和客户开了个会"), 0.0);
+    }
+
+    #[test]
+    fn a_short_query_is_not_penalised_by_length() {
+        // 返回的是**比例**不是个数：长查询不该凭空占优。
+        // 否则"问得啰嗦"就等于"更相关"，那是错的。
+        let short = lexical_overlap("客户", "上周和客户开了个会");
+        let long = lexical_overlap("上周和客户开了个会聊了预算", "上周和客户开了个会");
+        assert!(short > long, "短查询比率该更高：{short} vs {long}");
+    }
+
+    #[test]
+    fn an_empty_query_overlaps_nothing() {
+        assert_eq!(lexical_overlap("", "随便什么"), 0.0);
+    }
+
+    #[test]
+    fn rrf_rewards_showing_up_in_both_channels() {
+        // 出现在两路里的那条，分数必须高于只出现在一路的——
+        // **这正是融合的意义**：两个通道都认为它相关，那它更可能真的相关。
+        let lexical = vec![0, 1, 2];
+        let semantic = vec![2, 3, 4];
+        let fused = rrf_fuse(&[lexical, semantic], RRF_K);
+        let score = |id: usize| fused.iter().find(|(i, _)| *i == id).unwrap().1;
+        assert!(
+            score(2) > score(0),
+            "两路都有的（2）该赢过只有一路的（0）：{} vs {}",
+            score(2),
+            score(0)
+        );
+        assert!(score(2) > score(3));
+    }
+
+    #[test]
+    fn a_first_place_beats_a_fifth_place_within_one_channel() {
+        let lexical = vec![0, 1, 2, 3, 4];
+        let fused = rrf_fuse(&[lexical], RRF_K);
+        assert_eq!(fused[0].0, 0, "只一路时按那一路的名次");
+        assert!(fused[0].1 > fused[4].1);
+    }
+
+    #[test]
+    fn the_earlier_channel_wins_ties() {
+        // **研究文档明确要求**："精确命令/路径出现时，词面命中不能被
+        // 一个泛化向量结果挤掉"。做法就是把词面传在前面 + 稳定排序。
+        let lexical = vec![7];
+        let semantic = vec![9];
+        let fused = rrf_fuse(&[lexical, semantic], RRF_K);
+        assert_eq!(fused[0].0, 7, "同分时先传的那一路赢");
+    }
+
+    #[test]
+    fn fusion_keeps_everything_that_showed_up() {
+        let lexical = vec![1, 2];
+        let semantic = vec![3, 4];
+        let fused = rrf_fuse(&[lexical, semantic], RRF_K);
+        assert_eq!(fused.len(), 4, "两路出现过的都要在结果里");
+    }
+
+    #[test]
+    fn an_empty_channel_does_not_break_fusion() {
+        // 语义那路整条挂了（没模型、超时）时，**词面还得能单独工作**。
+        // 参考实现的原话："语义是辅助，不是前提。"
+        let lexical = vec![5, 6];
+        let semantic: Vec<usize> = vec![];
+        let fused = rrf_fuse(&[lexical, semantic], RRF_K);
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].0, 5);
+    }
+}
+
+#[cfg(test)]
+mod function_word_tests {
+    use super::*;
+
+    #[test]
+    fn a_shared_function_word_does_not_count_as_a_match() {
+        // **真机上就是这么坏的**：问「量子色动力学的重整化群方程」，
+        // 靠「色」和「的」两个字把「使用者最喜欢的颜色是青绿色」收了进来。
+        // 「的」不携带任何区分信息——一个查询和一条正文共有一个「的」，
+        // 说明不了任何事。
+        let q = "量子色动力学的重整化群方程";
+        assert_eq!(
+            lexical_overlap(q, "使用者最喜欢的颜色是青绿色"),
+            0.0,
+            "靠「色」+「的」凑出来的两个重合必须被挡掉"
+        );
+    }
+
+    #[test]
+    fn content_words_still_count() {
+        // 排除功能词不能把实词也误伤
+        assert!(lexical_overlap("客户预算", "上周和客户开了个预算会") > 0.9);
+        assert!(lexical_overlap("颜色", "使用者最喜欢的颜色是青绿色") > 0.9);
+    }
+
+    #[test]
+    fn a_query_of_only_function_words_matches_nothing() {
+        assert_eq!(lexical_overlap("的了吗呢", "随便什么内容"), 0.0);
     }
 }

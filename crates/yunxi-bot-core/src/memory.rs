@@ -67,7 +67,7 @@ impl MemoryKind {
 ///
 /// 宁可多召回一条不相干的，也别漏掉相关的：漏掉的表现是
 /// "它明明记过却想不起来"，那比多一行噪声难查得多。
-pub const RECALL_MIN_SCORE: f32 = 0.10;
+pub const RECALL_MIN_SCORE: f32 = 0.20;
 
 /// 一条候选记忆在召回里的结局。
 ///
@@ -94,12 +94,42 @@ impl RecallRoute {
     }
 }
 
+/// 这一条是从哪一路来的。
+///
+/// **可观测性要求**（研究文档 §4.7）：事后要能回答"它为什么被选中"。
+/// 只报"选中了"不够——"词面命中"和"语义相似"是两种不同的证据，
+/// 调不准的时候得知道该动哪一路。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallVia {
+    /// 词面和语义都认为相关——**最强的证据**。
+    Both,
+    /// 只有词面命中（精确的字对上了）。
+    Lexical,
+    /// 只有语义相似（意思像，但字不一样）。
+    Semantic,
+    /// 两路都没进（不相干）。
+    None,
+}
+
+impl RecallVia {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Both => "词面+语义",
+            Self::Lexical => "词面",
+            Self::Semantic => "语义",
+            Self::None => "-",
+        }
+    }
+}
+
 /// 一条召回候选。
 #[derive(Debug)]
 pub struct RecallHit<'a> {
     pub entry: &'a MemoryEntry,
+    /// RRF 融合分。**不是相似度**——它只反映名次，不可当阈值用。
     pub score: f32,
     pub route: RecallRoute,
+    pub via: RecallVia,
 }
 
 /// 被反复召回时的降权。
@@ -297,51 +327,128 @@ impl Memory {
         budget_chars: usize,
         fatigue: &std::collections::HashMap<String, u32>,
     ) -> Vec<RecallHit<'_>> {
+        use crate::embedding::{CHANNEL_DEPTH, RRF_K, embed_with_idf, lexical_overlap, rrf_fuse};
+
         // 语料 = 全部记忆的正文。IDF 要它来算"哪些字到处都是"。
         let idf = crate::embedding::Idf::fit(self.entries.values().map(|e| e.text.as_str()));
-        let qv = crate::embedding::embed_with_idf(query, &idf);
 
-        let mut scored: Vec<(f32, &MemoryEntry)> = self
-            .entries
-            .values()
-            .map(|e| {
-                let ev = crate::embedding::embed_with_idf(&e.text, &idf);
-                let sim = crate::embedding::cosine(&qv, &ev).max(0.0);
-                (
-                    sim * self.dynamic_weight(e, now_ms)
-                        * fatigue_penalty(fatigue.get(&e.id).copied()),
-                    e,
-                )
+        // 定序的载体：`self.entries` 是 BTreeMap，遍历顺序按 id，
+        // **是确定的**——所以下标能稳定地代表某一条。
+        let items: Vec<&MemoryEntry> = self.entries.values().collect();
+
+        // ---- 路 1：语义 ----
+        let qv = embed_with_idf(query, &idf);
+        let mut semantic: Vec<(usize, f32)> = items
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let ev = embed_with_idf(&e.text, &idf);
+                (i, crate::embedding::cosine(&qv, &ev).max(0.0))
             })
+            // **要有相关性下限。** 重写成两路时这里一度写成 `> 0.0`，
+            // 结果是"任何中文文本之间都有一点余弦"——不相干的问题
+            // 也能召回一堆。下限是量出来的（见 RECALL_MIN_SCORE 的文档）。
+            .filter(|(_, sc)| *sc >= RECALL_MIN_SCORE)
             .collect();
-        // 分数降序；同分按 id 定序，**否则同样输入两次跑出来顺序不定**
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
+        semantic.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.id.cmp(&b.1.id))
+                .then_with(|| a.0.cmp(&b.0))
         });
+        semantic.truncate(CHANNEL_DEPTH);
 
-        let mut out = Vec::with_capacity(scored.len());
+        // ---- 路 2：词面 ----
+        //
+        // **加这一路是为了"精确的字对上了"这种情况。**
+        // 语义通道对精确的词不敏感：问 `DISCOUNT_THRESHOLD` 长什么样时，
+        // 一个泛化的"讲满减逻辑"可能把真正含这个标识符的那条挤掉。
+        let mut lexical: Vec<(usize, f32)> = items
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, lexical_overlap(query, &e.text)))
+            .filter(|(_, sc)| *sc > 0.0)
+            .collect();
+        lexical.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        lexical.truncate(CHANNEL_DEPTH);
+
+        // ---- 融合 ----
+        //
+        // **词面传在前面**：RRF 的稳定排序让它在平局时赢，
+        // 于是"精确命中不被泛化向量挤掉"这条要求自动成立。
+        let lex_rank: Vec<usize> = lexical.iter().map(|(i, _)| *i).collect();
+        let sem_rank: Vec<usize> = semantic.iter().map(|(i, _)| *i).collect();
+        let fused = rrf_fuse(&[lex_rank, sem_rank], RRF_K);
+
+        let in_lex = |i: usize| lexical.iter().any(|(j, _)| *j == i);
+        let in_sem = |i: usize| semantic.iter().any(|(j, _)| *j == i);
+
+        let mut out = Vec::with_capacity(items.len());
         let mut used = 0usize;
         let mut taken = 0usize;
-        for (score, e) in scored {
-            let route = if score < RECALL_MIN_SCORE {
-                RecallRoute::DroppedUnrelated
-            } else if taken >= limit || used + e.text.chars().count() > budget_chars {
+        let mut pushed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        for (idx, fused_score) in &fused {
+            let e = items[*idx];
+            let via = match (in_lex(*idx), in_sem(*idx)) {
+                (true, true) => RecallVia::Both,
+                (true, false) => RecallVia::Lexical,
+                (false, true) => RecallVia::Semantic,
+                (false, false) => RecallVia::None,
+            };
+            // 按类别权重和疲劳修正**排序分**。RRF 分本身只用名次，
+            // 这里乘上业务修正——概念上对上研究文档 §4.4 的那个式子。
+            let adjusted = *fused_score as f32
+                * self.dynamic_weight(e, now_ms)
+                * fatigue_penalty(fatigue.get(&e.id).copied());
+            let route = if taken >= limit || used + e.text.chars().count() > budget_chars {
                 RecallRoute::DroppedBudget
             } else {
-                RecallRoute::Picked
-            };
-            if route == RecallRoute::Picked {
                 used += e.text.chars().count();
                 taken += 1;
+                RecallRoute::Picked
+            };
+            pushed.insert(*idx);
+            out.push(RecallHit {
+                entry: e,
+                score: adjusted,
+                route,
+                via,
+            });
+        }
+
+        // ---- 两路都没进的那些，也要出现在结果里 ----
+        //
+        // **"它怎么没想起那条"是排查时第一个会问的问题。**
+        // 只返回选中项的话这个问题答不上来（研究文档 §4.7 的原话：
+        // "召回 0 命中不知原因"）。
+        for (i, e) in items.iter().enumerate() {
+            if pushed.contains(&i) {
+                continue;
             }
             out.push(RecallHit {
                 entry: e,
-                score,
-                route,
+                score: 0.0,
+                route: RecallRoute::DroppedUnrelated,
+                via: RecallVia::None,
             });
         }
+
+        // 选中的排前面（按修正后的分降序），没选中的按 id 兜底定序
+        out.sort_by(|a, b| {
+            let pa = (a.route != RecallRoute::Picked) as u8;
+            let pb = (b.route != RecallRoute::Picked) as u8;
+            pa.cmp(&pb)
+                .then_with(|| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.entry.id.cmp(&b.entry.id))
+        });
         out
     }
 
@@ -840,9 +947,15 @@ mod recall_tests {
         // "为什么没召回某条"要能回答。
         let items = twenty();
         let m = mem_of(&items);
-        let r = m.recall_for_prompt("颜色 猫 咖啡 杭州 香菜", 10_000, 2, 20, &no_fatigue());
+        // **`limit` 压到 1 是为了让"溢出"必然发生。**
+        //
+        // 原来用的是 2，而相关性下限提高之后够相关的条目也少了，
+        // 凑不出溢出的场景——于是这条测试挂在了"没有 DroppedBudget"上。
+        // 那**不是断言放宽，是场景失效**：要验的机制是"溢出被标出来"，
+        // 就该保证一定溢出。
+        let r = m.recall_for_prompt("颜色 猫 咖啡 杭州 香菜", 10_000, 1, 400, &no_fatigue());
         let picked = r.iter().filter(|h| h.route == RecallRoute::Picked).count();
-        assert!(picked <= 2, "条数上限是 2，实际选了 {picked}");
+        assert!(picked <= 1, "条数上限是 1，实际选了 {picked}");
         assert!(
             r.iter().any(|h| h.route == RecallRoute::DroppedBudget),
             "超预算的必须带原因，而不是凭空消失"
