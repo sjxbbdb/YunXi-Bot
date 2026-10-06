@@ -515,7 +515,27 @@ impl ChatHandler {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             yunxi_bot_core::policy::SandboxMode::WorkspaceWrite,
         );
-        let mut runner = ToolRunner::new(&self.tools, self.policy.clone(), &mut *ap, ctx)
+        // **纯生成型的意图不给工具。**
+        //
+        // 判据是"这一步的产出是文本，还是动作"：
+        //
+        // - `Plan` 产出一份步骤清单，`Options` 产出一组候选做法——
+        //   两者都不该自己动手。它们要的信息，拆出来的步骤会去取。
+        // - `Step` 和 `Chat` 是要干活的，必须有工具。
+        //
+        // 真机上踩过：规划步的提示词写着"只输出一个 JSON 对象"，
+        // 可工具循环照样把 10 个工具递过去了——模型于是跑去 `read_file`、
+        // `list_dir`，**自己开始干活而不是拆解**，转了 8 轮撞上轮数上限，
+        // 整个任务连拆解都没完成。
+        //
+        // **给不出去的权限就不要给。** 递一个用不上的工具，
+        // 换来的只有"模型拿它去绕路"。
+        let no_tools = yunxi_bot_core::tool::ToolRegistry::new();
+        let tools = match intent {
+            Intent::Plan | Intent::Options => &no_tools,
+            Intent::Step | Intent::Chat => &self.tools,
+        };
+        let mut runner = ToolRunner::new(tools, self.policy.clone(), &mut *ap, ctx)
             // **把路由的思考决定带进工具循环。** 忘了这一步，"复杂任务开思考"
             // 就只在没有工具的那条路径上成立——而几乎每条路径都有工具。
             .with_thinking(match routing.thinking_field() {

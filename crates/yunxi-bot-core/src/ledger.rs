@@ -782,10 +782,26 @@ pub fn task_from_events(events: &[Event]) -> crate::task::TaskSet {
                         .and_then(|v| serde_json::from_value(v.clone()).ok())
                         .unwrap_or_default();
                     // 重试会把同一步重新置为 Pending：此时保留已有的 attempts 和结果
+                    //
+                    // **但"升级人工"是另一回事。** 弃权意味着"我需要人来拍板"，
+                    // 不是"这次尝试失败了"——它不该消耗重试次数。
+                    // 真机上就是这么坏的：决策模型弃权两次 → 次数用光 →
+                    // 步骤硬判失败 → 依赖它的全跳过 → 任务变成"卡住"，
+                    // 而**真正的状态应该是"等人工"**。
+                    //
+                    // `fresh: true` 表示"这一步重新开始"，连次数一起清掉。
+                    let fresh = e
+                        .data
+                        .get("fresh")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     if t.step(sid).is_some() {
                         if let Some(s) = t.step_mut(sid) {
                             s.state = StepState::Pending;
                             s.result = None;
+                            if fresh {
+                                s.attempts = 0;
+                            }
                         }
                     } else {
                         t.steps.push(

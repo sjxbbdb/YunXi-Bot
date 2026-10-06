@@ -57,6 +57,52 @@ pub struct PlannedStep {
     pub kind: Option<TaskKind>,
 }
 
+/// 把模型可能写出的、我们不认的 `kind` 归一化。
+///
+/// ## 只处理有明确依据的那一种
+///
+/// 提示词让模型把"需要人拍板"的步骤写成 `instruction: "decide: ..."`，
+/// 而模型往往**顺带**把 `kind` 也设成 `"decide"`——那个值不在 `TaskKind`
+/// 枚举里，于是**整份计划被拒**、白费一次拆解调用。
+///
+/// 真机上就是这么坏的：
+///
+/// ```text
+/// 第 5 个步骤的字段不合法：unknown variant `decide`，
+/// expected one of `conversation`, `lookup`, ..., `execution`
+/// ```
+///
+/// **模型的行为是合理的**（那一步的 kind 确实就是"要人拍板"），
+/// 是 schema 没给它位置。而 `kind` 本来就可以不填（Rust 侧按文本兜底判），
+/// 所以对决策步骤来说它是**冗余信息**——丢掉它，不丢整份计划。
+///
+/// ## 只在两件事**同时**成立时才丢
+///
+/// `kind == "decide"` **且** instruction 是 `decide:` 开头。
+/// 只满足一个的话那是真的自相矛盾（比如普通步骤写 kind=decide），
+/// 报错才是对的——**静默吞掉会把真问题掩盖过去**。
+fn normalize_kind(item: &mut Value) {
+    let decide_instruction = item
+        .get("instruction")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            s.trim_start()
+                .starts_with(crate::task::engine::DECIDE_PREFIX)
+        })
+        .unwrap_or(false);
+    let decide_kind = item
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.eq_ignore_ascii_case("decide"))
+        .unwrap_or(false);
+    if decide_instruction
+        && decide_kind
+        && let Some(obj) = item.as_object_mut()
+    {
+        obj.remove("kind");
+    }
+}
+
 /// 解析模型返回的步骤清单。
 ///
 /// 分四步：取 JSON → 拆出步骤数组 → 查可用性（id / 指令 / 步数）→ 查依赖图。
@@ -74,7 +120,17 @@ pub fn parse_plan(raw: &str) -> Result<Vec<PlannedStep>, TaskError> {
         };
         unparsable(detail, raw)
     })?;
-    check_usable(&steps, raw)?;
+    // 同样带上截断提示：走到这里也可能是"截断后恰好解析出一个空清单"
+    check_usable(&steps, raw).map_err(|e| {
+        if looks_truncated(raw) {
+            unparsable(
+                format!("{e}；**回复看起来被截断了**（最外层括号没闭合）"),
+                raw,
+            )
+        } else {
+            e
+        }
+    })?;
 
     // 依赖图交给 model 的纯函数查：它同时管"引用了不存在的步骤"和"成环"，
     // 错误原样传出，不在这一层再包一遍——外面按 TaskError 的变体决定要不要人工介入。
@@ -221,6 +277,21 @@ fn raw_head(raw: &str) -> String {
 fn extract_json(raw: &str) -> Result<Value, String> {
     if raw.trim().is_empty() {
         return Err("模型回复为空".to_string());
+    }
+
+    // **截断了就别再挑碎片了，直接说。**
+    //
+    // 真机上踩过：回复被 `max_tokens` 从中间切断，外层 `{` 没有配对的 `}`。
+    // 而 `container_slices` 会继续逐字节扫，撞上 `"depends_on":[]` 这种
+    // **空数组**——它括号是配对的，`from_str("[]")` 也能解析成功，
+    // 于是被当成"解析出来的 JSON"，报出来是**"步骤清单是空的"**。
+    //
+    // 那个报错把人送去查"模型怎么给了个空计划"，而真正的问题是输出预算不够。
+    // 截断的回复里不可能藏着有效计划——外层容器都断了。
+    if looks_truncated(raw) {
+        return Err("**回复被截断了**（最外层括号没闭合），不可能是完整计划——\
+             多半是输出预算不够（思考过程也从这个预算里扣）"
+            .to_string());
     }
 
     let mut tried = 0usize;
@@ -373,7 +444,8 @@ fn steps_from_value(value: Value) -> Result<Vec<PlannedStep>, String> {
     };
 
     let mut steps = Vec::with_capacity(items.len());
-    for (index, item) in items.into_iter().enumerate() {
+    for (index, mut item) in items.into_iter().enumerate() {
+        normalize_kind(&mut item);
         // 逐个反序列化：整段一起转的报错只指向"某个地方"，定位不到是哪一步写错的
         let step = serde_json::from_value::<PlannedStep>(item)
             .map_err(|e| format!("第 {} 个步骤的字段不合法：{e}", index + 1))?;
@@ -459,6 +531,65 @@ fn planned_to_step(planned: &PlannedStep) -> Step {
     });
     Step::new(planned.id.clone(), planned.instruction.clone(), kind)
         .with_depends_on(planned.depends_on.clone())
+}
+
+#[cfg(test)]
+mod decide_kind_tests {
+    use super::*;
+
+    fn plan(steps: serde_json::Value) -> String {
+        serde_json::json!({ "steps": steps }).to_string()
+    }
+
+    #[test]
+    fn a_decide_step_may_also_carry_kind_decide() {
+        // **真机上就是这么坏的。** 提示词让模型把 instruction 写成
+        // `decide: ...`，它顺带把 kind 也设成 "decide"——那个值不在枚举里，
+        // 于是**整份计划被拒**、白费一次拆解调用。
+        //
+        // 模型的行为是合理的（那一步的 kind 确实就是"要人拍板"），
+        // 是 schema 没给它位置。而 kind 本来就可以不填。
+        let raw = plan(serde_json::json!([
+            { "id": "s1", "instruction": "读代码", "depends_on": [], "kind": "lookup" },
+            { "id": "s2", "instruction": "decide: 阈值含不含等于？", "depends_on": ["s1"], "kind": "decide" }
+        ]));
+        let steps = parse_plan(&raw).expect("带 kind=decide 的计划该被接受");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1].instruction, "decide: 阈值含不含等于？");
+        assert!(
+            steps[1].kind.is_none(),
+            "冗余的 kind 该被丢掉，让文本兜底去判"
+        );
+    }
+
+    #[test]
+    fn kind_decide_on_a_normal_step_is_still_an_error() {
+        // **只在两件事同时成立时才丢。** 普通步骤写 kind=decide
+        // 是真的自相矛盾——静默吞掉会把真问题掩盖过去。
+        let raw = plan(serde_json::json!([
+            { "id": "s1", "instruction": "读一下这个文件", "depends_on": [], "kind": "decide" }
+        ]));
+        assert!(parse_plan(&raw).is_err(), "自相矛盾的 kind 该报错");
+    }
+
+    #[test]
+    fn an_unknown_kind_is_still_rejected() {
+        // 拼错的类型名不该被静默忽略——那是真的写错了
+        let raw = plan(serde_json::json!([
+            { "id": "s1", "instruction": "读代码", "depends_on": [], "kind": "analisys" }
+        ]));
+        assert!(parse_plan(&raw).is_err(), "未知的 kind 该报错");
+    }
+
+    #[test]
+    fn a_decide_step_without_any_kind_still_works() {
+        // 提示词推荐的写法：只写 instruction
+        let raw = plan(serde_json::json!([
+            { "id": "s1", "instruction": "decide: 选哪个？", "depends_on": [] }
+        ]));
+        let steps = parse_plan(&raw).expect("不填 kind 是推荐写法");
+        assert!(steps[0].kind.is_none());
+    }
 }
 
 #[cfg(test)]

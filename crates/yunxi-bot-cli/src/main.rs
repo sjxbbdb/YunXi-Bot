@@ -2966,7 +2966,16 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         println!("任务 {id} 已经是{}，不需要续跑。", t.state.label());
         return Ok(0);
     }
-    if t.state == TaskState::AwaitingHuman {
+    // **不能只认 `AwaitingHuman`。**
+    //
+    // 真机上踩过：决策模型弃权两次把重试次数耗光，步骤硬判失败，
+    // 依赖它的全跳过，任务于是变成 `Stalled`（"卡住"）——
+    // 而人在这个状态下给答案，会被这道守卫**静默丢掉**：
+    // `--answer` 写了，什么也没发生，任务照旧卡着。
+    //
+    // 只要任务还没结束，人就有权插手。真正的判断在下面那句
+    // "有没有待决的决策步骤"——那里会给出明确的拒绝理由。
+    if !t.state.is_terminal() {
         // **先把人的答案落进台账，再把状态放回执行中。**
         //
         // 顺序不能反：状态一变成 running，引擎下一轮就会去看

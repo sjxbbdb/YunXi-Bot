@@ -587,7 +587,10 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
         if let Err(e) = ledger.try_charge() {
             // 预算在"标记执行中"之后用尽：必须把它退回去，
             // 否则这一步会永远停在 Running——既不是终态也永远不会被选中。
-            self.reset_step(task_id, &step)?;
+            //
+            // `fresh: false`：预算用尽**不是这一步的错**，次数要保留，
+            // 否则一个步骤可以靠"反复撞预算"绕过重试上限。
+            self.reset_step(task_id, &step, false)?;
             return Err(e);
         }
 
@@ -662,7 +665,7 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
                 // 看不出这一步曾经失败过——排查时最需要的就是那条。
                 // attempts 已经由 StepRunning 累加过，所以重试次数仍然是有限的。
                 if step.attempts + 1 < self.budget.max_attempts_per_step {
-                    self.reset_step(task_id, &step)?;
+                    self.reset_step(task_id, &step, false)?;
                     Ok(StepRun::RetryLater)
                 } else {
                     self.store.write(
@@ -829,14 +832,24 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             "{why}：步骤 {} 需要人工判断「{question}」；候选 = {options:?}",
             step.id
         );
-        // 步骤回到待执行，但任务状态转等人工——人处理完之后重新跑就能续上
-        self.reset_step(task_id, step)?;
+        // 步骤回到待执行，但任务状态转等人工——人处理完之后重新跑就能续上。
+        // **`fresh: true`：弃权不该消耗重试次数。**
+        self.reset_step(task_id, step, true)?;
         self.set_state(task_id, TaskState::AwaitingHuman)?;
         Ok(StepRun::NeedsHuman { reason })
     }
 
     /// 把一步退回待执行（保留 attempts，不重置重试计数）。
-    fn reset_step(&mut self, task_id: &str, step: &Step) -> Result<(), TaskError> {
+    /// 把步骤放回待执行。
+    ///
+    /// `fresh` 决定**要不要连重试次数一起清掉**：
+    ///
+    /// - `false`（普通重试）：次数保留，否则重试就成了无限次
+    /// - `true`（升级人工后）：**次数清零**。弃权是"我需要人拍板"，
+    ///   不是"这次尝试失败了"——不该消耗重试预算。
+    ///   真机上决策模型弃权两次就把步骤硬判失败，任务从"等人工"
+    ///   变成"卡住"，人再想答也没机会了。
+    fn reset_step(&mut self, task_id: &str, step: &Step, fresh: bool) -> Result<(), TaskError> {
         self.store.write(
             task_id,
             EventKind::StepPending,
@@ -846,6 +859,7 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
                 "instruction": step.instruction,
                 "kind": step.kind,
                 "depends_on": step.depends_on,
+                "fresh": fresh,
             }),
         )?;
         Ok(())
@@ -988,6 +1002,10 @@ fn human_answer_in(
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         })
+        // **空白答案当"没答过"。** 过滤放在这里而不是调用方：
+        // 两个 store 共用这一个实现，放调用方就会出现"一个过滤了一个没过滤"。
+        // 而一条空答案如果真的生效，会把步骤钉死在一个空决定上。
+        .filter(|a| !a.trim().is_empty())
 }
 
 impl TaskStore for LedgerTaskStore {
@@ -1169,6 +1187,67 @@ pub fn step_table(task: &Task) -> Vec<(String, &'static str, String)> {
 /// 报表用的空映射辅助（避免调用点到处写类型标注）。
 pub fn empty_inputs() -> Vec<(String, String)> {
     BTreeMap::<String, String>::new().into_iter().collect()
+}
+
+#[cfg(test)]
+mod human_answer_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn answer(store: &mut MemoryTaskStore, task: &str, step: &str, text: &str) {
+        store
+            .write(
+                task,
+                EventKind::HumanAnswered,
+                json!({ "task": task, "step": step, "answer": text }),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_recorded_answer_is_found() {
+        // **这一步是最小复现。** 真机上人给了答案、台账里也有
+        // `human_answered` 事件，可 `human_answer()` 返回 None，
+        // 于是步骤还是被判失败。
+        let mut store = MemoryTaskStore::default();
+        answer(&mut store, "t1", "s4", "用 >= 而不是 >");
+        assert_eq!(
+            store.human_answer("t1", "s4").as_deref(),
+            Some("用 >= 而不是 >"),
+            "记进去的答案必须能查出来"
+        );
+    }
+
+    #[test]
+    fn an_answer_for_another_step_is_not_confused() {
+        let mut store = MemoryTaskStore::default();
+        answer(&mut store, "t1", "s4", "给 s4 的");
+        assert!(store.human_answer("t1", "s5").is_none(), "不该串到别的步骤");
+        assert!(store.human_answer("t2", "s4").is_none(), "不该串到别的任务");
+    }
+
+    #[test]
+    fn the_latest_answer_wins() {
+        // 人可能改主意，**最后说的那句才算数**
+        let mut store = MemoryTaskStore::default();
+        answer(&mut store, "t1", "s4", "先这么定");
+        answer(&mut store, "t1", "s4", "改成这样");
+        assert_eq!(store.human_answer("t1", "s4").as_deref(), Some("改成这样"));
+    }
+
+    #[test]
+    fn an_empty_answer_does_not_count() {
+        // 空字符串当"没答过"——不然一次误操作会把步骤钉死
+        let mut store = MemoryTaskStore::default();
+        answer(&mut store, "t1", "s4", "   ");
+        assert!(store.human_answer("t1", "s4").is_none());
+    }
+
+    #[test]
+    fn nothing_recorded_means_none() {
+        let store = MemoryTaskStore::default();
+        assert!(store.human_answer("t1", "s4").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1698,6 +1777,190 @@ mod tests {
         match outcome.advance {
             Advance::Waiting { reason } => assert!(reason.contains("人工"), "{reason}"),
             other => panic!("应升级人工，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_human_answer_settles_the_step_without_calling_any_model() {
+        // **这条是 D44 的最小复现。**
+        //
+        // 真机上：决策步骤因为反复弃权把尝试次数用光成了 Failed，
+        // 人给了答案、台账里也有 `human_answered`，可这一步还是被判失败。
+        //
+        // 这里从**干净的初始状态**验完整链路：人答过 → 步骤直接收尾，
+        // 而且**一次模型调用都不花**（不用再生成选项、也不用问决策模型）。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 阈值含不含等于？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "需要选择").unwrap();
+        store
+            .write(
+                "t1",
+                EventKind::HumanAnswered,
+                serde_json::json!({ "task": "t1", "step": "d", "answer": "含等于，用 >=" }),
+            )
+            .unwrap();
+
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        let st = outcome.task.step("d").unwrap();
+        assert_eq!(
+            st.state,
+            StepState::Succeeded,
+            "人已经拍板了，这一步就该收尾"
+        );
+        let result = st.result.clone().unwrap_or_default();
+        assert!(result.contains("含等于"), "产物里要有人的决定: {result}");
+        assert!(
+            result.contains("human"),
+            "要标出这是人定的，不是模型选的: {result}"
+        );
+        // **真正该证的是"没去生成选项"。**
+        //
+        // 一开始我断言的是 `used_model_calls == 0`，它挂了——但那 1 次是
+        // **拆解**花的（引擎先拆解再执行），不是决策步骤花的。
+        // 断言写宽了会把正确行为判成错的，而这里要盯的是
+        // `observe`：决策步骤靠它生成选项，人答过之后**一次都不该调**。
+        assert_eq!(
+            handler.observe_calls, 0,
+            "人答过之后不该再去生成选项——那正是死循环里被反复浪费的调用"
+        );
+    }
+
+    #[test]
+    fn a_human_answer_revives_a_step_whose_retries_ran_out() {
+        // **真机上就是这一种。** 位置很要紧：检查必须在"重试次数用尽"
+        // **之前**——否则人给了答案，这一步还是被判失败，
+        // 因为引擎先看尝试次数，根本走不到"有没有人答过"。
+        //
+        // **重试计数是给模型用的，不是给人的。**
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 阈值含不含等于？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "需要选择").unwrap();
+
+        // 把尝试次数耗光：模拟"决策模型反复弃权"
+        let budget = Budget {
+            max_attempts_per_step: 2,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let _ = engine(&router, &decider, &mut handler, &mut store, budget).run("t1");
+            let _ = store.write(
+                "t1",
+                EventKind::StepPending,
+                serde_json::json!({
+                    "task": "t1", "step": "d",
+                    "instruction": "decide: 阈值含不含等于？",
+                    "kind": "analysis", "depends_on": [],
+                }),
+            );
+        }
+
+        // 现在人给出答案
+        store
+            .write(
+                "t1",
+                EventKind::HumanAnswered,
+                serde_json::json!({ "task": "t1", "step": "d", "answer": "含等于" }),
+            )
+            .unwrap();
+        store
+            .write(
+                "t1",
+                EventKind::StepPending,
+                serde_json::json!({
+                    "task": "t1", "step": "d",
+                    "instruction": "decide: 阈值含不含等于？",
+                    "kind": "analysis", "depends_on": [],
+                }),
+            )
+            .unwrap();
+
+        // **任务此时停在 AwaitingHuman，要先放回执行中**——
+        // 这正是 CLI 里 `resume` 做的那一步。测试里漏了它，
+        // 引擎根本不会去跑任何步骤，于是"步骤还是 Pending"。
+        store
+            .write(
+                "t1",
+                EventKind::TaskStateChanged,
+                serde_json::json!({ "task": "t1", "state": "running" }),
+            )
+            .unwrap();
+
+        let outcome = engine(&router, &decider, &mut handler, &mut store, budget)
+            .run("t1")
+            .unwrap();
+        let st = outcome.task.step("d").unwrap();
+        assert_eq!(
+            st.state,
+            StepState::Succeeded,
+            "人答过之后，尝试次数用尽也不该判失败"
+        );
+        assert!(
+            st.result.clone().unwrap_or_default().contains("含等于"),
+            "产物里要有人的决定"
+        );
+    }
+
+    #[test]
+    fn abstaining_does_not_burn_retry_attempts() {
+        // **这是真机上任务变成"卡住"的根因。**
+        //
+        // 决策模型弃权后，步骤回到待执行，但**尝试次数照样累加**。
+        // 弃权两次之后次数用光 → 步骤硬判失败 → 依赖它的全跳过 →
+        // 任务从"等人工"变成"卡住"，人再想答也没机会了。
+        //
+        // **弃权是"我需要人拍板"，不是"这次尝试失败了"。**
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding().with_choice("task_decision", "不在选项里");
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 选哪个？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "需要选择").unwrap();
+
+        let budget = Budget {
+            max_attempts_per_step: 2,
+            ..Default::default()
+        };
+        // 连着弃权 3 次——**超过重试上限**。每次都该是"等人工"，
+        // 而不是把步骤判死。
+        for round in 1..=3 {
+            let outcome = engine(&router, &decider, &mut handler, &mut store, budget)
+                .run("t1")
+                .unwrap();
+            assert_eq!(
+                outcome.task.state,
+                TaskState::AwaitingHuman,
+                "第 {round} 次弃权后该是等人工，实际 {}",
+                outcome.task.state.label()
+            );
+            assert_eq!(
+                outcome.task.step("d").unwrap().state,
+                StepState::Pending,
+                "第 {round} 次弃权后步骤该退回待执行"
+            );
         }
     }
 
