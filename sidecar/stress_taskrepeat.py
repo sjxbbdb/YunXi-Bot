@@ -198,7 +198,7 @@ def main() -> int:
         for f in r["failures"]:
             print(f"          ✗ {f}")
             # 工具循环那类失败——把它调过什么打出来
-            if "工具循环" in f:
+            if "工具循环" in f or "同一个动作" in f:
                 calls = r.get("tool_rounds", {}).get("all", [])
                 if calls:
                     print(f"             这一轮共调工具 {len(calls)} 次，最后 12 次："
