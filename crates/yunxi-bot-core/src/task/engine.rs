@@ -917,6 +917,30 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             "{why}：步骤 {} 需要人工判断「{question}」；候选 = {options:?}",
             step.id
         );
+        // **弃权也要进台账。**
+        //
+        // 决策模型**拍板**那条路已经留了痕（`StepSucceeded` 的 result 里
+        // 有 choice / rationale / alternatives）。但**弃权这条路没有**——
+        // `why` 只进了返回值，谁没接住就没了。
+        //
+        // 为什么这个缺口要紧（D78）：**决策模型接管之后，人从回路里退出了**。
+        // 以前每个 `decide:` 都问人，人看到问题本身就是一道检查；
+        // 现在它自己拍板，"它拍了什么、凭什么"只能靠台账。
+        // 而**弃权是最需要解释的那一种**——"它为什么不敢定"直接说明
+        // 那一类问题它判不了，那正是该去调提示词或补样本的地方。
+        self.store.write(
+            task_id,
+            EventKind::DecisionAsked,
+            serde_json::json!({
+                "task": task_id,
+                "step": step.id,
+                "question": question,
+                "options": options,
+                // **说清是"谁"没定下来。** "决策模型弃权"和
+                // "选项少于两个"是两种完全不同的原因，混在一起就查不出东西。
+                "why": why,
+            }),
+        )?;
         // 步骤回到待执行，但任务状态转等人工——人处理完之后重新跑就能续上。
         // **`fresh: true`：弃权不该消耗重试次数。**
         self.reset_step(task_id, step, true)?;
@@ -2124,6 +2148,70 @@ mod tests {
                 .iter()
                 .any(|(id, r)| id == "s1" && r.contains("清单是")),
             "给的是 s1 的真实产出：{s2_inputs:?}"
+        );
+    }
+
+    #[test]
+    fn an_abstention_is_recorded_in_the_ledger() {
+        // **决策模型接管之后，人从回路里退出了。**
+        //
+        // 以前每个 `decide:` 都问人，人看到问题本身就是一道检查；
+        // 现在它自己拍板，"它拍了什么、凭什么"只能靠台账。
+        //
+        // 拍板那条路本来就留了痕（`StepSucceeded` 的 result 里有
+        // choice / rationale）。**弃权这条没有**——`why` 只进了返回值，
+        // 谁没接住就没了。而弃权恰恰是最需要解释的那一种：
+        // "它为什么不敢定"直接说明那一类问题它判不了。
+        let router = ModelRouter::default();
+        // **"选了不在选项里的东西"就是弃权那条路。**
+        // 用 `failing` 不行——那是"决策器坏了"，走的是降级，
+        // 而这里要测的是"决策器能跑，但它不敢定"。
+        let decider = StubDecider::succeeding().with_choice("task_decision", "不在选项里");
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        // **步骤的指令必须真的以 `decide:` 开头**——否则引擎根本不走
+        // 决策那条路，测试会挂在一个和被测行为无关的地方。
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 选哪个？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        handler.steps = vec![Ok("OK: 完成了".into())];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "做一个决定").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        let events = store.events();
+        let asked = events
+            .iter()
+            .filter(|e| e.kind == EventKind::DecisionAsked)
+            .collect::<Vec<_>>();
+        assert_eq!(asked.len(), 1, "弃权该留下一条 DecisionAsked");
+        let d = &asked[0].data;
+        assert_eq!(d["task"], serde_json::json!("t1"));
+        assert_eq!(d["step"], serde_json::json!("d"));
+        // **问题原文要在。** 只记"某一步弃权了"等于没记——
+        // 事后要看的是"它当时在纠结什么"。
+        assert!(
+            d["question"].as_str().is_some_and(|q| !q.is_empty()),
+            "问题原文必须留下：{d}"
+        );
+        // **候选也要在**：是"没有好选项"还是"选项都差不多"，从候选能看出来
+        assert!(
+            d["options"].as_array().is_some_and(|a| !a.is_empty()),
+            "{d}"
+        );
+        // **说清是"谁"没定下来。** "决策模型弃权"和"选项少于两个"
+        // 是两种完全不同的原因，混在一起就查不出东西。
+        assert!(
+            d["why"].as_str().is_some_and(|w| !w.is_empty()),
+            "要说清为什么升级人工：{d}"
         );
     }
 
