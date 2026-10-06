@@ -163,6 +163,9 @@ pub struct ChatHandler {
     /// 对话会话的稳定前缀。**提前算好**——载入会话时要拿它和存档里的
     /// 指纹比，而"先建会话再比"会覆盖掉存档里的指纹。
     chat_prefix: String,
+    /// 启动时读到的项目规则。**留着是为了能报出来源**——
+    /// 模型说"按项目约定应该……"时，使用者得能查到那指的是哪一条。
+    project_rules: yunxi_bot_core::rules::RuleSet,
     /// 可用的工具。空表示这条链路没有工具（行为与加工具之前完全一致）。
     tools: ToolRegistry,
     /// 谁能回答"批不批准"。默认谁都不问、一律拒绝。
@@ -184,15 +187,36 @@ pub struct ChatHandler {
 impl ChatHandler {
     /// `persona_text` 与 `rules` 来自配置；它们会被拼进稳定前缀。
     pub fn new(home: PathBuf, persona_name: &str, persona_text: &str, rules: Vec<String>) -> Self {
+        // **项目规则在这里读一次，就定下来。**
+        //
+        // 它进稳定前缀，而前缀每轮变的话缓存全废——所以不能
+        // "每次拼前缀时现读"。中途 cwd 变了导致的差异由
+        // `PrefixMismatch` 处理（保留历史、换新前缀、如实报告）。
+        //
+        // 找规则用 cwd：使用者关心的是"我现在在哪个项目里工作"，
+        // 而不是数据目录在哪。
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let project_rules = yunxi_bot_core::rules::RuleSet::discover(&cwd, &home);
         Self {
             home,
             thinkers: BTreeMap::new(),
             sessions: BTreeMap::new(),
-            chat_prefix: format!(
-                "{}\n\n{}",
-                build_persona(persona_name, persona_text, &rules),
-                CHAT_SYSTEM
-            ),
+            chat_prefix: {
+                let base = format!(
+                    "{}\n\n{}",
+                    build_persona(persona_name, persona_text, &rules),
+                    CHAT_SYSTEM
+                );
+                let rules_text = project_rules.render();
+                // **没有规则时不拼空段**：那会平白占掉前缀的 token，
+                // 还每轮都一样地占。
+                if rules_text.is_empty() {
+                    base
+                } else {
+                    format!("{base}\n\n{rules_text}")
+                }
+            },
+            project_rules,
             persona: build_persona(persona_name, persona_text, &rules),
             tools: ToolRegistry::new(),
             approver: std::sync::Arc::new(std::sync::Mutex::new(RefusingApprover)),
@@ -324,6 +348,11 @@ impl ChatHandler {
             },
             layout,
         );
+    }
+
+    /// 启动时加载到的项目规则。
+    pub fn project_rules(&self) -> &yunxi_bot_core::rules::RuleSet {
+        &self.project_rules
     }
 
     /// 当前应该用的对话稳定前缀。
@@ -761,6 +790,43 @@ mod chat_session_tests {
             DEFAULT_PERSONA,
             default_rules(),
         )
+    }
+
+    #[test]
+    fn loaded_rules_actually_reach_the_stable_prefix() {
+        // **"加载了"和"进了前缀"是两件事。**
+        //
+        // 调试时踩过：规则加载正常、`/rules` 列得好好的，而模型说
+        // "系统提示词里没有这一节"。那次差一点去查模型，其实是接线断了。
+        //
+        // 这条断言不依赖具体环境（有没有 AGENTS.md 都成立）：
+        // **只要加载到了规则，它就必须出现在前缀里。**
+        let h = handler();
+        let rs = h.project_rules();
+        if rs.is_empty() {
+            return; // 这个目录没有规则，无从断言——不是失败
+        }
+        let prefix = h.expected_chat_prefix();
+        for f in &rs.files {
+            let first = f.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            assert!(
+                prefix.contains(first),
+                "规则 {} 加载了却没进前缀——接线断了",
+                f.path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_prefix_has_no_empty_rules_section_when_nothing_was_found() {
+        // 没有规则时不拼空段：那会平白占掉前缀的 token，还每轮都一样地占
+        let h = handler();
+        if h.project_rules().is_empty() {
+            assert!(
+                !h.expected_chat_prefix().contains("# 项目约定"),
+                "没有规则却拼了个空标题"
+            );
+        }
     }
 
     #[test]

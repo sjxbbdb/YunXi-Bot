@@ -209,6 +209,13 @@ pub fn run(
         }
     }
 
+    // **启动时把规则说清楚。** 不说的话，使用者不知道它读到了什么——
+    // 而"它怎么知道这个项目的测试命令"和"它怎么不知道"都要有答案。
+    let rs = handler.project_rules();
+    if !rs.is_empty() {
+        println!("{}", rs.summary());
+    }
+
     if turns == 0 {
         println!("新会话：{session_id}");
         println!("  （输入内容开始；`/help` 看命令，`/exit` 退出）");
@@ -263,6 +270,56 @@ pub fn run(
                     turns = 0;
                     resumed_turns = 0;
                     println!("已开新会话（旧的还在，用 `chat list` 能看到）。");
+                    continue;
+                }
+                "rules" => {
+                    // **要能查到规则从哪来的。** 模型说"按项目约定应该……"
+                    // 时，使用者得能核实那指的是哪一条。
+                    let rs = handler.project_rules();
+                    if rs.is_empty() {
+                        println!("没有找到项目规则文件。");
+                        println!();
+                        println!("在工作目录（或它的上级）放一份 AGENTS.md，");
+                        println!("它会被自动读进稳定前缀——以后不用每次重说。");
+                        println!("兼容 CLAUDE.md；两者都在时 AGENTS.md 优先。");
+                        println!();
+                        println!("停止条件：遇到含 .git 的目录就不再往上找。");
+                    } else {
+                        // **顺带验证接线。** "规则加载了"和"规则真的进了前缀"
+                        // 是两件事——只报前者的话，接线断了也看不出来。
+                        // 这个检查是端到端测试逼出来的：规则加载正常、
+                        // `/rules` 列得好好的，而模型说"系统提示词里没有这一节"。
+                        let prefix = handler.expected_chat_prefix();
+                        let first_line = rs.files[0]
+                            .text
+                            .lines()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or("");
+                        println!(
+                            "稳定前缀 {} 字；规则已进前缀：{}",
+                            prefix.chars().count(),
+                            if !first_line.is_empty() && prefix.contains(first_line) {
+                                "是"
+                            } else {
+                                "**否——接线断了**"
+                            }
+                        );
+                        println!();
+                        println!(
+                            "加载了 {} 份规则（从远到近，近的对模型影响更大）：",
+                            rs.files.len()
+                        );
+                        for f in &rs.files {
+                            println!(
+                                "  [{:<4}] {}{}",
+                                f.scope.label(),
+                                f.path.display(),
+                                if f.truncated { "（已截断）" } else { "" }
+                            );
+                            let first = f.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                            println!("          {}", first.chars().take(60).collect::<String>());
+                        }
+                    }
                     continue;
                 }
                 "usage" => {
@@ -417,6 +474,7 @@ fn print_help() {
     println!("  /save              立刻存盘（其实每轮都自动存）");
     println!("  /history           看本会话有多少轮");
     println!("  /usage             看上下文用了多少、什么时候会压缩");
+    println!("  /rules             看加载了哪些项目规则、从哪来的");
     println!("  /clear             开一个新会话（旧的保留）");
     println!("  /exit              退出（等价于 Ctrl+D）");
     println!();

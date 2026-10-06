@@ -39,6 +39,7 @@ pub mod notify;
 #[cfg(windows)]
 pub mod notify_windows;
 pub mod policy;
+pub mod rules;
 pub mod runner;
 pub mod task;
 pub mod think;
