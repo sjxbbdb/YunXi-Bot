@@ -263,10 +263,10 @@ fn fenced_blocks(text: &str) -> Vec<&str> {
 fn container_slices(text: &str) -> Vec<&str> {
     let mut out = Vec::new();
     for (start, byte) in text.bytes().enumerate() {
-        if matches!(byte, b'{' | b'[') {
-            if let Some(slice) = balanced_from(text, start) {
-                out.push(slice);
-            }
+        if matches!(byte, b'{' | b'[')
+            && let Some(slice) = balanced_from(text, start)
+        {
+            out.push(slice);
         }
     }
     out

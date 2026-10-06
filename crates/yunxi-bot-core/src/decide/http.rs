@@ -229,15 +229,13 @@ fn parse_response(raw: &[u8]) -> Result<String, HttpError> {
 
     // 分块传输必须显式拒绝：静默把 chunk 头当正文会得到看似成功的坏数据
     for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.eq_ignore_ascii_case("transfer-encoding")
-                && v.to_ascii_lowercase().contains("chunked")
-            {
-                return Err(HttpError::Malformed(
-                    "不支持分块传输编码，请让 sidecar 返回 Content-Length 或 Connection: close"
-                        .into(),
-                ));
-            }
+        if let Some((k, v)) = line.split_once(':')
+            && k.eq_ignore_ascii_case("transfer-encoding")
+            && v.to_ascii_lowercase().contains("chunked")
+        {
+            return Err(HttpError::Malformed(
+                "不支持分块传输编码，请让 sidecar 返回 Content-Length 或 Connection: close".into(),
+            ));
         }
     }
 

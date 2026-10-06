@@ -282,10 +282,10 @@ impl Ledger {
     /// 而不是跳过——静默跳行会让投影悄悄偏离真相。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| LedgerError::Io(e.to_string()))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| LedgerError::Io(e.to_string()))?;
         }
 
         let mut events = Vec::new();
@@ -734,14 +734,13 @@ pub fn task_from_events(events: &[Event]) -> crate::task::TaskSet {
                 }
             }
             EventKind::TaskStateChanged => {
-                if let Some(t) = out.get_mut(&id) {
-                    if let Some(s) = e
+                if let Some(t) = out.get_mut(&id)
+                    && let Some(s) = e
                         .data
                         .get("state")
                         .and_then(|v| serde_json::from_value::<TaskState>(v.clone()).ok())
-                    {
-                        t.state = s;
-                    }
+                {
+                    t.state = s;
                 }
             }
             EventKind::StepPending => {

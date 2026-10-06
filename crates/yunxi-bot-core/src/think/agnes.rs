@@ -38,10 +38,10 @@ impl ApiKey {
     /// 顺序：`YUNXI_BOT_AGNES_KEY` 环境变量 → `key_file`。
     /// 文件方式优先于命令行参数，**避免密钥出现在进程列表里**。
     pub fn load(key_file: &Path) -> Result<Self, ThinkError> {
-        if let Ok(v) = std::env::var("YUNXI_BOT_AGNES_KEY") {
-            if !v.trim().is_empty() {
-                return Ok(Self::new(v));
-            }
+        if let Ok(v) = std::env::var("YUNXI_BOT_AGNES_KEY")
+            && !v.trim().is_empty()
+        {
+            return Ok(Self::new(v));
         }
         let text = std::fs::read_to_string(key_file).map_err(|e| {
             ThinkError::Auth(format!(

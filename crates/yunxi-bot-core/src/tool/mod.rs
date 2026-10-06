@@ -77,6 +77,24 @@ pub enum Capability {
     ///
     /// **这一类永远需要人工，且不接受模型判定。** 见 [`gate`]。
     Outbound,
+    /// 能力未知。**MCP 工具默认用这一类。**
+    ///
+    /// ## 为什么需要它，而不是挑一个"最像的"
+    ///
+    /// MCP server 会在握手时声明自己提供什么工具，但**那是声称，不是事实**——
+    /// 一个 server 说自己"只读"，我们没有任何办法核实它。挑一个最像的类别
+    /// 就等于把它的自称当成了事实。
+    ///
+    /// 所以这一类：
+    ///
+    /// - **不享受只读的自动放行**（哪怕它自称只读）
+    /// - **不接受模型判定**（和 `Outbound` 一样）——让一个模型去判断
+    ///   "这个自称只读的东西能不能跑"，正是不可核实的声称该被挡住的地方
+    /// - **只有使用者显式写的 `allow` 规则才能预批准**
+    ///
+    /// 代价是新增 MCP server 时使用者要多写一条规则。那是**刻意的**：
+    /// 装一个第三方 server 等于把它的能力引进你的机器，这个决定应该有人签字。
+    Unknown,
 }
 
 impl Capability {
@@ -87,6 +105,7 @@ impl Capability {
             Capability::Execute => "执行",
             Capability::Network => "网络",
             Capability::Outbound => "不可逆",
+            Capability::Unknown => "能力未知",
         }
     }
 
@@ -98,6 +117,16 @@ impl Capability {
     /// 不可逆的能力。**任何情况下都不交给模型判。**
     pub fn is_irreversible(self) -> bool {
         matches!(self, Capability::Outbound)
+    }
+
+    /// 需要**显式预批准**的能力：没有 `allow` 规则就必须问人，且**不问模型**。
+    ///
+    /// 两条不同的理由，同一个结论：
+    ///
+    /// - `Outbound`：不可逆，ADR §八 第 2 条明令禁止模型参与
+    /// - `Unknown`：来源的能力声称**不可核实**，交给模型等于把它的自称当真
+    pub fn needs_explicit_approval(self) -> bool {
+        matches!(self, Capability::Outbound | Capability::Unknown)
     }
 }
 
@@ -594,7 +623,7 @@ pub fn gate(
     // 这里刻意不接受 `decider` 的判定。ADR §八 第 2 条写的是"不可逆动作必须
     // 人工批准，且批准不参与降级"——让一个模型去决定"这次删除不用问人"，
     // 正是那条规则要禁止的事。
-    if cap.is_irreversible() {
+    if cap.needs_explicit_approval() {
         if let Some(r) = policy
             .allow
             .iter()

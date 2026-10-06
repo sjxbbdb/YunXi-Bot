@@ -736,19 +736,20 @@ impl ModelRouter {
         //
         // 判据顺序很关键：**调用次数决定"要不要换不排队的模型"，
         // 需要推理决定"能不能省这次钱"**。后者是硬约束，前者是优化。
-        if kind.needs_reasoning() && !spec.accepts_thinking() && effort != ReasoningEffort::Never {
-            if let Some(better) = self
+        if kind.needs_reasoning()
+            && !spec.accepts_thinking()
+            && effort != ReasoningEffort::Never
+            && let Some(better) = self
                 .specs
                 .iter()
                 .filter(|s| s.accepts_thinking())
                 .min_by_key(|s| s.tier)
-            {
-                reason.push_str(&format!(
-                    "；这一步需要推理，但 {} 不支持思考模式，改用 {}",
-                    spec.provider, better.provider
-                ));
-                spec = better.clone();
-            }
+        {
+            reason.push_str(&format!(
+                "；这一步需要推理，但 {} 不支持思考模式，改用 {}",
+                spec.provider, better.provider
+            ));
+            spec = better.clone();
         }
 
         // ---- 思考轴：由任务类型决定 ----

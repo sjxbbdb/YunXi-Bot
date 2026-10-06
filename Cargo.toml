@@ -6,7 +6,7 @@ members = ["crates/yunxi-bot-core", "crates/yunxi-bot-cli"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.88"
 repository = "https://github.com/sjxbbdb/YunXi-Bot"
 
 [workspace.dependencies]
@@ -24,6 +24,19 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # ureq 是阻塞式、体积小的选择，底层是 rustls。选它而不是 reqwest：
 # 后者把 tokio 整套异步运行时也带进来，而本项目的守护循环是同步的。
 ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
+# MCP 客户端。**这是唯一引入异步运行时的依赖**，代价是量出来的：
+#   67 个包 -> 104 个包，构建约 16 秒
+# 选 rmcp 3.5.1 而不是 2.2.0：后者是 cargo 因 rust-version 门限自动退回的旧大版本
+# （3.5.1 要求 rustc 1.88）。两者代价几乎一样（105 vs 104 包），
+# 但 MCP 规范变化很快，为一个新集成钉在旧大版本上没有道理。
+#
+# 只开三个 feature，**刻意不引 reqwest**：HTTP 传输会带来第二套 TLS 栈
+# （我们已用 ureq + rustls）。绝大多数 MCP server 就是 npx/uvx/独立二进制，
+# stdio 覆盖得住。
+rmcp = { version = "3.5.1", default-features = false, features = ["client", "transport-child-process", "transport-io"] }
+# rmcp 自带 tokio，但需要调用方提供运行时。只用当前线程运行时（`rt`）——
+# 不用 `rt-multi-thread`：MCP 客户端是"发一条等一条"的形状，多线程运行时是白付的。
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "process", "io-util"] }
 yunxi-bot-core = { path = "crates/yunxi-bot-core" }
 
 [profile.release]

@@ -31,6 +31,7 @@ pub mod info;
 pub mod instance;
 pub mod job;
 pub mod ledger;
+pub mod mcp;
 pub mod memory;
 pub mod notify;
 /// Windows toast 后端。**不在非 Windows 平台上编译**——它依赖 PowerShell + WinRT，
@@ -118,15 +119,15 @@ pub fn now_millis() -> Result<u64, CoreError> {
 /// 靠 `YUNXI_BOT_HOME` 对齐。Python 那边改不动这个事实，
 /// 所以 Rust 侧至少要保证自己不重复。
 pub fn default_home() -> std::path::PathBuf {
-    if let Ok(v) = std::env::var("YUNXI_BOT_HOME") {
-        if !v.trim().is_empty() {
-            return std::path::PathBuf::from(v);
-        }
+    if let Ok(v) = std::env::var("YUNXI_BOT_HOME")
+        && !v.trim().is_empty()
+    {
+        return std::path::PathBuf::from(v);
     }
-    if cfg!(windows) {
-        if let Ok(la) = std::env::var("LOCALAPPDATA") {
-            return std::path::PathBuf::from(la).join("YunXiBot");
-        }
+    if cfg!(windows)
+        && let Ok(la) = std::env::var("LOCALAPPDATA")
+    {
+        return std::path::PathBuf::from(la).join("YunXiBot");
     }
     let mut p = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     p.push(".yunxi-bot");

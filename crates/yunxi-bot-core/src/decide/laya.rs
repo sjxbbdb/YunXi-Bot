@@ -168,13 +168,13 @@ pub fn validate(req: &DecisionRequest, result: &DecisionResult) -> Result<(), De
                 )?;
             }
             QuestionKind::Score { levels } => {
-                if let Some(chosen) = a.choice.as_deref() {
-                    if !levels.iter().any(|l| l == chosen) {
-                        return Err(DecisionError::Invalid(format!(
-                            "问题 {} 返回了未声明的等级 {chosen:?}",
-                            q.id
-                        )));
-                    }
+                if let Some(chosen) = a.choice.as_deref()
+                    && !levels.iter().any(|l| l == chosen)
+                {
+                    return Err(DecisionError::Invalid(format!(
+                        "问题 {} 返回了未声明的等级 {chosen:?}",
+                        q.id
+                    )));
                 }
                 check_distribution(
                     &q.id,
@@ -216,12 +216,12 @@ fn check_distribution(
                 "问题 {qid} 的分布项 {k}={v} 越界"
             )));
         }
-        if let Some(allowed) = &allowed {
-            if !allowed.contains(&k.as_str()) {
-                return Err(DecisionError::Invalid(format!(
-                    "问题 {qid} 的分布含未声明项 {k:?}"
-                )));
-            }
+        if let Some(allowed) = &allowed
+            && !allowed.contains(&k.as_str())
+        {
+            return Err(DecisionError::Invalid(format!(
+                "问题 {qid} 的分布含未声明项 {k:?}"
+            )));
         }
         sum += v;
     }

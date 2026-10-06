@@ -121,6 +121,8 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --limit <n>           取几封（默认 20）
       --read <uid>          看某封的正文
       --port <n>            sidecar 端口（默认 17871）
+  yunxi-bot mcp list          连上配置的 MCP server 并列出它的工具
+  yunxi-bot mcp call <s> <t>  调一个 MCP 工具（--args '{...}'）
   yunxi-bot tools             列出工具及其能力类别（不需要模型）
   yunxi-bot tasks             列出执行框架里的任务及其步骤
   yunxi-bot tasks <id>        看一个任务的步骤明细
@@ -210,6 +212,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "notify" => cmd_notify(rest),
         "mail" => cmd_mail(rest),
         "check" => cmd_check(rest),
+        "mcp" => cmd_mcp(rest),
         "feedback" => cmd_feedback(rest),
         "resume" => cmd_resume(rest),
         "cost" => cmd_cost(rest),
@@ -1056,7 +1059,7 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         //
         // 放在调度之后：先让任务跑完，判断才有新的事实可看。
         if let Some(engine) = engine.as_mut() {
-            if judge_every > 0 && n % judge_every == 0 {
+            if judge_every > 0 && n.is_multiple_of(judge_every) {
                 run_agent_round(&mut l, engine, thinker.as_ref(), &agent_home, n);
             }
 
@@ -2046,6 +2049,144 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     }
 }
 
+/// MCP：列出外部 server 的工具，或者调一个。
+///
+/// ## 为什么这个命令必须存在
+///
+/// MCP 工具**默认需要审批**（`Capability::Unknown`——server 声称的能力
+/// 不可核实）。所以使用者加一个 server 之后，第一件想做的事是
+/// **看它到底提供了什么**，第二件是**在写审批规则之前先试一次**。
+/// 没有这两个入口，加 server 就成了一件盲盒。
+///
+/// ## 它和 `tools` 的分工
+///
+/// - `tools`：本进程注册了哪些工具（MCP 的也在里面，标着"能力未知"）
+/// - `mcp list`：连上 server，看它**声称**提供什么
+///
+/// 两者不一样是有意的：前者是"我能调什么"，后者是"它说它能什么"。
+fn cmd_mcp(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::mcp::{McpConfig, McpHub, SERVERS_FILE};
+
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let cfg_path = default_home().join(SERVERS_FILE);
+
+    let cfg = match McpConfig::load(&default_home()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(2);
+        }
+    };
+
+    if cfg.servers.is_empty() {
+        println!("没有配置 MCP server。");
+        println!();
+        println!("配置文件: {}", cfg_path.display());
+        println!("形如：");
+        println!("  {{");
+        println!("    \"servers\": [");
+        println!("      {{ \"name\": \"time\", \"command\": \"uvx\",");
+        println!("        \"args\": [\"mcp-server-time\"] }}");
+        println!("    ]");
+        println!("  }}");
+        println!();
+        println!("注意：server 名不能含双下划线（那是工具名的分隔符）。");
+        println!("装的 server 提供的工具默认**需要审批**——那是刻意的：");
+        println!("装一个第三方 server 等于把它的能力引进你的机器，这个决定该有人签字。");
+        return Ok(if sub == "list" { 0 } else { 2 });
+    }
+
+    print!("连接 {} 个 MCP server…", cfg.servers.len());
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+
+    let (mut hub, problems) = match McpHub::connect(&cfg) {
+        Ok(v) => v,
+        Err(e) => {
+            println!();
+            eprintln!("{e}");
+            return Ok(2);
+        }
+    };
+    println!(" 完成");
+    for p in &problems {
+        // **起不来的必须说出来。** 否则使用者以为它连上了，
+        // 而"工具少了一个"会被归因到别处。
+        eprintln!("  ✗ {p}");
+    }
+    let names = hub.server_names();
+    println!(
+        "已连上: {}",
+        if names.is_empty() {
+            "（无）".to_string()
+        } else {
+            names.join(", ")
+        }
+    );
+
+    match sub {
+        "list" => {
+            let tools = hub.list_tools();
+            println!();
+            println!("共 {} 个工具：", tools.len());
+            for t in &tools {
+                println!();
+                println!("  {}", t.qualified);
+                println!("      来源  : {}（原名 {}）", t.server, t.name);
+                if !t.description.is_empty() {
+                    println!("      说明  : {}", truncate_chars(&t.description, 90));
+                }
+                println!("      能力  : 能力未知（需审批）");
+            }
+            if tools.is_empty() {
+                println!("（这个 server 没提供任何工具）");
+            }
+            Ok(0)
+        }
+        "call" => {
+            let pos: Vec<&String> = args
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with("--"))
+                .collect();
+            let (Some(server), Some(tool)) = (pos.first(), pos.get(1)) else {
+                eprintln!("用法: yunxi-bot mcp call <server> <tool> [--args '<json>']");
+                return Ok(2);
+            };
+            let raw = flag(args, "--args").unwrap_or("{}");
+            let parsed: serde_json::Value = match serde_json::from_str(raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("--args 不是合法 JSON: {e}");
+                    return Ok(2);
+                }
+            };
+
+            println!();
+            println!("调用 {server} / {tool} …");
+            match hub.call(server, tool, parsed) {
+                Ok(text) => {
+                    println!();
+                    println!("{text}");
+                    Ok(0)
+                }
+                Err(e) => {
+                    // **"这次做不到"不是"程序坏了"。** 如实报出来，
+                    // 让调用方能换条路，而不是当成崩溃。
+                    eprintln!("调用失败: {e}");
+                    Ok(1)
+                }
+            }
+        }
+        other => {
+            eprintln!("未知子命令「{other}」");
+            eprintln!("用法: yunxi-bot mcp list");
+            eprintln!("      yunxi-bot mcp call <server> <tool> [--args '<json>']");
+            Ok(2)
+        }
+    }
+}
+
 /// 发一条桌面通知。**同时是"通知出口"的验证入口。**
 ///
 /// 它存在的理由不只是"方便测"：使用者需要一条能**自己确认出口通不通**的命令。
@@ -2546,7 +2687,23 @@ fn truncate_chars(s: &str, n: usize) -> String {
 fn cmd_tools(_args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::tool::Capability;
 
-    let r = tooling::default_registry(&default_home()).map_err(|e| format!("工具注册失败: {e}"))?;
+    let mut r =
+        tooling::default_registry(&default_home()).map_err(|e| format!("工具注册失败: {e}"))?;
+    // **MCP 工具也要出现在这里。** 它是"我能调什么"的一部分——
+    // 只在 `mcp list` 里看得到的话，使用者写审批规则时会漏掉它们。
+    let mcp = tooling::with_mcp(&mut r, &default_home());
+    match &mcp {
+        Ok((n, problems)) => {
+            if *n > 0 {
+                println!("（另有 {n} 个 MCP 工具，能力类别为「能力未知」——需显式规则才放行）");
+                println!();
+            }
+            for p in problems {
+                eprintln!("  ✗ MCP: {p}");
+            }
+        }
+        Err(e) => eprintln!("  ✗ MCP 配置有问题: {e}"),
+    }
     println!("共 {} 个工具：", r.len());
     println!();
     println!("{:<14} {:<8} 默认是否免问", "工具", "能力");

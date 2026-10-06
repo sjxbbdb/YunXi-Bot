@@ -481,12 +481,12 @@ pub fn validate_dependencies(steps: &[Step]) -> Result<(), TaskError> {
         seen += 1;
         // 所有依赖 id 的步骤，度数减一
         for s in steps {
-            if s.depends_on.iter().any(|d| d == id) {
-                if let Some(d) = deg.get_mut(s.id.as_str()) {
-                    *d -= 1;
-                    if *d == 0 {
-                        queue.push(s.id.as_str());
-                    }
+            if s.depends_on.iter().any(|d| d == id)
+                && let Some(d) = deg.get_mut(s.id.as_str())
+            {
+                *d -= 1;
+                if *d == 0 {
+                    queue.push(s.id.as_str());
                 }
             }
         }

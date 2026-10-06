@@ -228,14 +228,14 @@ pub fn tick(ledger: &mut Ledger, opts: &TickOptions) -> Result<TickReport, Ledge
 
 /// 记录 watch 目标本轮观测到的 mtime，避免同一变更被重复触发。
 fn record_watch_observation(ledger: &mut Ledger, job: &Job) -> Result<(), LedgerError> {
-    if let Trigger::Watch { path } = &job.spec.trigger {
-        if let Some(m) = read_mtime_ms(path) {
-            ledger.append(
-                EventKind::JobWatchObserved,
-                Some(&job.id),
-                json!({ "mtime_ms": m }),
-            )?;
-        }
+    if let Trigger::Watch { path } = &job.spec.trigger
+        && let Some(m) = read_mtime_ms(path)
+    {
+        ledger.append(
+            EventKind::JobWatchObserved,
+            Some(&job.id),
+            json!({ "mtime_ms": m }),
+        )?;
     }
     Ok(())
 }

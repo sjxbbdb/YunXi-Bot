@@ -304,16 +304,16 @@ fn recent_operational_facts(events: &[Event], limit: usize) -> Vec<String> {
     // 任务名在 job_created 的 spec 里，而失败事件只带 id
     let mut names: HashMap<String, String> = HashMap::new();
     for e in events {
-        if e.kind == EventKind::JobCreated {
-            if let (Some(id), Some(name)) = (
+        if e.kind == EventKind::JobCreated
+            && let (Some(id), Some(name)) = (
                 e.job.clone(),
                 e.data
                     .get("spec")
                     .and_then(|s| s.get("name"))
                     .and_then(|v| v.as_str()),
-            ) {
-                names.insert(id, name.to_string());
-            }
+            )
+        {
+            names.insert(id, name.to_string());
         }
     }
 

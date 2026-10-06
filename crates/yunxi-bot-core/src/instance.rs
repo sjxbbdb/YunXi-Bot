@@ -125,20 +125,20 @@ impl InstanceLock {
     /// 陈旧锁（pid 已死或文件损坏）会被自动接管。
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self, LockError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| LockError::Io(e.to_string()))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|e| LockError::Io(e.to_string()))?;
         }
 
-        if let Ok(text) = fs::read_to_string(&path) {
-            if let Ok(info) = serde_json::from_str::<LockInfo>(&text) {
-                if is_process_alive(info.pid) && info.pid != std::process::id() {
-                    return Err(LockError::AlreadyRunning { pid: info.pid });
-                }
-            }
-            // 解析失败或进程已死：视为陈旧锁，直接接管
+        if let Ok(text) = fs::read_to_string(&path)
+            && let Ok(info) = serde_json::from_str::<LockInfo>(&text)
+            && is_process_alive(info.pid)
+            && info.pid != std::process::id()
+        {
+            return Err(LockError::AlreadyRunning { pid: info.pid });
         }
+        // 解析失败或进程已死：视为陈旧锁，直接接管
 
         let pid = std::process::id();
         let info = LockInfo {
@@ -164,13 +164,13 @@ impl InstanceLock {
 impl Drop for InstanceLock {
     fn drop(&mut self) {
         // 只删自己的锁：万一被别的实例接管过，不要误删它的
-        if let Ok(text) = fs::read_to_string(&self.path) {
-            if let Ok(info) = serde_json::from_str::<LockInfo>(&text) {
-                if info.pid == self.pid {
-                    let _ = fs::remove_file(&self.path);
-                }
-                return;
+        if let Ok(text) = fs::read_to_string(&self.path)
+            && let Ok(info) = serde_json::from_str::<LockInfo>(&text)
+        {
+            if info.pid == self.pid {
+                let _ = fs::remove_file(&self.path);
             }
+            return;
         }
         let _ = fs::remove_file(&self.path);
     }

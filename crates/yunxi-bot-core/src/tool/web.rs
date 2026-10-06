@@ -258,10 +258,8 @@ fn build_agent(use_proxy: bool, user_agent: &str) -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new()
         .timeout(HTTP_TIMEOUT)
         .user_agent(user_agent);
-    if use_proxy {
-        if let Some(proxy) = proxy_from_env() {
-            builder = builder.proxy(proxy);
-        }
+    if use_proxy && let Some(proxy) = proxy_from_env() {
+        builder = builder.proxy(proxy);
     }
     builder.build()
 }
@@ -841,12 +839,12 @@ fn decode_entities(s: &str) -> String {
         if s.as_bytes()[i] == b'&' {
             // 实体名最长也就十来个字符，限制搜索范围可以避免把
             // 正文里孤零零一个 `&` 后面到很远的 `;` 当成一个实体。
-            if let Some(semi) = s[i..].find(';').filter(|p| *p <= 12) {
-                if let Some(value) = entity_value(&s[i + 1..i + semi]) {
-                    out.push_str(&value);
-                    i += semi + 1;
-                    continue;
-                }
+            if let Some(semi) = s[i..].find(';').filter(|p| *p <= 12)
+                && let Some(value) = entity_value(&s[i + 1..i + semi])
+            {
+                out.push_str(&value);
+                i += semi + 1;
+                continue;
             }
         }
         // 不是实体：原样推进**一个字符**（不是一字节），别切断多字节字符。
@@ -1610,12 +1608,13 @@ fn percent_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                out.push(high * 16 + low);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push(high * 16 + low);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;

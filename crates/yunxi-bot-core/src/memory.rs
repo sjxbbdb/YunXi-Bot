@@ -137,12 +137,12 @@ impl Memory {
                     );
                 }
                 EventKind::MemoryReinforced => {
-                    if let Some(id) = e.data.get("id").and_then(|v| v.as_str()) {
-                        if let Some(entry) = mem.entries.get_mut(id) {
-                            let delta = e.data.get("delta").and_then(|v| v.as_f64()).unwrap_or(0.2);
-                            entry.weight = (entry.weight + delta).clamp(0.0, 10.0);
-                            entry.last_used_at = Some(e.at);
-                        }
+                    if let Some(id) = e.data.get("id").and_then(|v| v.as_str())
+                        && let Some(entry) = mem.entries.get_mut(id)
+                    {
+                        let delta = e.data.get("delta").and_then(|v| v.as_f64()).unwrap_or(0.2);
+                        entry.weight = (entry.weight + delta).clamp(0.0, 10.0);
+                        entry.last_used_at = Some(e.at);
                     }
                 }
                 EventKind::MemoryForgotten => {

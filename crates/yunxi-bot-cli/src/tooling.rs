@@ -55,12 +55,12 @@ fn stdin_ask(question: &str, options: &[String]) -> Option<String> {
 
     let answer = line.trim().to_string();
     // 给了选项就接受序号，省得使用者手打一遍
-    if !options.is_empty() {
-        if let Ok(i) = answer.parse::<usize>() {
-            if i >= 1 && i <= options.len() {
-                return Some(options[i - 1].clone());
-            }
-        }
+    if !options.is_empty()
+        && let Ok(i) = answer.parse::<usize>()
+        && i >= 1
+        && i <= options.len()
+    {
+        return Some(options[i - 1].clone());
     }
     Some(answer)
 }
@@ -127,6 +127,34 @@ pub fn default_registry(home: &Path) -> Result<ToolRegistry, String> {
     add(Arc::new(AskUserTool::new(ask)))?;
 
     Ok(r)
+}
+
+/// 在基础工具之上再接上 MCP（如果配了的话）。
+///
+/// ## 为什么单独一个函数而不是塞进 `default_registry`
+///
+/// 因为**连 MCP 会起子进程**（npx/uvx/独立二进制），慢且可能失败。
+/// 把它混进"建工具表"这件事里，会让每个不关心 MCP 的命令都付这个代价——
+/// 包括 `yunxi-bot tools` 这种纯查询。
+///
+/// ## 返回什么
+///
+/// `(接入了几个, 起不来的 server)`
+///
+/// **起不来的必须报出来。** 否则使用者以为它连上了，
+/// 而"工具少了一个"会被归因到别处——那种排查很贵。
+pub fn with_mcp(registry: &mut ToolRegistry, home: &Path) -> Result<(usize, Vec<String>), String> {
+    use yunxi_bot_core::mcp::{McpConfig, McpHub, register_tools};
+
+    let cfg = McpConfig::load(home).map_err(|e| e.to_string())?;
+    if cfg.servers.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+
+    let (hub, problems) = McpHub::connect(&cfg).map_err(|e| e.to_string())?;
+    let hub = Arc::new(std::sync::Mutex::new(hub));
+    let n = register_tools(registry, &hub);
+    Ok((n, problems.iter().map(|p| p.to_string()).collect()))
 }
 
 /// 从命令行参数拼审批策略。
