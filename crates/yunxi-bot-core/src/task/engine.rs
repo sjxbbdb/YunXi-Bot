@@ -388,7 +388,45 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
                 task = self.load(task_id)?;
 
                 if task.all_settled() {
-                    self.finish(task_id, TaskState::Done)?;
+                    // **"所有步骤都尘埃落定"不等于"目标达成了"。**
+                    //
+                    // 失败和跳过的步骤**也是 settled**。把它们算成完成，
+                    // 就是"报告说做完了、而实际没做"——这个项目里
+                    // 定义的最坏的一类错（D18 的契约就是为它立的）。
+                    //
+                    // 真机上抓到过（D93）：`s5` 因为"需要使用者拍板"
+                    // 而 BLOCKED（**那是对的行为**），依赖它的全跳过，
+                    // 而任务状态报的是"完成"、文件一个字没改。
+                    // **12 次里出现 2 次**，不是偶发。
+                    //
+                    // **D18 那条契约管的是单步输出，管不到整条链。**
+                    // 这里补的就是整条链那一层：**有步骤没成，就不叫完成。**
+                    let broken: Vec<String> = task
+                        .steps
+                        .iter()
+                        .filter(|s| {
+                            matches!(
+                                s.state,
+                                crate::task::StepState::Failed | crate::task::StepState::Skipped
+                            )
+                        })
+                        .map(|s| s.id.clone())
+                        .collect();
+                    if broken.is_empty() {
+                        self.finish(task_id, TaskState::Done)?;
+                    } else {
+                        // **报"卡住"而不是"完成"**，并把是哪几步没成说清楚。
+                        // 不用更细的状态是因为 `Stalled` 的语义就是
+                        // "推进不下去了"——而那正是这里的事实。
+                        self.set_state(task_id, TaskState::Stalled)?;
+                        outcome = Some(EngineOutcome {
+                            task: self.load(task_id)?,
+                            used_model_calls: ledger.used(),
+                            advance: Advance::Waiting {
+                                reason: TaskError::Stalled { remaining: broken }.to_string(),
+                            },
+                        });
+                    }
                     continue;
                 }
 
@@ -2149,6 +2187,84 @@ mod tests {
                 .any(|(id, r)| id == "s1" && r.contains("清单是")),
             "给的是 s1 的真实产出：{s2_inputs:?}"
         );
+    }
+
+    #[test]
+    fn a_task_with_a_failed_step_is_not_reported_as_done() {
+        // **真机上抓到的静默错**（D93）：`s5` 因为"需要使用者拍板"
+        // 而 BLOCKED（**那是对的行为**），依赖它的全跳过，
+        // 而任务状态报的是"**完成**"、文件一个字没改。12 次里出现 2 次。
+        //
+        // 根因：`all_settled()` 把**失败和跳过也算"落定"**，
+        // 于是"所有步骤都尘埃落定"被当成了"目标达成"。
+        //
+        // **D18 那条契约管的是单步输出，管不到整条链。**
+        // 这条测试盯的就是整条链那一层。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[]), ("b", &["a"])]));
+        // **要放两次 Err。** `ScriptedHandler` 的脚本用完之后**默认返回成功**，
+        // 而失败步骤会被重试一次——只放一次的话它重试就"成了"，
+        // 测试也就测不到失败那条路（我第一版就是这么写的，跑出来还是 Done）。
+        handler.steps = vec![
+            Err(TaskError::StepFailed {
+                step: "a".into(),
+                reason: "需要使用者拍板".into(),
+            }),
+            Err(TaskError::StepFailed {
+                step: "a".into(),
+                reason: "需要使用者拍板".into(),
+            }),
+            Ok("OK: 本来该做但前置没成".into()),
+        ];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "做一件事").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+
+        let t = store.project().get("t1").cloned().unwrap();
+        assert_ne!(
+            t.state,
+            TaskState::Done,
+            "**有步骤失败却报完成，就是报告说做完了而实际没做**——最坏的一类错"
+        );
+        assert_eq!(t.state, TaskState::Stalled, "该如实报卡住");
+        // 而且要说清是哪几步——"卡住"两个字本身回答不了"哪卡的"
+        let b = t.step("b").unwrap();
+        assert_eq!(
+            b.state,
+            crate::task::StepState::Skipped,
+            "依赖失败步骤的那一步该是跳过"
+        );
+    }
+
+    #[test]
+    fn a_task_where_everything_succeeded_is_still_done() {
+        // **别把正常路径弄坏。** 每一步都成了，就该是"完成"。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[]), ("b", &["a"])]));
+        handler.steps = vec![Ok("OK: 甲".into()), Ok("OK: 乙".into())];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "做两件事").unwrap();
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("t1")
+        .unwrap();
+        let t = store.project().get("t1").cloned().unwrap();
+        assert_eq!(t.state, TaskState::Done, "都成了就该是完成");
     }
 
     #[test]
