@@ -1725,10 +1725,10 @@ fn cmd_remember(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     // 统一分隔符、去掉末尾斜杠。不一致的表现是"记了但它从来不提"。
     let scope: Option<String> = if kind == MemoryKind::Workspace {
         match std::env::current_dir() {
-            Ok(d) => {
-                let s = d.to_string_lossy().replace('/', "\\");
-                Some(s.trim_end_matches('\\').to_string())
-            }
+            // **归一逻辑只有一份**（`yunxi_bot_core::memory::normalize_scope`）。
+            // 写和召回用不一样的归一，表现就是"记了但它从来不提"——
+            // 不报错，只是静默不匹配。
+            Ok(d) => Some(yunxi_bot_core::memory::normalize_scope(&d)),
             Err(e) => {
                 // **不静默降级成"无作用域"。** 那样它会变成一条
                 // 哪个目录都不给的坏数据——人以为记住了，其实永远召不回。

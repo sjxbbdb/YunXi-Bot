@@ -587,12 +587,11 @@ impl ChatHandler {
         };
         // 疲劳参数留着但**不再用了**——`recall_for_prompt` 的签名里它是
         // "会话内计数"，这里传空表；要恢复那套只需把它换成真实计数。
-        // 规范化一次，召回时用。规范化的方式是 `Path::canonicalize` 做不到的
-        // （目录可能已不存在），所以用手工归一：统一分隔符、去掉末尾斜杠。
-        let cwd_scope: Option<String> = std::env::current_dir().ok().map(|d| {
-            let s = d.to_string_lossy().replace('/', "\\");
-            s.trim_end_matches('\\').to_string()
-        });
+        // **归一逻辑只有一份**（`yunxi_bot_core::memory::normalize_scope`）。
+        // 这里和 `remember` 必须算出同一个串，否则那条记忆永远召不回。
+        let cwd_scope: Option<String> = std::env::current_dir()
+            .ok()
+            .map(|d| yunxi_bot_core::memory::normalize_scope(&d));
         let hits = mem.recall_for_prompt(
             input,
             now,

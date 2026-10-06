@@ -224,6 +224,40 @@ pub struct Memory {
     entries: BTreeMap<String, MemoryEntry>,
 }
 
+/// 把工作目录归一成记忆作用域用的字符串。
+///
+/// ## 为什么必须只有一份
+///
+/// **写入（`remember`）和召回（`chat`）必须用完全一样的归一。**
+/// 不一致的表现是"**记了但它从来不提**"——**它不报错，只是静默地不匹配**，
+/// 而那是最难查的一种。
+///
+/// 这个 session 里已经因为"两份来源对不上"栽过好几次（D62 最典型：
+/// 两条守卫各自检查了一份前缀，两条都没检查真正发出去的那份）。
+/// 所以这段逻辑**只写一份**，两边都调它。
+///
+/// ## 归一方式
+///
+/// - 统一分隔符为 `\`（Windows 上 `current_dir()` 给的是 `\`，
+///   但别的来源可能给 `/`）
+/// - 去掉末尾分隔符
+///
+/// **不用 `Path::canonicalize`**：它会解析符号链接、而且**要求目录存在**。
+/// 而这个函数要能在"目录已经不在了"的情况下照样算出同一个值——
+/// 否则**昨天记的今天就召不回了**。
+///
+/// 边界：整个路径都是分隔符时（`/`），归一整之后会是空串，
+/// 而空串会让"无作用域"和"根目录"混在一起。所以那种情况保留一个分隔符。
+pub fn normalize_scope(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy().replace('/', "\\");
+    let trimmed = s.trim_end_matches('\\');
+    if trimmed.is_empty() {
+        "\\".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// 记忆事件的数据形状。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RecordedPayload {
@@ -1461,5 +1495,58 @@ mod workspace_scope_tests {
             Some("C:\\proj\\a"),
         );
         assert!(ids(&hits).is_empty(), "坏数据不该被召回：{:?}", ids(&hits));
+    }
+}
+
+#[cfg(test)]
+mod normalize_scope_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn different_spellings_of_the_same_directory_agree() {
+        // **这个性质才是要紧的那个。**
+        //
+        // 写的时候用 `C:\proj\a`、召回的时候用 `C:/proj/a/`——
+        // 归一之后必须是同一个串，否则那条记忆**永远召不回，
+        // 而且不报任何错**。
+        let a = normalize_scope(Path::new("C:\\proj\\a"));
+        let b = normalize_scope(Path::new("C:/proj/a/"));
+        assert_eq!(a, b, "同一个目录的两种写法必须归一成同一个串");
+    }
+
+    #[test]
+    fn a_trailing_separator_is_dropped() {
+        assert_eq!(normalize_scope(Path::new("C:\\proj\\a\\")), "C:\\proj\\a");
+        assert_eq!(normalize_scope(Path::new("C:\\proj\\a")), "C:\\proj\\a");
+    }
+
+    #[test]
+    fn forward_slashes_become_backslashes() {
+        assert_eq!(normalize_scope(Path::new("C:/proj/a")), "C:\\proj\\a");
+    }
+
+    #[test]
+    fn a_bare_root_does_not_collapse_to_empty() {
+        // **空串会和"无作用域"撞车。**
+        // `scope: None` 的语义是"在哪儿都能召回"，而空串如果被当成
+        // `Some("")`，它就跟根目录混在一起了。
+        assert_eq!(normalize_scope(Path::new("/")), "\\");
+        assert!(!normalize_scope(Path::new("/")).is_empty());
+    }
+
+    #[test]
+    fn different_directories_stay_different() {
+        // 反方向：归一不能把不同的目录并成一个——
+        // 那会让 A 项目的约定在 B 项目里生效。
+        assert_ne!(
+            normalize_scope(Path::new("C:\\proj\\a")),
+            normalize_scope(Path::new("C:\\proj\\b"))
+        );
+        // 前缀关系也不能并
+        assert_ne!(
+            normalize_scope(Path::new("C:\\proj")),
+            normalize_scope(Path::new("C:\\proj\\a"))
+        );
     }
 }
