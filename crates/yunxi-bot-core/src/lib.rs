@@ -23,6 +23,7 @@ pub mod assistant;
 pub mod companion;
 pub mod costlog;
 pub mod decide;
+pub mod diff;
 pub mod exec;
 /// 反馈回写：使用者的处置，以及下一次判断要不要记得它。
 pub mod feedback;

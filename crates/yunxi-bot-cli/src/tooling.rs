@@ -326,6 +326,7 @@ mod tests {
             specifier: None,
             arguments: "{}".into(),
             reason: "测试".into(),
+            preview: None,
         };
         // 非 --yes 且非 --dry-run 时它会去读 stdin；测试里 stdin 是空的，
         // 所以应当落到"读不到输入 → 拒绝"
@@ -342,6 +343,7 @@ mod tests {
             specifier: None,
             arguments: "{}".into(),
             reason: "测试".into(),
+            preview: None,
         };
         assert_eq!(
             a.lock().unwrap().approve(&req),

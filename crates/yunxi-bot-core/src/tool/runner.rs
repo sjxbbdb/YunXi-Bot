@@ -59,6 +59,12 @@ pub struct ApprovalRequest {
     pub arguments: String,
     /// 为什么要问。来自门禁的判定理由。
     pub reason: String,
+    /// **这次调用会造成什么后果。** 见 [`Tool::preview`]。
+    ///
+    /// `None` 表示这个工具没提供预览（读取类工具本来就没有"后果"可言）。
+    /// 那时审批框只能显示参数——而那是**参数，不是后果**，
+    /// 所以"没有预览"本身就是一件该让人知道的事。
+    pub preview: Option<String>,
 }
 
 /// 人工的答复。
@@ -202,9 +208,21 @@ pub struct ToolRunner<'a> {
     thinking: Option<crate::think::Thinking>,
     /// 工具调用的去处。`None` 表示不记录——**测试与纯计算场景的显式选择**。
     sink: Option<std::sync::Arc<dyn ToolCallSink>>,
+    /// 正文增量的去处。`None` 表示不流式（一次性拿到完整正文）。
+    ///
+    /// **它只收正文，不收工具调用。** 工具调用的增量是参数 JSON 的碎片，
+    /// 打出来是噪声，而且它们本来就不是给人读的。
+    on_delta: Option<DeltaSink>,
     /// 一轮对话最多几次工具往返。
     pub max_rounds: u32,
 }
+
+/// 正文增量的去处。
+///
+/// 抽成别名有两个理由：一是这个类型写在签名里太长了，
+/// 二是**"要把增量送到哪"这件事值得有个名字**——
+/// 它和 `ToolCallSink`（工具调用的去处）是同一层的东西。
+pub type DeltaSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 /// 一次工具调用的**判定结果**。
 ///
@@ -274,8 +292,19 @@ impl<'a> ToolRunner<'a> {
             ctx,
             thinking: None,
             sink: None,
+            on_delta: None,
             max_rounds: DEFAULT_MAX_ROUNDS,
         }
+    }
+
+    /// 设定正文增量的去处。
+    ///
+    /// **不设就是不流式**——行为和加这个功能之前完全一致
+    /// （一次性拿到完整正文）。常驻循环、测试、无人值守场景
+    /// 都不需要流式，也不该为它付代价。
+    pub fn with_on_delta(mut self, f: DeltaSink) -> Self {
+        self.on_delta = Some(f);
+        self
     }
 
     /// 设定工具调用的去处。
@@ -339,7 +368,17 @@ impl<'a> ToolRunner<'a> {
                 req = req.with_tools(specs.clone());
             }
 
-            let resp = thinker.think(&req)?;
+            // **走流式入口。** 不支持的 Thinker 会退化成一次性返回
+            // （`Thinker::think_stream` 的默认实现），所以这里不需要判断。
+            let resp = {
+                let cb = self.on_delta.clone();
+                let mut emit = |t: &str| {
+                    if let Some(f) = &cb {
+                        f(t);
+                    }
+                };
+                thinker.think_stream(&req, &mut emit)?
+            };
 
             let reqs = parse_tool_calls(&resp.tool_calls);
             if reqs.is_empty() {
@@ -447,6 +486,11 @@ impl<'a> ToolRunner<'a> {
                     specifier: spec.clone(),
                     arguments: args_head,
                     reason: reason.clone(),
+                    // **在真正执行之前算，而且必须只读。**
+                    // 算不出来（读不了、参数不全）就给 `None`——
+                    // 那时审批框会如实说"没提供预览"，
+                    // 而不是让人以为参数 JSON 就是后果。
+                    preview: tool.preview(&tr.arguments, &self.ctx),
                 };
                 match self.approver.approve(&req) {
                     Approval::Deny => Decided::Settled(ToolCallRecord {

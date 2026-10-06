@@ -68,11 +68,29 @@ impl Approver for StdinApprover {
         println!();
         println!("┌─ 需要你确认 ─────────────────────────────");
         println!("│ 工具      : {}（{}）", req.tool, req.capability.label());
+        if let Some(s) = &req.specifier {
+            println!("│ 动的是    : {s}");
+        }
+        // **先给后果，再给参数。**
+        //
+        // 顺序是有意的：人读审批框是从上往下的，读到能判断"批不批"
+        // 就该停下了。参数 JSON 是给"想再核对一眼"用的，不是判决依据。
+        //
+        // 而这一段**可能没有**——读取类工具本来就没有"后果"。
+        // 那时如实说"没提供预览"，而不是让人以为下面那串 JSON 就是后果。
+        match &req.preview {
+            Some(p) => {
+                println!("│ 会变成    :");
+                for line in p.lines() {
+                    println!("│   {line}");
+                }
+            }
+            None => {
+                println!("│ 会变成    : （这个工具没提供预览，请直接看下面的参数）");
+            }
+        }
         println!("│ 参数      : {}", req.arguments);
         println!("│ 为什么问  : {}", req.reason);
-        if let Some(s) = &req.specifier {
-            println!("│ 规则粒度  : {s}");
-        }
         if req.capability.is_irreversible() {
             println!("│ ⚠ 不可逆动作：这次批准不会变成长期规则");
         }
@@ -120,6 +138,7 @@ mod tests {
             specifier: Some("D:\\notes".into()),
             arguments: "{\"path\":\"a.md\"}".into(),
             reason: "写入能力".into(),
+            preview: None,
         }
     }
 

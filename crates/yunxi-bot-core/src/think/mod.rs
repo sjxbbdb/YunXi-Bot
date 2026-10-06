@@ -295,6 +295,32 @@ impl std::error::Error for ThinkError {}
 pub trait Thinker: Send + Sync {
     fn think(&self, req: &ThinkRequest) -> Result<ThinkResponse, ThinkError>;
 
+    /// 流式思考：每收到一段正文就调一次 `on_delta`。
+    ///
+    /// ## 为什么默认实现是"一次性"
+    ///
+    /// **不是所有 Thinker 都能流式**——本地决策模型、测试桩、
+    /// 以后可能的其他 provider 都可能只能给完整结果。
+    ///
+    /// 默认实现退化成一次调用、把正文整体交出去一次。
+    /// 对调用方来说**行为完全一致，只是没有"边生成边显示"**——
+    /// 所以调用方不必写两条路径，也不必判断"这个 thinker 支不支持流"。
+    ///
+    /// **`on_delta` 只收正文，不收工具调用。**
+    /// 工具调用的增量是参数 JSON 的碎片，打出来是噪声——
+    /// 而且它们本来就不是给人读的。
+    fn think_stream(
+        &self,
+        req: &ThinkRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ThinkResponse, ThinkError> {
+        let r = self.think(req)?;
+        if !r.content.is_empty() {
+            on_delta(&r.content);
+        }
+        Ok(r)
+    }
+
     /// 用于台账归因的模型标识。
     fn model(&self) -> &str;
 }

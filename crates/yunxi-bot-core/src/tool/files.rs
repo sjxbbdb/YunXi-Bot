@@ -797,6 +797,27 @@ impl Tool for WriteFileTool {
         path_specifier(args, ctx)
     }
 
+    /// 覆盖或新建之前，把"文件会变成什么样"给出来。
+    ///
+    /// **覆盖是破坏性的**——上面 `call` 里那段注释说得很清楚：
+    /// 模型凭印象重写一个文件，就是把用户没让它动的东西一起抹掉。
+    /// 而在此之前，人在审批框里看到的是参数 JSON，**看不到被抹掉的是什么**。
+    ///
+    /// 只读：读一下现有内容算个 diff，不动任何东西。
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
+        let (raw, abs) = path_arg(args, ctx).ok()?;
+        let content = args.get("content")?.as_str()?;
+        let label = if abs.exists() {
+            format!("要覆盖 {raw}")
+        } else {
+            format!("要新建 {raw}")
+        };
+        // 读不了就当没有旧内容——比如它是个二进制文件。
+        // 那正是最该看 diff 的场合，所以照样给预览（全部算新增）。
+        let before = std::fs::read_to_string(&abs).unwrap_or_default();
+        Some(crate::diff::render(&before, content, &label))
+    }
+
     fn call(&self, args: &Value, ctx: &mut ToolContext) -> Result<ToolOutput, ToolError> {
         let (raw, abs) = path_arg(args, ctx)?;
         let content = require_str(args, "content")?;
@@ -879,6 +900,35 @@ impl Tool for EditFileTool {
         path_specifier(args, ctx)
     }
 
+    /// 改之前把"文件会变成什么样"给出来。
+    ///
+    /// 这是最需要预览的一个工具：审批框里原本显示的是
+    /// `{"old_string":"...","new_string":"..."}`，那是**参数**，不是**后果**。
+    /// 而定点修改最容易出的错恰恰是"改到了不该改的地方"——
+    /// 那种错只有看到上下文才看得出来。
+    ///
+    /// 只读：读现有内容、算一遍替换结果、渲染 diff，不动任何东西。
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
+        let (raw, abs) = path_arg(args, ctx).ok()?;
+        let old = args.get("old_string")?.as_str()?;
+        let new = args.get("new_string")?.as_str()?;
+        let replace_all = args
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if old.is_empty() {
+            // 空 old_string 会被 `call` 拒掉，这里也没法算 diff
+            return None;
+        }
+        let before = std::fs::read_to_string(&abs).ok()?;
+        let after = if replace_all {
+            before.replace(old, new)
+        } else {
+            before.replacen(old, new, 1)
+        };
+        Some(crate::diff::render(&before, &after, &format!("要改 {raw}")))
+    }
+
     fn call(&self, args: &Value, ctx: &mut ToolContext) -> Result<ToolOutput, ToolError> {
         let (raw, abs) = path_arg(args, ctx)?;
         let old = require_str(args, "old_string")?;
@@ -954,6 +1004,204 @@ impl Tool for EditFileTool {
             "已修改 {}：替换 {count} 处",
             display_path(&abs, &ctx.cwd)
         )))
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use crate::policy::SandboxMode;
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "yunxi-preview-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn ctx(dir: &std::path::Path) -> ToolContext {
+        ToolContext::new(dir, SandboxMode::WorkspaceWrite)
+    }
+
+    // ---- edit_file ----
+
+    #[test]
+    fn edit_preview_shows_the_result_not_the_arguments() {
+        // **这是整件事的要点。** 审批框里原来只有参数 JSON，
+        // 而那是参数，不是后果。
+        let d = tmp("edit");
+        std::fs::write(d.join("a.md"), "第一行\n旧的\n第三行\n").unwrap();
+        let args = json!({"path": "a.md", "old_string": "旧的", "new_string": "新的"});
+        let p = EditFileTool.preview(&args, &ctx(&d)).expect("该有预览");
+
+        assert!(p.contains("要改 a.md"), "{p}");
+        assert!(p.contains("- 旧的"), "要看到改掉什么: {p}");
+        assert!(p.contains("+ 新的"), "要看到换成什么: {p}");
+        assert!(p.contains("第一行"), "要看得到上下文: {p}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_preview_works_for_a_replacement_that_spans_lines() {
+        let d = tmp("edit-multi");
+        std::fs::write(d.join("a.md"), "一\n二\n三\n四\n五\n").unwrap();
+        let args = json!({
+            "path": "a.md",
+            "old_string": "二\n三",
+            "new_string": "二和三合成了一行"
+        });
+        let p = EditFileTool.preview(&args, &ctx(&d)).expect("该有预览");
+        assert!(p.contains("删 2 行"), "{p}");
+        assert!(p.contains("加 1 行"), "{p}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_preview_honours_replace_all() {
+        // `replace_all` 会改多处，而只算一处的话**预览会骗人**——
+        // 人看到"改 1 行"就批了，实际改了 5 处
+        let d = tmp("edit-all");
+        std::fs::write(d.join("a.md"), "x\nx\nx\n").unwrap();
+        let one = EditFileTool
+            .preview(
+                &json!({"path": "a.md", "old_string": "x", "new_string": "y"}),
+                &ctx(&d),
+            )
+            .unwrap();
+        let all = EditFileTool
+            .preview(
+                &json!({"path": "a.md", "old_string": "x", "new_string": "y", "replace_all": true}),
+                &ctx(&d),
+            )
+            .unwrap();
+        assert!(all.contains("加 3 行"), "全替换要如实说改了几处: {all}");
+        assert!(!one.contains("加 3 行"), "默认只改一处: {one}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_preview_is_none_when_there_is_nothing_to_read() {
+        // 文件不存在时给不出后果——**那时宁可说"没有预览"，
+        // 也不要编一个看起来像后果的东西**
+        let d = tmp("edit-missing");
+        let args = json!({"path": "nope.md", "old_string": "a", "new_string": "b"});
+        assert!(EditFileTool.preview(&args, &ctx(&d)).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_preview_is_none_for_an_empty_old_string() {
+        // 空 old_string 会被 `call` 拒掉，所以也没什么后果可言
+        let d = tmp("edit-empty");
+        std::fs::write(d.join("a.md"), "内容\n").unwrap();
+        let args = json!({"path": "a.md", "old_string": "", "new_string": "x"});
+        assert!(EditFileTool.preview(&args, &ctx(&d)).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_preview_does_not_touch_the_file() {
+        // **预览必须在真正执行之前算，所以它自己不能有副作用。**
+        // 否则"看一眼"就等于"改一下"。
+        let d = tmp("edit-readonly");
+        let original = "旧的\n";
+        std::fs::write(d.join("a.md"), original).unwrap();
+        let args = json!({"path": "a.md", "old_string": "旧的", "new_string": "新的"});
+        let _ = EditFileTool.preview(&args, &ctx(&d));
+        assert_eq!(
+            std::fs::read_to_string(d.join("a.md")).unwrap(),
+            original,
+            "预览把文件改了"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_preview_does_not_require_read_before_write() {
+        // 预览是给人看的，不是执行——不该受"先读后写"约束。
+        // 受了的话，审批框里永远不会有预览（因为还没读过）
+        let d = tmp("edit-noread");
+        std::fs::write(d.join("a.md"), "旧的\n").unwrap();
+        let c = ctx(&d); // 注意：ctx 里 `read_files` 是空的
+        assert!(!c.has_read(&d.join("a.md")));
+        let args = json!({"path": "a.md", "old_string": "旧的", "new_string": "新的"});
+        assert!(EditFileTool.preview(&args, &c).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- write_file ----
+
+    #[test]
+    fn write_preview_says_new_when_the_file_is_new() {
+        let d = tmp("write-new");
+        let args = json!({"path": "new.md", "content": "第一行\n第二行\n"});
+        let p = WriteFileTool.preview(&args, &ctx(&d)).expect("该有预览");
+        assert!(p.contains("要新建 new.md"), "{p}");
+        assert!(p.contains("+ 第一行"), "{p}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_preview_shows_what_an_overwrite_would_destroy() {
+        // **覆盖是破坏性的。** 而在此之前，人在审批框里看到的
+        // 只是参数 JSON——看不到被抹掉的是什么。
+        let d = tmp("write-over");
+        std::fs::write(d.join("old.md"), "很重要的旧内容\n另一行\n").unwrap();
+        let args = json!({"path": "old.md", "content": "全新的内容\n"});
+        let p = WriteFileTool.preview(&args, &ctx(&d)).expect("该有预览");
+        assert!(p.contains("要覆盖 old.md"), "{p}");
+        assert!(
+            p.contains("- 很重要的旧内容"),
+            "被抹掉的东西必须看得见: {p}"
+        );
+        assert!(p.contains("+ 全新的内容"), "{p}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_preview_says_plainly_when_nothing_changes() {
+        let d = tmp("write-same");
+        std::fs::write(d.join("a.md"), "一样的内容\n").unwrap();
+        let args = json!({"path": "a.md", "content": "一样的内容\n"});
+        let p = WriteFileTool.preview(&args, &ctx(&d)).unwrap();
+        assert!(p.contains("没有变化"), "{p}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_preview_does_not_touch_the_file() {
+        let d = tmp("write-readonly");
+        std::fs::write(d.join("a.md"), "原来的\n").unwrap();
+        let args = json!({"path": "a.md", "content": "换掉的\n"});
+        let _ = WriteFileTool.preview(&args, &ctx(&d));
+        assert_eq!(std::fs::read_to_string(d.join("a.md")).unwrap(), "原来的\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- 读取类工具不该有预览 ----
+
+    #[test]
+    fn read_only_tools_have_no_preview() {
+        // **读取没有"后果"可言。** 硬塞一段预览只会让审批框变长、
+        // 让人更不想读——而"不想读"正是这套机制要防的事。
+        let d = tmp("reads");
+        std::fs::write(d.join("a.md"), "内容\n").unwrap();
+        let c = ctx(&d);
+        let args = json!({"path": "a.md"});
+        assert!(ReadFileTool.preview(&args, &c).is_none());
+        assert!(ListDirTool.preview(&json!({"path": "."}), &c).is_none());
+        assert!(
+            SearchFilesTool
+                .preview(&json!({"pattern": "x"}), &c)
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 

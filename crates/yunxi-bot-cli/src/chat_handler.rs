@@ -177,6 +177,11 @@ pub struct ChatHandler {
     /// **不设就是不记录**，而 CLI 一定会设——
     /// 机器能改使用者的文件却不留记录，是 ADR D11 明令禁止的。
     sink: Option<std::sync::Arc<dyn yunxi_bot_core::tool::ToolCallSink>>,
+    /// 正文增量的去处。`None` 表示不流式。
+    ///
+    /// **只有面对使用者的那条链路才设它**——常驻循环和测试不需要
+    /// "边生成边显示"，也不该为它付代价。
+    on_delta: Option<yunxi_bot_core::tool::runner::DeltaSink>,
     /// 审批策略。
     policy: ToolPolicy,
     /// 路由。**对话要自己判断"这活复杂不复杂"**——
@@ -224,6 +229,7 @@ impl ChatHandler {
             // 默认不记录。CLI 一定会用 `with_sink` 覆盖它——
             // 默认值是给"这条链路不该记录"的场景留的显式出口。
             sink: None,
+            on_delta: None,
             policy: ToolPolicy::default(),
             router: yunxi_bot_core::think::ModelRouter::default(),
         }
@@ -248,6 +254,11 @@ impl ChatHandler {
     pub fn with_decider(mut self, decider: std::sync::Arc<dyn Decider>) -> Self {
         self.decider = Some(decider);
         self
+    }
+
+    /// 设定正文增量的去处。**只有交互式那条链路才该设它。**
+    pub fn set_on_delta(&mut self, f: yunxi_bot_core::tool::runner::DeltaSink) {
+        self.on_delta = Some(f);
     }
 
     /// 设定工具调用的去处。
@@ -514,6 +525,9 @@ impl ChatHandler {
         if let Some(d) = &self.decider {
             runner = runner.with_decider(&**d);
         }
+        if let Some(f) = &self.on_delta {
+            runner = runner.with_on_delta(f.clone());
+        }
         // **每一次工具调用都要有人接住。**
         //
         // 不接的话，机器能读使用者的文件、跑命令、抓网页，
@@ -557,7 +571,12 @@ impl ChatHandler {
 /// 包成 `Thinker` 而不是散在调用点，是为了让工具循环的每一轮自动享受同样待遇。
 /// 放在外面就得每加一个调用点都记得处理一次——而"记得"是靠不住的。
 struct MeteredThinker {
-    inner: std::sync::Arc<OpenAiThinker>,
+    /// **trait object 而不是具体类型。**
+    ///
+    /// 用 `Arc<OpenAiThinker>` 的话，"这个 wrapper 有没有转发
+    /// `think_stream`"就**没法用替身测**——而那个 bug 正是漏转发造成的。
+    /// 不能测的地方就是会长 bug 的地方。
+    inner: std::sync::Arc<dyn Thinker>,
     rpm: u32,
     provider: &'static str,
     model: &'static str,
@@ -565,6 +584,37 @@ struct MeteredThinker {
 }
 
 impl Thinker for MeteredThinker {
+    /// **必须转发 `think_stream`。**
+    ///
+    /// 这个 wrapper 包在主链路外面（负责限流等待和用量记账）。
+    /// 它一开始只实现了 `think`，于是 `think_stream` 落到 trait 的默认实现上：
+    /// **等整段答完，再一次性交出去**——流式在外层被整个吞掉了。
+    ///
+    /// 而这个 bug 极难发现：功能"能用"（正文照样出来、工具照样调），
+    /// 只是不再逐字显示。**是端到端的时间证据抓到的**——
+    /// 首字节和结尾的时间戳一模一样，而直接打 API 的探针显示
+    /// provider 那边确实在流（304 个 chunk 跨 2.6 秒）。
+    ///
+    /// 教训：**中间层只要漏转发一个方法，就会静默改变行为。**
+    fn think_stream(
+        &self,
+        req: &ThinkRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<yunxi_bot_core::think::ThinkResponse, ThinkError> {
+        let rpm = self.rpm;
+        let resp = retry_throttled(
+            || self.inner.think_stream(req, on_delta),
+            |wait| {
+                eprintln!(
+                    "  · 本地限流（{rpm} RPM），等 {} ms 后重发",
+                    wait.as_millis()
+                );
+            },
+        )?;
+        self.record(req, &resp);
+        Ok(resp)
+    }
+
     fn think(
         &self,
         req: &ThinkRequest,
@@ -579,8 +629,21 @@ impl Thinker for MeteredThinker {
                 );
             },
         )?;
+        self.record(req, &resp);
+        Ok(resp)
+    }
 
-        // 记账：**存原始计数**，金额事后按价格表算
+    fn model(&self) -> &str {
+        self.model
+    }
+}
+
+impl MeteredThinker {
+    /// 记账：**存原始计数**，金额事后按价格表算。
+    ///
+    /// 抽出来是因为流式和非流式**两条路径都要记**——
+    /// 只在一条上记会让成本少报一半，而那种少报不会报错。
+    fn record(&self, req: &ThinkRequest, resp: &yunxi_bot_core::think::ThinkResponse) {
         if let Ok(mut s) = self.sink.lock() {
             // 只把**显式开的**记成思考。
             //
@@ -599,11 +662,6 @@ impl Thinker for MeteredThinker {
                 .with_usage(resp.usage),
             );
         }
-        Ok(resp)
-    }
-
-    fn model(&self) -> &str {
-        self.model
     }
 }
 
@@ -1047,6 +1105,113 @@ mod tests {
             thinking: yunxi_bot_core::think::Thinking::Disabled,
             tool_calls: Vec::new(),
         }
+    }
+
+    use yunxi_bot_core::think::{Message, Usage};
+
+    /// 一个"能流式"的 thinker：把回复拆成三片。
+    struct ChunkedThinker {
+        stream_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Thinker for ChunkedThinker {
+        fn think(&self, _req: &ThinkRequest) -> Result<ThinkResponse, ThinkError> {
+            // **wrapper 漏转发 `think_stream` 时就会走到这里**——
+            // 而这里刻意不分片，于是测试能看出区别
+            Ok(ThinkResponse {
+                content: "整段".into(),
+                model: "m".into(),
+                usage: Usage::default(),
+                finish_reason: None,
+                reasoning: None,
+                thinking: Thinking::Disabled,
+                tool_calls: Vec::new(),
+            })
+        }
+
+        fn think_stream(
+            &self,
+            _req: &ThinkRequest,
+            on_delta: &mut dyn FnMut(&str),
+        ) -> Result<ThinkResponse, ThinkError> {
+            self.stream_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for part in ["一", "二", "三"] {
+                on_delta(part);
+            }
+            Ok(ThinkResponse {
+                content: "一二三".into(),
+                model: "m".into(),
+                usage: Usage::default(),
+                finish_reason: None,
+                reasoning: None,
+                thinking: Thinking::Disabled,
+                tool_calls: Vec::new(),
+            })
+        }
+
+        fn model(&self) -> &str {
+            "chunked"
+        }
+    }
+
+    fn metered_for_test(
+        inner: std::sync::Arc<ChunkedThinker>,
+        sink: std::sync::Arc<std::sync::Mutex<Vec<CallRecord>>>,
+    ) -> MeteredThinker {
+        MeteredThinker {
+            inner,
+            rpm: 0,
+            provider: "p",
+            model: "m",
+            sink,
+        }
+    }
+
+    #[test]
+    fn the_metered_wrapper_forwards_streaming() {
+        // **这个 bug 是端到端的时间证据抓到的。**
+        //
+        // wrapper 漏转发 `think_stream` 的话，它会落到 trait 的默认实现：
+        // 等整段答完再一次性交出去——功能"能用"（正文照样出来、
+        // 工具照样调），只是不再逐字显示。这种"能用但不对"最难发现。
+        //
+        // 实测差别：修之前正文 2 批到达、首末差 0.00s；
+        // 修之后 209 批、首末差 3.56s。
+        let calls = std::sync::Arc::new(ChunkedThinker {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let w = metered_for_test(calls.clone(), sink);
+
+        let mut parts = Vec::new();
+        let resp = w
+            .think_stream(&ThinkRequest::new(vec![Message::user("hi")]), &mut |t| {
+                parts.push(t.to_string())
+            })
+            .unwrap();
+
+        assert_eq!(
+            calls.stream_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "没转发——内层根本没走流式"
+        );
+        assert_eq!(parts, vec!["一", "二", "三"], "增量该原样传出来");
+        assert_eq!(resp.content, "一二三");
+    }
+
+    #[test]
+    fn the_wrapper_still_records_usage_when_streaming() {
+        // 转发流式**不能把记账丢了**——那样成本就少报，
+        // 而"少报"不会报错，只会让账单和实际对不上
+        let calls = std::sync::Arc::new(ChunkedThinker {
+            stream_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let w = metered_for_test(calls, sink.clone());
+        w.think_stream(&ThinkRequest::new(vec![Message::user("hi")]), &mut |_| {})
+            .unwrap();
+        assert_eq!(sink.lock().unwrap().len(), 1, "流式这一次也该记上");
     }
 
     #[test]

@@ -222,6 +222,25 @@ pub fn run(
     }
     println!();
 
+    // **只有交互式这条链路才流式。**
+    //
+    // 常驻循环、定时任务、测试都不需要"边生成边显示"——
+    // 而它们为它付的代价是：多一条 SSE 解析路径、多一种失败模式。
+    //
+    // 增量直接写 stdout 并**立刻 flush**：不 flush 的话内容会攒在
+    // 缓冲区里，等整段结束才一起出来——那就完全失去了流式的意义
+    // （看起来和加这个功能之前一模一样）。
+    let streamed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let streamed_flag = streamed.clone();
+    handler.set_on_delta(std::sync::Arc::new(move |t: &str| {
+        use std::io::Write;
+        // 第一段增量到达之前才需要"准备开始输出"，
+        // 之后就是纯粹的追加
+        streamed_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        print!("{t}");
+        let _ = std::io::stdout().flush();
+    }));
+
     let mut records = Vec::new();
     let outcome = loop {
         print!("› ");
@@ -409,8 +428,15 @@ pub fn run(
 
         match handler.chat_turn(&routing, input, &mut records) {
             Ok(text) => {
+                // **正文已经边生成边打出来了。**
+                //
+                // 这里只补收尾的换行——再打一遍 `text` 会显示两遍。
+                // 而"有没有流出来过"决定怎么补：纯工具调用的一轮
+                // 本来就没有正文，硬打一遍空字符串会多出空行。
                 println!();
-                println!("{text}");
+                if !streamed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    println!("{text}");
+                }
                 println!();
                 turns += 1;
 
@@ -433,6 +459,43 @@ pub fn run(
                 eprintln!("（会话还在，直接说下一句就行。）");
             }
         }
+
+        // **把这一轮的模型调用写进台账。**
+        //
+        // 不写的话，对话的成本在台账里是完全隐形的——
+        // `yunxi-bot cost` 会少报，缓存命中率也测不到对话这条链路。
+        // 而"成本看不见"正是最容易被忽略、也最容易失控的一类问题。
+        //
+        // 放在 match 之外：**失败的调用也是调用**（它照样花了 token，
+        // 有些还花了钱），漏掉失败的那些会让账单对不上。
+        if let Some(l) = ledger.as_mut() {
+            for r in records.drain(..) {
+                let _ = l.append(
+                    yunxi_bot_core::EventKind::ModelCalled,
+                    None,
+                    serde_json::json!(r),
+                );
+            }
+        }
+
+        // **把这一轮的模型调用写进台账。**
+        //
+        // 不写的话，对话的成本在台账里是完全隐形的——
+        // `yunxi-bot cost` 会少报，缓存命中率也测不到对话这条链路。
+        // 而"成本看不见"正是最容易被忽略、也最容易失控的一类问题。
+        //
+        // 放在 match 之外：**失败的调用也是调用**（它照样花了 token，
+        // 有些还花了钱），漏掉失败的那些会让账单对不上。
+        if let Some(l) = ledger.as_mut() {
+            for r in records.drain(..) {
+                let _ = l.append(
+                    yunxi_bot_core::EventKind::ModelCalled,
+                    None,
+                    serde_json::json!(r),
+                );
+            }
+        }
+
         let _ = resumed_turns;
     };
 

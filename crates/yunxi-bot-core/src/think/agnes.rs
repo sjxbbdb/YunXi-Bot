@@ -260,6 +260,96 @@ fn wire_message(m: &super::Message) -> serde_json::Value {
     serde_json::Value::Object(v)
 }
 
+/// SSE 里的一个分片。
+#[derive(Debug, serde::Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Usage,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<StreamToolCall>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct StreamToolCall {
+    #[serde(default)]
+    index: u64,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFunction>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct StreamFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// 一个工具调用的分片攒起来的结果。
+///
+/// **参数是逐片拼的**：`{"pa` + `th":"a"}` —— 少拼一片就是坏 JSON，
+/// 而那种坏法不会报错，只会让工具收到一个解析不了的参数。
+#[derive(Debug, Default)]
+struct ToolCallAccum {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl ToolCallAccum {
+    fn absorb(&mut self, tc: StreamToolCall) {
+        // id / name 只在第一片出现；后面的片是空的，
+        // 而空值**不能覆盖**已经拿到的值
+        if let Some(id) = tc.id
+            && !id.is_empty()
+        {
+            self.id = Some(id);
+        }
+        if let Some(f) = tc.function {
+            if let Some(n) = f.name
+                && !n.is_empty()
+            {
+                self.name = Some(n);
+            }
+            if let Some(a) = f.arguments {
+                self.arguments.push_str(&a);
+            }
+        }
+    }
+
+    /// 拼成和非流式一样的形状。
+    fn into_wire(self) -> Option<serde_json::Value> {
+        let name = self.name?;
+        Some(serde_json::json!({
+            "id": self.id.unwrap_or_default(),
+            "type": "function",
+            "function": { "name": name, "arguments": self.arguments },
+        }))
+    }
+}
+
 /// 有线响应形状（OpenAI 兼容）。
 #[derive(Debug, serde::Deserialize)]
 struct WireResponse {
@@ -310,28 +400,8 @@ impl Thinker for OpenAiThinker {
             return Err(ThinkError::LocalThrottle { wait });
         }
 
-        let mut body = serde_json::json!({
-            "model": self.config.model,
-            "messages": req.messages.iter().map(wire_message).collect::<Vec<_>>(),
-        });
-        if let Some(n) = req.max_tokens {
-            body["max_tokens"] = serde_json::json!(n);
-        }
-        if let Some(t) = req.temperature {
-            // ⚠️ 思考模式下 temperature 不生效（官方文档：设了不报错，但也不生效）
-            body["temperature"] = serde_json::json!(t);
-        }
-        // 思考模式开关。**请求上的设置优先于客户端配置**——思考模式是任务的属性。
-        // 端点不支持思考时 effective_thinking 会返回 ServerDefault，即不打这个字段。
         let thinking = req.effective_thinking(self.config.thinking);
-        if let Some(t) = thinking.body_field() {
-            body["thinking"] = t;
-        }
-        // 工具描述。实测开思考时带 tools 不报错。
-        if !req.tools.is_empty() {
-            body["tools"] = serde_json::json!(req.tools);
-        }
-
+        let body = self.build_body(req);
         let resp = self
             .agent
             .post(&self.endpoint())
@@ -408,8 +478,236 @@ impl Thinker for OpenAiThinker {
         })
     }
 
+    /// 真流式：SSE 逐块读，正文边收边交出去。
+    ///
+    /// ## 实测确认过的事
+    ///
+    /// Agnes 支持 `stream: true` + `stream_options.include_usage: true`，
+    /// **最后一个 chunk 带 `usage`**（实测 `prompt_tokens: 84`）。
+    ///
+    /// 这一点很关键：上下文锚点靠的就是 `prompt_tokens`。
+    /// 如果流式拿不到 usage，压缩就会退化成纯估算——
+    /// 所以是先实测过才敢这么实现的，不是假定。
+    ///
+    /// ## 工具调用的增量
+    ///
+    /// 流式下 `tool_calls` 是按 `index` 分片过来的：
+    ///
+    /// ```text
+    /// delta.tool_calls=[{"index":0,"id":"call_x","function":{"name":"read_file","arguments":""}}]
+    /// delta.tool_calls=[{"index":0,"function":{"arguments":"{\"pa"}}]
+    /// delta.tool_calls=[{"index":0,"function":{"arguments":"th\":\"a\"}"}}]
+    /// ```
+    ///
+    /// 所以要**按 index 拼**，拼完的形状必须和非流式一致——
+    /// 不然下游（工具循环）会看到两种不一样的 `tool_calls`。
+    fn think_stream(
+        &self,
+        req: &ThinkRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ThinkResponse, ThinkError> {
+        if self.api_key.is_empty() {
+            return Err(ThinkError::Auth("密钥为空".into()));
+        }
+        if req.messages.is_empty() {
+            return Err(ThinkError::BadRequest {
+                status: 0,
+                detail: "消息列表为空".into(),
+            });
+        }
+        if let Some(wait) = self.limiter.try_acquire() {
+            return Err(ThinkError::LocalThrottle { wait });
+        }
+
+        let mut body = self.build_body(req);
+        body["stream"] = serde_json::json!(true);
+        // **不带上这个就拿不到 usage**，而锚点全靠它
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+
+        let resp = self
+            .agent
+            .post(&self.endpoint())
+            .set(
+                "Authorization",
+                &format!("Bearer {}", self.api_key.expose()),
+            )
+            .set("Content-Type", "application/json")
+            // SSE：要 Accept 事件流，否则有些网关会先缓冲整个响应
+            .set("Accept", "text/event-stream")
+            .send_json(body);
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                let retry_after = r
+                    .header("Retry-After")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                let detail = r.into_string().unwrap_or_default();
+                let detail: String = detail.chars().take(300).collect();
+                return Err(Self::map_status(code, detail, retry_after));
+            }
+            Err(ureq::Error::Transport(t)) => {
+                let msg = t.to_string();
+                if msg.contains("timed out") || msg.contains("timeout") {
+                    return Err(ThinkError::Transient {
+                        status: None,
+                        detail: format!("请求超时（{:?}）", self.config.timeout),
+                    });
+                }
+                return Err(ThinkError::Network(msg));
+            }
+        };
+
+        let thinking = req.effective_thinking(self.config.thinking);
+        let reader = std::io::BufReader::new(resp.into_reader());
+        self.read_sse(reader, thinking, on_delta)
+    }
+
     fn model(&self) -> &str {
         &self.config.model
+    }
+}
+
+impl OpenAiThinker {
+    /// 组装请求体。非流式和流式共用——**两条路径的请求必须一模一样**，
+    /// 否则"流式"和"不流式"会得到不同结果，而那种差异极难排查。
+    fn build_body(&self, req: &ThinkRequest) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "messages": req.messages.iter().map(wire_message).collect::<Vec<_>>(),
+        });
+        if let Some(n) = req.max_tokens {
+            body["max_tokens"] = serde_json::json!(n);
+        }
+        if let Some(t) = req.temperature {
+            // ⚠️ 思考模式下 temperature 不生效（官方文档：设了不报错，但也不生效）
+            body["temperature"] = serde_json::json!(t);
+        }
+        // 思考模式开关。**请求上的设置优先于客户端配置**——思考模式是任务的属性。
+        // 端点不支持思考时 effective_thinking 会返回 ServerDefault，即不打这个字段。
+        let thinking = req.effective_thinking(self.config.thinking);
+        if let Some(t) = thinking.body_field() {
+            body["thinking"] = t;
+        }
+        // 工具描述。实测开思考时带 tools 不报错。
+        if !req.tools.is_empty() {
+            body["tools"] = serde_json::json!(req.tools);
+        }
+        body
+    }
+
+    /// 读 SSE 流。
+    ///
+    /// ## 只认 `data:` 行
+    ///
+    /// SSE 里还有 `event:` / `id:` / `retry:` 和以 `:` 开头的注释行。
+    /// 全都要跳过——**不跳的话，某天服务器加一行 `: keep-alive`
+    /// 就会让解析炸掉**。
+    ///
+    /// ## 拼装规则
+    ///
+    /// - `delta.content` → 攒进正文，同时交给 `on_delta`
+    /// - `delta.reasoning_content` → 攒进思考过程（**不交给 `on_delta`**：
+    ///   思考过程是给排查用的，混在回答里显示会让人以为模型在胡说）
+    /// - `delta.tool_calls` → **按 index 拼**
+    /// - 任何一行的 `usage` 非空就记下来（实测在最后一个 chunk）
+    /// - `data: [DONE]` → 结束
+    fn read_sse<R: std::io::BufRead>(
+        &self,
+        reader: R,
+        thinking: Thinking,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ThinkResponse, ThinkError> {
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut usage = Usage::default();
+        let mut finish_reason: Option<String> = None;
+        let mut model = self.config.model.clone();
+        // 按 index 攒工具调用。`BTreeMap` 而不是 `Vec`——
+        // 分片不保证按顺序到达，而 index 是它们唯一的身份。
+        let mut calls: std::collections::BTreeMap<u64, ToolCallAccum> =
+            std::collections::BTreeMap::new();
+        let mut saw_done = false;
+
+        for line in reader.lines() {
+            let line = line.map_err(|e| ThinkError::Network(format!("读流失败: {e}")))?;
+            let Some(payload) = line.strip_prefix("data:") else {
+                // `event:` / `:` 注释 / 空行 —— 都不是内容
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            if payload == "[DONE]" {
+                saw_done = true;
+                break;
+            }
+            let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) else {
+                // **单块解析不了不致命。** 有些网关会在流里插非 JSON 的心跳。
+                // 为它把整次调用判失败，代价远大于收益。
+                continue;
+            };
+            if !chunk.model.is_empty() {
+                model = chunk.model;
+            }
+            if chunk.usage.total_tokens > 0
+                || chunk.usage.prompt_tokens > 0
+                || chunk.usage.completion_tokens > 0
+            {
+                usage = chunk.usage;
+            }
+            let Some(choice) = chunk.choices.into_iter().next() else {
+                // 只带 usage 的那一块没有 choices —— 这是正常的
+                continue;
+            };
+            if let Some(r) = choice.finish_reason {
+                finish_reason = Some(r);
+            }
+            if let Some(c) = choice.delta.content
+                && !c.is_empty()
+            {
+                content.push_str(&c);
+                on_delta(&c);
+            }
+            if let Some(r) = choice.delta.reasoning_content {
+                reasoning.push_str(&r);
+            }
+            for tc in choice.delta.tool_calls {
+                calls.entry(tc.index).or_default().absorb(tc);
+            }
+        }
+
+        // **没有 `[DONE]` 也不算失败。** 有些服务端直接关连接。
+        // 只要收到了正文或有工具调用，这次就算是成的——
+        // 为"少一个结束标记"把一整轮回答判失败，不划算。
+        let tool_calls: Vec<serde_json::Value> = calls
+            .into_values()
+            .filter_map(ToolCallAccum::into_wire)
+            .collect();
+
+        if content.is_empty() && tool_calls.is_empty() {
+            return Err(ThinkError::Malformed(if saw_done {
+                "流结束了，但既没有正文也没有工具调用".into()
+            } else {
+                "流被中断，且没有收到任何正文".into()
+            }));
+        }
+
+        Ok(ThinkResponse {
+            content,
+            model,
+            usage,
+            finish_reason,
+            reasoning: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
+            thinking,
+            tool_calls,
+        })
     }
 }
 
@@ -459,6 +757,7 @@ impl Thinker for StubThinker {
             tool_calls: Vec::new(),
         })
     }
+
     fn model(&self) -> &str {
         "stub"
     }
