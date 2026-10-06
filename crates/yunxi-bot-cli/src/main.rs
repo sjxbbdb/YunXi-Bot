@@ -1721,6 +1721,60 @@ fn cmd_remember(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(0)
 }
 
+/// 从对话里提炼使用者信息的提示词。
+///
+/// ## 排除项是这份提示词的主要工作
+///
+/// "提炼使用者信息"这件事**不难**，难的是**不提炼不该提炼的**。
+/// 参考架构（研究文档 §4.6）把边界写得很清楚：
+///
+/// > organizer 只提炼"**这个人/这台机器/这个项目/这段关系**"的
+/// > 可复用内容；**通用教程、临时问答和秘密不进入长期记忆**。
+///
+/// 所以提示词里**排除项写得比要求还细**：
+///
+/// - **通用知识不算**："什么是 HashMap"问的是世界，不是他
+/// - **一次性问答不算**："帮我看看这个文件"不说明他是谁
+/// - **秘密不算**：密钥、密码、证件号进档案是最坏的一种错
+///
+/// 而且明确允许**一条都不提炼**。不写这句的话模型会硬凑，
+/// 而硬凑出来的东西会堆进待确认列表，让人懒得看——
+/// **那比不提议更坏**，因为待确认列表一废，这个机制就废了。
+const LEARN_SYSTEM: &str = "\
+你在帮一个个人助理维护「使用者画像」。
+
+只提炼**关于使用者这个人**的可复用信息：他的身份、职业、习惯、偏好、
+正在做的事、明确表达过的要求。
+
+**不要提炼这些：**
+- 通用知识、概念解释、教程（那些问的是世界，不是他）
+- 一次性的临时问答（比如「帮我看看这个文件」——它不说明他是谁）
+- 秘密、密钥、密码、证件号、银行卡号（进档案是最坏的一种错）
+- 你自己说过的话（那不是他说的）
+
+输出格式：每行一条，以「- 」开头，一句话，不超过 30 字。
+最多 3 条。
+
+**如果这段对话里没有任何值得记住的、关于这个人的信息，
+就什么都不要输出。** 一条都没有是正常结果，不要硬凑。";
+
+/// 解析提炼结果。
+///
+/// **只认 `- ` 开头的行。** 模型偶尔会加解释、加标题、加总结——
+/// 那些不该被当成提议。宁可漏掉一条，也不要往待确认列表里塞噪声：
+/// **待确认列表一旦开始有噪声，人就不看了，这个机制就废了。**
+fn parse_proposals(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("- ").map(str::trim))
+        .filter(|t| !t.is_empty())
+        // 长度兜底：一条超过 60 字的"使用者信息"多半是模型在解释
+        .filter(|t| t.chars().count() <= 60)
+        .take(3)
+        .map(|t| (t.to_string(), "从最近的对话里提炼".to_string()))
+        .collect()
+}
+
 /// 看 / 初始化助理的人格。
 ///
 /// ## 为什么要能改
@@ -1802,6 +1856,83 @@ fn cmd_profile(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let path = home.join(PROFILE_FILE);
 
     // ---- 初始化 ----
+    // ---- 从最近的对话里自动总结 ----
+    //
+    // **这是用户要的第 4 条**："判断某条输入是不是用户信息——
+    // 是 → 归入用户画像；不是 → 归入记忆。"
+    //
+    // 这里做的是前半句：**判完只提议，不直接改档案**（§4.6）。
+    if args.iter().any(|a| a == "--learn") {
+        use yunxi_bot_core::think::{Message, ThinkRequest, Thinker, agnes::OpenAiThinker};
+
+        let store = yunxi_bot_core::think::session::SessionStore::new(&home);
+        let Some(session) = store.latest()? else {
+            println!("还没有对话记录——先 `yunxi-bot chat` 聊几轮再来。");
+            return Ok(0);
+        };
+        // 从历史里取使用者说过的话。**只取 User**：
+        // 助理自己的话会污染提取（它会把"我理解你在杭州"当成使用者说的）。
+        let said: Vec<String> = session
+            .layout
+            .build()
+            .into_iter()
+            .filter(|m: &Message| m.role == yunxi_bot_core::think::Role::User)
+            .map(|m| m.content)
+            .collect();
+        if said.is_empty() {
+            println!("这个会话里还没有你说过的话。");
+            return Ok(0);
+        }
+        let transcript = said.join("\n---\n");
+
+        let config = ThinkerConfig::agnes();
+        let thinker = match OpenAiThinker::from_home(&home, config) {
+            Ok(t) => t,
+            Err(e) => {
+                // **说清是"总结不了"而不是"没什么可总结"**——
+                // 那两件事混在一起会让人以为它觉得自己没得记。
+                eprintln!("无法初始化模型，这次总结不了：{e}");
+                return Ok(2);
+            }
+        };
+        let req = ThinkRequest::new(vec![
+            Message::system(LEARN_SYSTEM),
+            Message::user(format!("最近的对话：\n{transcript}")),
+        ])
+        .with_max_tokens(400)
+        .with_temperature(0.2);
+
+        let resp = match thinker.think(&req) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("总结失败：{e}");
+                return Ok(2);
+            }
+        };
+        let proposals = parse_proposals(&resp.content);
+        if proposals.is_empty() {
+            // **"这次没提炼出什么"是正常结果，不是错误。**
+            // 大多数对话里确实没有关于使用者的可复用信息。
+            println!("这次没有提炼出关于你的新信息。");
+            println!("（这是正常结果——大多数对话里确实没有。）");
+            return Ok(0);
+        }
+        let mut ledger = Ledger::open(ledger_path())?;
+        println!("提炼出 {} 条，**都还没进画像**：", proposals.len());
+        for (text, reason) in proposals {
+            let id = format!("pp{}", yunxi_bot_core::now_millis()?);
+            ledger.append(
+                yunxi_bot_core::EventKind::ProfileProposed,
+                None,
+                serde_json::json!({ "id": id, "text": text, "reason": reason }),
+            )?;
+            println!("  [{id}] {text}");
+        }
+        println!();
+        println!("去 `yunxi-bot profile --pending` 看，然后 --accept / --reject。");
+        return Ok(0);
+    }
+
     // ---- 待确认的提议 ----
     //
     // **自动总结的东西必须先 pending。** 参考架构（研究文档 §4.6）的原话：
