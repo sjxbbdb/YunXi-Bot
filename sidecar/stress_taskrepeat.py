@@ -29,6 +29,7 @@ D76/D77 里同一个场景两次跑出两种结果：
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -106,12 +107,34 @@ def one_run(bin_path: str, real_home: Path, index: int) -> dict:
         else:
             state = "完成（没停下来问人）"
 
+        # **把失败的性质也抓出来——只报一个数字不够。**
+        #
+        # "40% 变 60%" 说明不了什么；"失败的**原因换了一种**"才是真信息：
+        # 那说明上一个原因修掉了、而下面是另一个。
+        failures = []
+        ledger = home / "ledger.jsonl"
+        if ledger.exists():
+            for line in ledger.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("kind") != "step_failed":
+                    continue
+                d = e.get("data") or {}
+                reason = (d.get("error") or d.get("reason") or "")[:80]
+                failures.append(f"{d.get('step')}: {reason.replace(chr(10), ' ')}")
+
         return {
             "fixed": fixed,
             "destroyed": destroyed,
             "state": state,
             "rate_limited": "超出速率限制" in out,
             "lines": len(final.splitlines()),
+            "failures": failures,
         }
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -136,10 +159,33 @@ def main() -> int:
         extra = "  **文件被毁了**" if r["destroyed"] else ""
         rate = "  （这一轮限流过）" if r["rate_limited"] else ""
         print(f"  第 {i} 次 {mark}  状态={r['state']}  文件 {r['lines']} 行{extra}{rate}")
+        for f in r["failures"]:
+            print(f"          ✗ {f}")
 
     ok = sum(1 for r in results if r["fixed"])
     destroyed = sum(1 for r in results if r["destroyed"])
     rate_limited = sum(1 for r in results if r["rate_limited"] and not r["fixed"])
+
+    # **按"失败在哪一步、什么原因"归类。**
+    # 这是这一轮最该看的东西：数字会变，而"换了个原因"能告诉你
+    # 上一个原因是不是真的修掉了。
+    from collections import Counter
+    kinds = Counter()
+    for r in results:
+        for f in r["failures"]:
+            kinds[f[:40]] += 1
+    if kinds:
+        print()
+        print("=== 失败的性质（按条数）===")
+        # **变量名不能再用 `n`。** 它在外面是"跑了几次"，
+        # 这里一覆盖，下面的 `ok / n` 就变成了"7 / 1 = 700%"——
+        # 我的测量脚本自己产出了一个假数字。
+        for kind_text, count in kinds.most_common(6):
+            print(f"  {count}× {kind_text}")
+    else:
+        print()
+        print("=== 没有 step_failed 事件 —— 失败不在「某一步」这一层 ===")
+        print("    （那说明原因在别处：拆解、预算、限流、或者根本没失败）")
 
     print()
     print(f"=== 结果 ===")
