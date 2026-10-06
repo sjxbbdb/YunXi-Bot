@@ -24,6 +24,51 @@ use std::time::Duration;
 /// 响应体上限。防止一个坏掉的服务把常驻进程的内存吃掉。
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+/// 回环地址的**连接**超时。
+///
+/// ## 为什么回环要单独一个更短的超时
+///
+/// 这是真机上量出来的：Windows 上连 `127.0.0.1` 上一个没人监听的端口，
+/// 内核要**约 2070 ms** 才回"积极拒绝"。而默认超时是 2000 ms——
+/// 于是**先超时了**，真实原因（没人监听）被报成"调用超时"。
+///
+/// 两种原因的下一步动作完全不同：
+///
+/// | 报什么 | 该去查什么 |
+/// |---|---|
+/// | 超时 | 服务为什么慢 |
+/// | 没人监听 | 服务为什么没起来 |
+///
+/// 而且每次白等两秒——`check` 一轮 20 封邮件里那些要走决策层的，
+/// 会白等十几秒。**本机服务要么立刻接受，要么就是没起来**，
+/// 300 ms 足够区分。
+const LOOPBACK_CONNECT_MS: u64 = 300;
+
+/// 连接超时：回环用短的，其他用调用方给的。
+fn connect_timeout_for(addr: &SocketAddr, asked_ms: u64) -> u64 {
+    if addr.ip().is_loopback() {
+        LOOPBACK_CONNECT_MS.min(asked_ms)
+    } else {
+        asked_ms
+    }
+}
+
+/// 连不上时给一句**指向正确方向**的话。
+fn connect_error(addr: &SocketAddr, e: &std::io::Error) -> HttpError {
+    // `TimedOut` 在回环上几乎总是"没人监听"——内核回报拒绝比超时慢，
+    // 所以消息里两种可能都要提，并给出该查什么。
+    if e.kind() == std::io::ErrorKind::TimedOut && addr.ip().is_loopback() {
+        return HttpError::Connect(format!(
+            "{addr} 连不上（回环地址 {LOOPBACK_CONNECT_MS} ms 内没接受连接）\
+             ——多半是这个服务没起来"
+        ));
+    }
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        return HttpError::Timeout;
+    }
+    HttpError::Connect(format!("{addr} 连不上：{e}"))
+}
+
 #[derive(Debug)]
 pub enum HttpError {
     /// 无法解析或连接到目标地址。
@@ -62,13 +107,10 @@ pub fn post_json(endpoint: &str, body: &str, timeout_ms: u64) -> Result<String, 
     let (addr, path) = parse_endpoint(endpoint)?;
 
     let timeout = Duration::from_millis(timeout_ms);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::TimedOut {
-            HttpError::Timeout
-        } else {
-            HttpError::Connect(e.to_string())
-        }
-    })?;
+    // 连接用**回环专属**的超时：本机服务要么立刻接受，要么就是没起来
+    let connect_ms = connect_timeout_for(&addr, timeout_ms);
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(connect_ms))
+        .map_err(|e| connect_error(&addr, &e))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| HttpError::Io(e.to_string()))?;
@@ -118,13 +160,10 @@ pub fn get_json(endpoint: &str, timeout_ms: u64) -> Result<String, HttpError> {
     let (addr, path) = parse_endpoint(endpoint)?;
     let timeout = Duration::from_millis(timeout_ms);
 
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::TimedOut {
-            HttpError::Timeout
-        } else {
-            HttpError::Connect(e.to_string())
-        }
-    })?;
+    // 连接用**回环专属**的超时：本机服务要么立刻接受，要么就是没起来
+    let connect_ms = connect_timeout_for(&addr, timeout_ms);
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(connect_ms))
+        .map_err(|e| connect_error(&addr, &e))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| HttpError::Io(e.to_string()))?;
@@ -245,6 +284,87 @@ fn parse_response(raw: &[u8]) -> Result<String, HttpError> {
         return Err(HttpError::Status(code, snippet));
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::*;
+
+    fn addr(ip: &str, port: u16) -> SocketAddr {
+        // IPv6 字面量要方括号，`::1:17870` 是解析不了的
+        let host = if ip.contains(':') {
+            format!("[{ip}]")
+        } else {
+            ip.to_string()
+        };
+        format!("{host}:{port}").parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_gets_a_short_connect_timeout() {
+        // **真机上量出来的：** Windows 连 `127.0.0.1` 上没人监听的端口，
+        // 内核要**约 2070 ms** 才回"积极拒绝"。而默认超时是 2000 ms——
+        // 于是先超时了，真实原因（没人监听）被报成"调用超时"，
+        // 而且每次白等两秒。本机服务要么立刻接受，要么就是没起来。
+        assert_eq!(
+            connect_timeout_for(&addr("127.0.0.1", 17870), 2_000),
+            LOOPBACK_CONNECT_MS
+        );
+        assert_eq!(
+            connect_timeout_for(&addr("::1", 17870), 2_000),
+            LOOPBACK_CONNECT_MS
+        );
+    }
+
+    #[test]
+    fn a_shorter_asked_timeout_still_wins_on_loopback() {
+        // 调用方要的更短就听调用方的——它可能有个更紧的预算
+        assert_eq!(connect_timeout_for(&addr("127.0.0.1", 1), 100), 100);
+    }
+
+    #[test]
+    fn non_loopback_keeps_the_asked_timeout() {
+        assert_eq!(connect_timeout_for(&addr("10.0.0.1", 1), 2_000), 2_000);
+    }
+
+    #[test]
+    fn a_loopback_timeout_is_reported_as_unreachable_not_timeout() {
+        // **两者指向的下一步完全不同**：超时 -> 查为什么慢；
+        // 没人监听 -> 查为什么服务没起来。
+        let e = connect_error(
+            &addr("127.0.0.1", 17870),
+            &std::io::Error::from(std::io::ErrorKind::TimedOut),
+        );
+        match e {
+            HttpError::Connect(m) => {
+                assert!(m.contains("没起来"), "要说清该去查什么: {m}");
+                assert!(m.contains("17870"), "要带上地址: {m}");
+            }
+            other => panic!("回环超时该报成连接问题，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_remote_timeout_is_still_a_timeout() {
+        // 远端超时确实可能是"慢"，不能一概说成"没起来"
+        let e = connect_error(
+            &addr("10.0.0.1", 1),
+            &std::io::Error::from(std::io::ErrorKind::TimedOut),
+        );
+        assert!(matches!(e, HttpError::Timeout), "{e:?}");
+    }
+
+    #[test]
+    fn a_refused_loopback_connection_keeps_the_os_message() {
+        let e = connect_error(
+            &addr("127.0.0.1", 17870),
+            &std::io::Error::other("积极拒绝"),
+        );
+        match e {
+            HttpError::Connect(m) => assert!(m.contains("积极拒绝"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
