@@ -125,7 +125,7 @@ def one_run(bin_path: str, real_home: Path, index: int) -> dict:
                 if e.get("kind") != "step_failed":
                     continue
                 d = e.get("data") or {}
-                reason = (d.get("error") or d.get("reason") or "")[:80]
+                reason = (d.get("error") or d.get("reason") or "")
                 failures.append(f"{d.get('step')}: {reason.replace(chr(10), ' ')}")
 
         return {
