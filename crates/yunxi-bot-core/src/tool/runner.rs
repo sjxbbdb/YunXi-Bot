@@ -393,8 +393,25 @@ impl<'a> ToolRunner<'a> {
                 });
             }
 
-            // 助手请求调工具的那条消息必须**原样**进历史：字段少一个服务端就报 400
-            layout.push_raw(Message::assistant_tool_calls(resp.tool_calls.clone()));
+            // 助手请求调工具的那条消息必须**原样**进历史：字段少一个服务端就报 400。
+            //
+            // **但"原样"有个前提：它得是合法的。** 真机上抓到的 400
+            // 完整报文是：
+            //
+            // ```text
+            // Assistant tool call <id>.arguments must be valid JSON.
+            // ```
+            //
+            // 根因：**模型产出的 `arguments` 不是合法 JSON**——最常见的
+            // 是被输出预算截断在参数中间（`{"path": "src/bill`）。
+            // 而我们把它**原样**塞进历史，下一轮服务端校验历史时
+            // **整条请求被拒**。一条坏的工具调用，废掉后面所有的回合。
+            //
+            // **这和本项目反复踩的"截断"是同一个根**：被截断的东西
+            // 不能当成完整的用，也不能原样传下去。
+            layout.push_raw(Message::assistant_tool_calls(sanitize_tool_calls(
+                &resp.tool_calls,
+            )));
 
             // **先全部判定（串行），再批量执行（只读的并行）。**
             //
@@ -698,6 +715,53 @@ pub struct ParsedCall {
 /// **参数是 JSON 字符串而不是对象**（OpenAI 协议如此），解析失败不能当成
 /// "没参数"——那会让工具在一个空参数上跑，做出完全不相干的事。
 /// 这里把坏参数原样保留，由工具自己报 `BadArgs`。
+/// 把工具调用里的 `arguments` 修成合法 JSON 字符串。
+///
+/// ## 为什么必须有这一步
+///
+/// OpenAI 协议要求 `tool_calls[].function.arguments` 是一个
+/// **JSON 字符串**。模型偶尔会给出不合法的——最常见的是被输出预算
+/// 截断在参数中间：
+///
+/// ```text
+/// {"path": "src/bill
+/// ```
+///
+/// 而这条消息**要原样回灌进历史**（协议要求助手消息带 tool_calls，
+/// 后面跟对应的 tool 结果）。**一条坏的调用会让下一轮整条请求
+/// 被服务端拒掉**——报的还是一句看不懂的
+/// `Assistant tool call <id>.arguments must be valid JSON.`
+///
+/// ## 为什么修成 `{}` 而不是丢掉
+///
+/// - **丢掉会破坏条数对应**：助手说调了 N 个、我们只回 N-1 个结果，
+///   服务端同样报 400（D50 就是栽在这个上）
+/// - 修成 `{}` 之后工具会报"参数坏了"，**模型收到一条明确的反馈**，
+///   可以重试
+///
+/// 所以这是"**带着说明失败**"，不是"悄悄改掉"。
+///
+/// **参数本来就合法的原样保留**——只在坏的时候动它。
+fn sanitize_tool_calls(raw: &[Value]) -> Vec<Value> {
+    raw.iter()
+        .map(|c| {
+            let mut c = c.clone();
+            let Some(f) = c.get_mut("function") else {
+                return c;
+            };
+            let Some(args) = f.get_mut("arguments") else {
+                return c;
+            };
+            if let Value::String(text) = args
+                && serde_json::from_str::<Value>(text).is_err()
+            {
+                *args = Value::String("{}".to_string());
+            }
+            c
+        })
+        .collect()
+}
+
 pub fn parse_tool_calls(raw: &[Value]) -> Vec<ParsedCall> {
     let mut out = Vec::new();
     for c in raw {
@@ -2164,5 +2228,63 @@ mod tests {
         assert_eq!(v["tool"], "read_file");
         assert_eq!(v["capability"], "read_only");
         assert!(rec.executed());
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_truncated_arguments_string_is_repaired() {
+        // **真机上抓到的原文**：
+        // `Assistant tool call <id>.arguments must be valid JSON.`
+        // 根因是模型把参数截断在了中间。
+        let raw = vec![json!({
+            "id": "c1", "type": "function",
+            "function": { "name": "edit_file", "arguments": "{\"path\": \"src/bill" }
+        })];
+        let out = sanitize_tool_calls(&raw);
+        assert_eq!(
+            out[0]["function"]["arguments"],
+            json!("{}"),
+            "坏的参数该被修成合法的空对象"
+        );
+        // **id 和 name 不能动**——回灌时靠 id 对应结果
+        assert_eq!(out[0]["id"], json!("c1"));
+        assert_eq!(out[0]["function"]["name"], json!("edit_file"));
+    }
+
+    #[test]
+    fn valid_arguments_are_left_alone() {
+        // **只在坏的时候动它。** 好的参数改掉就等于篡改模型的意图。
+        let raw = vec![json!({
+            "id": "c1", "type": "function",
+            "function": { "name": "read_file", "arguments": "{\"path\":\"a.md\"}" }
+        })];
+        let out = sanitize_tool_calls(&raw);
+        assert_eq!(
+            out[0]["function"]["arguments"],
+            json!("{\"path\":\"a.md\"}")
+        );
+    }
+
+    #[test]
+    fn the_call_count_never_changes() {
+        // **条数必须对上**——助手说调了 N 个，就得回 N 个结果，
+        // 少一个服务端照样 400（D50 那次的教训）。
+        let raw = vec![
+            json!({"id": "c1", "function": {"name": "a", "arguments": "{坏"}}),
+            json!({"id": "c2", "function": {"name": "b", "arguments": "{}"}}),
+            json!({"id": "c3"}),
+        ];
+        assert_eq!(sanitize_tool_calls(&raw).len(), 3, "一个都不能少");
+    }
+
+    #[test]
+    fn a_call_without_a_function_does_not_panic() {
+        let raw = vec![json!({"id": "c1"})];
+        assert_eq!(sanitize_tool_calls(&raw).len(), 1);
     }
 }
