@@ -1213,12 +1213,45 @@ impl TaskStore for LedgerTaskStore {
         data: serde_json::Value,
     ) -> Result<(), TaskError> {
         // 审计事件必须落在边界内——台账会拒绝边界外的审计事件。
-        // 任务执行框架目前没有审计事件（DecisionAsked 由 decide 模块写），
-        // 所以这里直接追加；等决策点接入台账审计时在这里开边界。
+        //
+        // **这里原来写的是"任务执行框架目前没有审计事件（DecisionAsked
+        // 由 decide 模块写），所以直接追加"。那句话当时是对的，D90 之后
+        // 不成立了**：`Engine::escalate` 现在自己写 `DecisionAsked`，
+        // 而 `DecisionAsked` 在"需要边界"的名单里（`ledger.rs:150`）。
+        //
+        // 后果很隐蔽：**真实 CLI 用的是 `LedgerTaskStore`（会拦），
+        // 而引擎测试用的是 `MemoryTaskStore`（不拦）**。
+        // 于是测试全绿，真机上每一次弃权都变成 `TaskError::Core`
+        // 被抛出去——**不是"等人工"**。而 `Core::needs_human()` 是 false，
+        // 所以它连升级人工都走不到。
+        //
+        // 这和 D93 那次（引擎测试的内存台账不检查、真机台账检查）
+        // 是同一族：**测试用了一套和生产不同的器件**。
+        //
+        // 修法：**由持有台账的这一层自己开边界**。语义上也对——
+        // 审计事件必须落在边界内，而"开边界"是这个 store 的职责，
+        // 不该推给上层每个调用点。
         if kind.requires_span() && !self.ledger.has_open_span() {
-            return Err(TaskError::Core(crate::CoreError::Ledger(format!(
-                "{kind:?} 需要边界，但当前没有开启"
-            ))));
+            // **写入必须经过 `span.ledger()`。**
+            // `begin_span` 已经把台账可变借走了，这里再借 `self.ledger`
+            // 编译不过。这也正是审计边界的本意：边界内的写只能从边界进去
+            // （`decide/mod.rs:300-315` 就是这么写的）。
+            let mut span = self
+                .ledger
+                .begin_span()
+                .map_err(|e| TaskError::Core(crate::CoreError::Ledger(e.to_string())))?;
+            span.ledger()
+                .append(kind, None, data)
+                .map_err(|e: LedgerError| {
+                    TaskError::Core(crate::CoreError::Ledger(e.to_string()))
+                })?;
+            // **显式关边界，把"关不上"也当失败报出来。**
+            // 留一个永远开着的边界，后面所有审计事件都会落进它里面——
+            // 那是一种更隐蔽的错。
+            return span
+                .close()
+                .map(|_| ())
+                .map_err(|e| TaskError::Core(crate::CoreError::Ledger(e.to_string())));
         }
         self.ledger
             .append(kind, None, data)
@@ -2277,6 +2310,66 @@ mod tests {
                 .any(|(id, r)| id == "s1" && r.contains("清单是")),
             "给的是 s1 的真实产出：{s2_inputs:?}"
         );
+    }
+
+    #[test]
+    fn an_abstention_survives_the_real_ledger_store() {
+        // **这条测试盯着一个真机上的 bug，而我原来的测试抓不到它。**
+        //
+        // `DecisionAsked` 在"必须落在审计边界内"的名单里
+        // （`ledger.rs:150`），而任务路径上**没有任何 `begin_span`**。
+        // `Engine::escalate` 直接写它 → `LedgerTaskStore::write` 拦下 →
+        // `TaskError::Core` 被抛出去，**连"等人工"都走不到**。
+        //
+        // 为什么原来的测试全绿：**引擎测试用的是 `MemoryTaskStore`，
+        // 它不检查边界**；而真实 CLI 用的是 `LedgerTaskStore`（`main.rs:550`）。
+        // **测试和生产用了两套不同的器件**——和 D93 那次同一族。
+        //
+        // 所以这条测试的价值不在断言本身，**在它用的是真台账**。
+        let dir = std::env::temp_dir().join(format!("yunxi-span-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ledger.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let ledger = crate::ledger::Ledger::open(&path).expect("开台账");
+        let mut store = LedgerTaskStore::new(ledger);
+
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding().with_choice("task_decision", "不在选项里");
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 选哪个？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        handler.steps = vec![Ok("OK: 完成了".into())];
+
+        create_task(&mut store, "t1", "需要选择").expect("建任务");
+        // **不用 `engine()` 那个助手**——它的返回类型写死了
+        // `MemoryTaskStore`，而这条测试的要害恰恰是**换成真台账**。
+        // 这正是那条 bug 藏了这么久的原因。
+        let mut eng = Engine::new(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        );
+        let out = eng.run("t1").expect("弃权不该让引擎报错——它该转成等待人工");
+
+        // 弃权 = 等人工。**不是 Core 错误**。
+        assert!(
+            matches!(out.advance, Advance::Waiting { .. }),
+            "弃权后该是等待，实际 {:?}",
+            out.advance
+        );
+        // 而且台账里那条审计事件真的写进去了
+        let ledger = crate::ledger::Ledger::open(&path).expect("重开台账");
+        let asked = ledger
+            .events()
+            .iter()
+            .filter(|e| e.kind == EventKind::DecisionAsked)
+            .count();
+        assert_eq!(asked, 1, "弃权该留下一条 DecisionAsked，而且是在真台账里");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
