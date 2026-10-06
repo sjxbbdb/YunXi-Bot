@@ -417,6 +417,163 @@ fn print_report(r: &yunxi_bot_core::TickReport) {
     );
 }
 
+/// 任务回合：**daemon 自己把没人管的任务推进下去。**
+///
+/// ## 这是 goal 开头点名的那条断链
+///
+/// > 任务卡住后**没有任何东西自动推进它**
+///
+/// 在此之前任务只能由 `yunxi-bot do` 同步跑完；进程被杀、或跑到
+/// 「等人工」之后，唯一的推进方式是人在终端敲 `resume`。
+///
+/// ## 两条边界都写在调度层（`task::schedule`）
+///
+/// 1. **不碰 `AwaitingHuman`** —— 自动续跑它等于自动批准。
+///    这类任务只会被**报出来**（下面那段 `attention_needed`），
+///    而不是替他做决定。
+/// 2. **不碰刚刚还在动的任务** —— 使用者在终端里跑时守护也在看同一本台账，
+///    没有这道闸两边会同时执行同一批步骤（而步骤可能有副作用）。
+///
+/// ## 无人值守 = 不获得新权限
+///
+/// 这里构造的审批者是 `RefusingApprover`：**凡是需要批准的动作一律拒绝**。
+/// 守护进程拿不到 stdin，用 `StdinApprover` 会直接卡死；而"自动批准"
+/// 更不可接受——那等于让一个无人看管的进程自己给自己发权限。
+///
+/// 所以守护能做的事 = 使用者在 `--allow` 里预先写明的那些。
+/// 其余一律失败并留痕——**失败是正确结果，不是缺陷**。
+fn run_task_round<D: yunxi_bot_core::decide::Decider>(
+    ledger: &mut Ledger,
+    router: &yunxi_bot_core::think::ModelRouter,
+    decider: &D,
+    handler: &mut chat_handler::ChatHandler,
+    notifier: &dyn yunxi_bot_core::notify::Notifier,
+    cfg: &TaskRound,
+    tick_no: u64,
+) {
+    use yunxi_bot_core::task::engine::{Engine, LedgerTaskStore};
+    use yunxi_bot_core::task::schedule::{AutoAdvance, attention_needed, auto_advance_candidates};
+
+    let TaskRound {
+        idle_ms,
+        budget,
+        dry_run,
+    } = *cfg;
+
+    let Ok(now) = now_millis() else {
+        eprintln!("[{tick_no:>3}] 任务回合跳过：取不到当前时间");
+        return;
+    };
+
+    // **必须重读台账，不能信 `events()`。**
+    //
+    // `events()` 是**开台账那一刻的快照**。任务引擎在另一本台账上写状态，
+    // 而守护手里这本永远看不到那些写入——于是每轮都按最初那份快照决策，
+    // 一个已经 Stalled 的任务会被无限重试。
+    //
+    // 这个 bug 是被端到端测试抓到的：日志里同一个任务每轮都"卡住"一次。
+    if let Err(e) = ledger.reload() {
+        println!("[{tick_no:>3}] 任务：读不到台账（{e}）");
+        return;
+    }
+    let events = ledger.events().to_vec();
+    let tasks = yunxi_bot_core::ledger::task_from_events(&events);
+
+    // —— 需要人的那些：报出来 ——
+    //
+    // **自动推进不该碰它们，但不该瞒着使用者。**
+    // 这两类任务在台账里静静躺着，而使用者不会主动去查。
+    for (t, why) in attention_needed(&tasks) {
+        // 同一个任务只提醒一次。反复报同一件事会让噪音淹没真信号。
+        let already = events.iter().any(|e| {
+            e.kind == EventKind::TaskAttentionNotified
+                && e.data.get("task").and_then(|v| v.as_str()) == Some(t.id.as_str())
+        });
+        if already {
+            continue;
+        }
+        let n = yunxi_bot_core::notify::Notification::new(
+            "有任务在等你",
+            format!("「{}」{}", truncate_chars(&t.goal, 40), why),
+        )
+        .with_tag(format!("task.{}", t.id))
+        .with_urgency(yunxi_bot_core::notify::Urgency::Normal);
+
+        let d = if dry_run {
+            yunxi_bot_core::notify::Delivery::Blocked {
+                reason: "演练模式：没有真的发通知".into(),
+            }
+        } else {
+            notifier.notify(&n)
+        };
+        println!("[{tick_no:>3}] 任务：{} {} —— {}", t.id, why, d.label());
+        let _ = ledger.append(
+            EventKind::TaskAttentionNotified,
+            None,
+            serde_json::json!({
+                "task": t.id,
+                "state": format!("{:?}", t.state),
+                "why": why,
+                "result": d.label(),
+                "confirmed": d.can_claim_user_notified(),
+                "dry_run": dry_run,
+            }),
+        );
+    }
+
+    // —— 能推进的那些：推进 ——
+    let candidates = auto_advance_candidates(
+        &tasks,
+        &events,
+        AutoAdvance {
+            idle_ms,
+            now_ms: now,
+        },
+    );
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut store = LedgerTaskStore::new(match Ledger::open(ledger.path()) {
+        Ok(l) => l,
+        Err(e) => {
+            println!("[{tick_no:>3}] 任务：打不开台账（{e}）");
+            return;
+        }
+    });
+
+    for id in candidates {
+        // 每个任务单独跑一轮。**一个失败不影响下一个**——
+        // 一个坏任务不该让整批停摆。
+        let out = {
+            let mut engine = Engine::new(router, decider, handler, &mut store, budget);
+            engine.run(&id)
+        };
+        match out {
+            Ok(o) => println!(
+                "[{tick_no:>3}] 任务 {}：{}（{}，用了 {} 次模型调用）",
+                id,
+                o.task.state.label(),
+                truncate_chars(&o.task.goal, 30),
+                o.used_model_calls
+            ),
+            Err(e) => {
+                // **失败要说出来，但不打断守护。** 一个任务反复失败时，
+                // 使用者需要看到它，而不是让守护悄悄退出。
+                println!("[{tick_no:>3}] 任务 {id} 推进失败：{e}");
+            }
+        }
+    }
+}
+
+/// 任务回合的固定配置。
+#[derive(Clone, Copy)]
+struct TaskRound {
+    idle_ms: u64,
+    budget: yunxi_bot_core::task::Budget,
+    dry_run: bool,
+}
+
 /// 助理回合的固定配置。启动时定好，每轮不变。
 ///
 /// 打包成一个结构不是为了少敲几个字，而是因为**这五项是一组**：
@@ -618,6 +775,18 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         .transpose()?
         .unwrap_or(300);
     let assistant_dry: bool = args.iter().any(|a| a == "--assistant-dry-run");
+    // 任务推进的间隔（秒）。**0 表示关闭。**
+    let task_secs: u64 = flag(args, "--task-interval")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(60);
+    // 任务安静多久之后才允许守护接手。默认 120 秒——
+    // 比任何一次正常的模型往返都长，又短到"进程被杀了"能合理地被接上。
+    let task_idle_secs: u64 = flag(args, "--task-idle")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(120);
+    let task_dry: bool = args.iter().any(|a| a == "--assistant-dry-run");
     let mail_port: u16 = flag(args, "--port")
         .map(str::parse)
         .transpose()?
@@ -784,6 +953,74 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     }
     println!();
 
+    // —— 任务推进的组件 ——
+    //
+    // 与助理回合的分工：
+    //   助理回合：看**外部信息**（邮件），决定要不要把事告诉你
+    //   任务回合：看**内部待办**（任务），把没人管的推进下去
+    //
+    // **守护的审批者一律是"拒绝"。** 见 `run_task_round` 的文档：
+    // 无人值守不该获得新权限，守护能做的 = 使用者在 --allow 里预先写明的。
+    let mut task_handler: Option<chat_handler::ChatHandler> = if task_secs > 0 {
+        let tools = tooling::default_registry(&agent_home)?;
+        println!(
+            "  任务   : 每 {} 秒看一眼待办（安静 {} 秒以上的才接手）",
+            task_secs, task_idle_secs
+        );
+        println!("          审批者：一律拒绝（无人值守不获得新权限；能做的 = --allow 里写明的）");
+        Some(
+            chat_handler::ChatHandler::new(
+                agent_home.clone(),
+                // 人格名与 cmd_do 保持一致——同一个助理，不该因为
+                // 谁来跑而叫不同的名字。
+                "云熙",
+                chat_handler::DEFAULT_PERSONA,
+                chat_handler::default_rules(),
+            )
+            .with_tools(tools)
+            .with_approver(std::sync::Arc::new(std::sync::Mutex::new(
+                yunxi_bot_core::tool::RefusingApprover,
+            )))
+            .with_policy(tooling::policy_from_args(args))
+            .with_sink(tool_sink_or_warn())
+            .with_decider(std::sync::Arc::new(
+                yunxi_bot_core::decide::LayaDecider::new(
+                    flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
+                ),
+            )),
+        )
+    } else {
+        println!("  任务   : 关闭（--task-interval 0）");
+        None
+    };
+
+    let task_cfg = TaskRound {
+        idle_ms: task_idle_secs * 1000,
+        budget: yunxi_bot_core::task::Budget::default(),
+        dry_run: task_dry,
+    };
+    let task_notifier: Box<dyn yunxi_bot_core::notify::Notifier> =
+        if args.iter().any(|a| a == "--console") {
+            Box::new(yunxi_bot_core::notify::ConsoleNotifier)
+        } else {
+            #[cfg(windows)]
+            {
+                Box::new(yunxi_bot_core::notify_windows::WindowsToast::new())
+            }
+            #[cfg(not(windows))]
+            {
+                Box::new(yunxi_bot_core::notify::NullNotifier)
+            }
+        };
+    let task_router = yunxi_bot_core::think::ModelRouter::default();
+    let task_decider = yunxi_bot_core::decide::LayaDecider::new(
+        flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
+    );
+
+    // 上一次任务回合的时刻。同样按时间不按轮数——
+    // 理由和助理巡览一样（轮数会和 --interval 耦合）。
+    let mut last_task_ms: u64 = 0;
+
     let mut n = 0u64;
     let mut consecutive_errors = 0u32;
     // 上一次助理巡览的时刻。用**时间**而不是轮数：
@@ -842,6 +1079,30 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                     };
                     run_assistant_round(&mut l, engine, &cfg, n, &mut assistant_health);
                 }
+            }
+        }
+
+        // —— 任务回合 ——
+        //
+        // **这一段是 goal 开头那条断链的落点**：任务卡住后没有任何东西
+        // 自动推进它。现在守护每 `--task-interval` 秒看一眼待办，
+        // 把安静够久、又不需要人介入的那些推进下去。
+        //
+        // 放在助理回合之后：先看外面进来了什么，再看自己欠着什么。
+        if let Some(h) = task_handler.as_mut() {
+            let now = now_millis().unwrap_or(0);
+            let due = last_task_ms == 0 || now.saturating_sub(last_task_ms) >= task_secs * 1000;
+            if due {
+                last_task_ms = now;
+                run_task_round(
+                    &mut l,
+                    &task_router,
+                    &task_decider,
+                    h,
+                    task_notifier.as_ref(),
+                    &task_cfg,
+                    n,
+                );
             }
         }
 

@@ -7,6 +7,7 @@ pub mod decide;
 pub mod engine;
 pub mod model;
 pub mod plan;
+pub mod schedule;
 
 pub use decide::{TaskDecision, decision_point, options_request, parse_options};
 pub use engine::{Advance, Engine, EngineOutcome};

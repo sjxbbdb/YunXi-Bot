@@ -98,6 +98,11 @@ pub enum EventKind {
     /// 在此之前机器能读使用者的文件、跑命令、抓网页，而台账里
     /// 一条记录都没有。
     ToolCalled,
+    /// 已经就某个任务提醒过使用者了。
+    ///
+    /// 存在的理由是**去重**：一个卡住的任务每轮都提醒一次，
+    /// 噪音会淹没真信号——而噪音的代价是使用者开始不看通知。
+    TaskAttentionNotified,
     /// 使用者对一条通知的处置。
     ///
     /// **记的是"他当时看到的那条信息长什么样"**，不只是 id——
@@ -358,8 +363,74 @@ impl Ledger {
         self.events.is_empty()
     }
 
+    /// 已加载的事件。**这是一份快照，不是实时视图。**
+    ///
+    /// ## 这个区分咬过人
+    ///
+    /// 同一个进程里可以有两本 `Ledger` 指向同一个文件（任务 store 一本、
+    /// 工具调用记录一本、调用方自己一本）。**别人写的不会出现在你的
+    /// `events` 里**——你只看得见"开台账那一刻读到的"加上"你自己写的"。
+    ///
+    /// 后果很隐蔽：守护进程每轮读状态做决策，而任务引擎在另一本台账上
+    /// 写状态。于是守护**永远看不到引擎写的状态**，每轮都按最初那份快照
+    /// 决策——一个已经 `Stalled` 的任务被无限重试。
+    /// 这个 bug 是被端到端测试抓到的（日志里同一个任务每轮都"卡住"一次）。
+    ///
+    /// **要拿最新状态就用 [`Ledger::reload`]**，别指望它自己更新。
     pub fn events(&self) -> &[Event] {
         &self.events
+    }
+
+    /// 从磁盘重读事件与序号。**多写入者场景下读状态前必须调它。**
+    ///
+    /// 语义与打开时一致：任何无法解析的行都视为**损坏**而不是跳过——
+    /// 静默跳行会让投影悄悄偏离真相。
+    pub fn reload(&mut self) -> Result<(), LedgerError> {
+        use std::io::{BufRead, BufReader};
+        self.events.clear();
+
+        let len = match std::fs::metadata(&self.path) {
+            Ok(m) => m.len(),
+            Err(_) => {
+                // 文件被删了：清空即可，下一次 append 会重建
+                self.seq = 0;
+                self.seen_len = 0;
+                return Ok(());
+            }
+        };
+        if len == 0 {
+            self.seq = 0;
+            self.seen_len = 0;
+            return Ok(());
+        }
+
+        let f = File::open(&self.path).map_err(|e| LedgerError::Io(e.to_string()))?;
+        let mut lines = BufReader::new(f).lines();
+        // 头部再校验一次：文件可能在两次读之间被换掉
+        if let Some(head) = lines.next() {
+            let head = head.map_err(|e| LedgerError::Io(e.to_string()))?;
+            let header: Header = serde_json::from_str(&head)
+                .map_err(|e| LedgerError::Format(format!("头部不可解析: {e}")))?;
+            if header.yunxi_bot_ledger != LEDGER_FORMAT_VERSION {
+                return Err(LedgerError::Format(format!(
+                    "不支持的台账版本 {}，本程序只支持 {}",
+                    header.yunxi_bot_ledger, LEDGER_FORMAT_VERSION
+                )));
+            }
+        }
+        for (i, line) in lines.enumerate() {
+            let line = line.map_err(|e| LedgerError::Io(e.to_string()))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let ev: Event = serde_json::from_str(&line)
+                .map_err(|e| LedgerError::Format(format!("第 {} 条事件不可解析: {e}", i + 1)))?;
+            self.events.push(ev);
+        }
+        self.seq = self.events.last().map(|e| e.seq).unwrap_or(0);
+        self.next_span = self.seq + 1;
+        self.seen_len = len;
+        Ok(())
     }
 
     /// 开启一个边界。边界是崩溃恢复的提交单位，审计事件必须落在其中。
