@@ -205,6 +205,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "agent" => cmd_agent(rest),
         "remember" => cmd_remember(rest),
         "memory" => cmd_memory(rest),
+        "profile" => cmd_profile(rest),
         "journal" => cmd_journal(rest),
         "install-autostart" => cmd_autostart(AutostartAction::Install),
         "uninstall-autostart" => cmd_autostart(AutostartAction::Uninstall),
@@ -1717,6 +1718,70 @@ fn cmd_remember(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     println!("  编号 : {id}");
     println!("  台账 : {}", ledger.path().display());
     Ok(0)
+}
+
+/// 看 / 初始化使用者自己写的那份画像。
+///
+/// ## 为什么不合并进 `memory`
+///
+/// 画像是**使用者主动写的自我描述**（权威），记忆是**助理攒的观察**
+/// （可能有错）。来源不同、权威性不同——放进同一个命令会让人以为
+/// 它们是同一种东西，而"这是它对我的看法"和"这是我告诉它的"
+/// 混淆之后，改哪个、信哪个就说不清了。
+fn cmd_profile(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::profile::{MAX_PROFILE_BYTES, PROFILE_FILE, TEMPLATE};
+
+    let home = default_home();
+    let path = home.join(PROFILE_FILE);
+
+    // ---- 初始化 ----
+    if args.iter().any(|a| a == "--init") {
+        if path.exists() && !args.iter().any(|a| a == "--force") {
+            eprintln!("画像已经存在：{}", path.display());
+            eprintln!("要重写就加 --force（**会覆盖你现在写的内容**）。");
+            return Ok(2);
+        }
+        std::fs::create_dir_all(&home)?;
+        std::fs::write(&path, TEMPLATE)?;
+        println!("已创建画像模板：{}", path.display());
+        println!();
+        println!("用任何编辑器打开它，把 `<!-- -->` 里的例子换成你自己的话。");
+        println!("**它是纯文本，写几句话就够，不用长。**");
+        return Ok(0);
+    }
+
+    // ---- 看 ----
+    match yunxi_bot_core::profile::load(&home) {
+        None => {
+            println!("还没有画像。");
+            println!();
+            println!("画像是**你自己写的一段话**，告诉它该怎么理解你——");
+            println!("怎么称呼、在意什么、别做什么。它和记忆不是一回事：");
+            println!("记忆是它自己攒的观察，画像是你亲口说的。");
+            println!();
+            println!("建一份：yunxi-bot profile --init");
+            Ok(0)
+        }
+        Some(p) => {
+            println!("画像：{}", p.path.display());
+            println!(
+                "大小：{} 字 / 上限 {} KB",
+                p.text.chars().count(),
+                MAX_PROFILE_BYTES / 1024
+            );
+            if p.truncated {
+                println!("**注意：超上限了，进提示词的只有前面一部分。**");
+            }
+            println!();
+            println!("{}", p.text.trim());
+            println!();
+            println!("─────────────────────────────────────");
+            println!("下面这段就是**每次对话都会发给它**的内容：");
+            println!();
+            println!("{}", p.render().trim());
+            Ok(0)
+        }
+    }
 }
 
 /// 看它记住了什么 / 找 / 忘。

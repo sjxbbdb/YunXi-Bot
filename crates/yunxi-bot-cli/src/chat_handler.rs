@@ -165,6 +165,8 @@ pub struct ChatHandler {
     /// 常驻记忆段（构造时定下）。**单独存着**，因为它要拼进稳定前缀，
     /// 而稳定前缀只能有一份来源——两份必然漂移（见 `stable_prefix`）。
     memory_block: String,
+    /// 使用者自己写的画像（构造时读一次）。同样进稳定前缀。
+    profile_block: String,
     /// 启动时读到的项目规则。**留着是为了能报出来源**——
     /// 模型说"按项目约定应该……"时，使用者得能查到那指的是哪一条。
     project_rules: yunxi_bot_core::rules::RuleSet,
@@ -238,11 +240,18 @@ impl ChatHandler {
         // 这是可接受的（记记忆本来就该是"下一次对话生效"），
         // 而且比"每轮前缀都变、缓存永远命中不了"好得多。
         let memory_block = resident_memory_block(&home);
+        // **使用者自己写的那份**。和记忆不是一回事：画像是他主动写的
+        // 自我描述（权威），记忆是助理攒的观察（可能有错）。
+        //
+        // 它在构造时读一次就定下来——和人格、规则、常驻记忆同理：
+        // 进稳定前缀的东西每轮现读的话，前缀一直在变、缓存全废。
+        let profile_block = yunxi_bot_core::profile::load_and_render(&home);
         Self {
             home,
             thinkers: BTreeMap::new(),
             sessions: BTreeMap::new(),
             memory_block,
+            profile_block,
             project_rules,
             persona: build_persona(persona_name, persona_text, &rules),
             tools: ToolRegistry::new(),
@@ -518,6 +527,14 @@ impl ChatHandler {
         if intent == Intent::Chat {
             // **没有内容就不拼空段**：那会平白占掉前缀的 token，
             // 还每轮都一样地占。
+            //
+            // 顺序是**人格 → 画像 → 记忆 → 项目规则**：先"我是谁"，
+            // 再"你是谁"，再"我记得什么"，最后"这个项目的约定"。
+            // 从最稳定到最具体，读起来顺，也符合注意力从远到近的分布。
+            if !self.profile_block.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&self.profile_block);
+            }
             if !self.memory_block.is_empty() {
                 out.push_str("\n\n");
                 out.push_str(&self.memory_block);

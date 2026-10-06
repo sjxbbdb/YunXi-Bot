@@ -41,6 +41,7 @@ pub mod notify;
 #[cfg(windows)]
 pub mod notify_windows;
 pub mod policy;
+pub mod profile;
 pub mod rules;
 pub mod runner;
 pub mod task;
