@@ -368,6 +368,27 @@ impl ChatHandler {
         self.converse(routing, Intent::Chat, volatile, CHAT_MAX_TOKENS, records)
     }
 
+    /// 拿不准时问决策模型："这句话要不要去查关于他的记忆。"
+    ///
+    /// 返回 `None` 表示**问不出来**——没有决策器、调用失败、或者模型
+    /// 给了个听不懂的选项。三种情况都由调用方退回关键词的判断。
+    ///
+    /// **认不出就说认不出**，不硬猜：硬猜一个比不猜更坏，
+    /// 因为它看起来像有依据，事后没法归因。
+    fn gate_with_model(&self, input: &str) -> Option<yunxi_bot_core::recall_gate::MemoryNeed> {
+        use yunxi_bot_core::decide::DecisionRequest;
+        let d = self.decider.as_deref()?;
+        // **只喂判断所需的证据。** 把整段上下文倒进去既浪费调用，
+        // 也让"它凭什么这么判"变得不可复核。
+        let req = DecisionRequest::new(
+            serde_json::json!({ "使用者这一句": input }),
+            yunxi_bot_core::recall_gate::gate_questions(),
+        );
+        let res = d.decide(&req).ok()?;
+        let answer = res.answer(yunxi_bot_core::recall_gate::GATE_QUESTION)?;
+        yunxi_bot_core::recall_gate::need_from_choice(answer.choice.as_deref())
+    }
+
     /// 给这一句话配上相关的往事，拼成易变尾。
     ///
     /// ## 为什么是易变尾而不是前缀
@@ -419,6 +440,23 @@ impl ChatHandler {
         // 省下来的调用还不够付它的；而且调模型的门控没法稳定测试，
         // "召回结果为什么变了"就说不清了。
         let need = yunxi_bot_core::recall_gate::gate(input);
+        // **拿不准才问决策模型。**
+        //
+        // 关键词先跑：常见问法（"我住在哪"）一毫秒就能判准，
+        // 而且**确定**——同一句话永远同一个结果。
+        //
+        // 只有它判成 `Mixed`（拿不准）时才问模型。真机上的例子：
+        // 「量子色动力学的重整化群方程」没有疑问句式、也没有个人指代，
+        // 关键词只能保守地判成"可能要用记忆"，于是白召回一趟。
+        // **"这是不是通用知识"靠字面判不出来。**
+        //
+        // 模型失败/超时/给出听不懂的选项时**退回关键词的判断**——
+        // 门控是优化，不是对话能不能进行的前提。
+        let need = if need == yunxi_bot_core::recall_gate::MemoryNeed::Mixed {
+            self.gate_with_model(input).unwrap_or(need)
+        } else {
+            need
+        };
         if !need.needs_recall() {
             // `none`：问的是世界，不是使用者，不去翻私人记忆
             // `profile`：画像和常驻层**已经在稳定前缀里**了，再召一次是重复占位

@@ -234,6 +234,136 @@ pub fn gate(query: &str) -> MemoryNeed {
     MemoryNeed::Mixed
 }
 
+/// 门控那个决策问题的 id。
+pub const GATE_QUESTION: &str = "memory_need";
+
+/// **拿不准时问决策模型。**
+///
+/// ## 为什么不能全靠关键词
+///
+/// 关键词表能覆盖常见问法，但**判不了无标记的名词短语**。
+/// 真机上的例子：「量子色动力学的重整化群方程」——它没有疑问句式、
+/// 也没有个人指代，关键词只能保守地判成"可能要用记忆"，
+/// 于是白召回一趟。
+///
+/// **"这是不是通用知识"靠字面判不出来。** 关键词表越写越长也只是
+/// 在追着用例跑，而每一轮对话都要为这张表付维护成本。
+///
+/// ## 为什么也不是全交给模型
+///
+/// 门控在**每一轮**都跑。全交给模型的话：
+/// - 每轮多一次调用（限流、延迟、花钱）
+/// - 常见问法（"我住在哪"）本来关键词一毫秒就能判准
+/// - **而且它变得不可测**——同一句话两次可能判得不一样，
+///   "召回结果为什么变了"就说不清
+///
+/// 所以：**关键词先跑，只有它判成 `Mixed`（拿不准）时才问模型。**
+/// 常见情况零成本且确定，模糊情况有真判断。
+///
+/// ## 选项和 `MemoryNeed` 一一对应
+///
+/// 判据写得**互相排斥**——"问的是世界"和"问的是使用者本人"不能重叠，
+/// 否则模型的选择没有可复核性（这和研究文档说的"选项必须有
+/// 可区分的判据"是同一条要求）。
+pub fn gate_questions() -> Vec<crate::decide::Question> {
+    use crate::decide::Question;
+    vec![Question::choice(
+        GATE_QUESTION,
+        "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+        &[
+            (
+                "none",
+                "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+            ),
+            (
+                "profile",
+                "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯",
+            ),
+            (
+                "episode",
+                "问的是他经历过的事：什么时候、当时、上次、最近一次",
+            ),
+            (
+                "long_term",
+                "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+            ),
+            ("knowledge", "要查的是文档或资料库，而不是关于他的私人记忆"),
+            ("mixed", "既有个人指代又涉及具体的事，两类都可能用得上"),
+        ],
+    )]
+}
+
+/// 把模型的选项翻成 [`MemoryNeed`]。
+///
+/// **`knowledge` 映射成 `None`**：两者的共同点是"**别去翻私人记忆**"，
+/// 而这一层的职责就是决定要不要翻。区分"该查文档"和"什么都不用查"
+/// 是召回**之后**的事（研究文档 §4.1 说知识库和记忆不得互相旁路）。
+///
+/// 认不出的选项返回 `None`（拿不准）而不是硬猜一个——
+/// 调用方会退回关键词的判断。
+pub fn need_from_choice(choice: Option<&str>) -> Option<MemoryNeed> {
+    Some(match choice? {
+        "none" | "knowledge" => MemoryNeed::None,
+        "profile" => MemoryNeed::Profile,
+        "episode" => MemoryNeed::Episode,
+        "long_term" => MemoryNeed::LongTerm,
+        "mixed" => MemoryNeed::Mixed,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod model_gate_tests {
+    use super::*;
+
+    #[test]
+    fn the_model_choice_maps_back_to_a_need() {
+        assert_eq!(need_from_choice(Some("none")), Some(MemoryNeed::None));
+        assert_eq!(need_from_choice(Some("profile")), Some(MemoryNeed::Profile));
+        assert_eq!(need_from_choice(Some("episode")), Some(MemoryNeed::Episode));
+        assert_eq!(
+            need_from_choice(Some("long_term")),
+            Some(MemoryNeed::LongTerm)
+        );
+        assert_eq!(need_from_choice(Some("mixed")), Some(MemoryNeed::Mixed));
+    }
+
+    #[test]
+    fn knowledge_means_do_not_touch_private_memory() {
+        // **`knowledge` 和 `none` 在这一层的效果一样**：都不翻私人记忆。
+        // 区分"该查文档"和"什么都不用查"是召回之后的事
+        // （知识库和记忆不得互相旁路）。
+        assert_eq!(need_from_choice(Some("knowledge")), Some(MemoryNeed::None));
+        assert!(!need_from_choice(Some("knowledge")).unwrap().needs_recall());
+    }
+
+    #[test]
+    fn an_unrecognised_choice_is_none_not_a_guess() {
+        // **认不出就说认不出**，让调用方退回关键词的判断——
+        // 硬猜一个比不猜更坏，因为它看起来像有依据。
+        assert_eq!(need_from_choice(Some("随便什么")), None);
+        assert_eq!(need_from_choice(None), None);
+    }
+
+    #[test]
+    fn the_gate_question_has_criteria_for_every_option() {
+        // 判据必须**互相排斥**，否则模型的选择没有可复核性。
+        // 这里钉的是"六类都有判据"——少一个就等于那一类模型没法选。
+        let qs = gate_questions();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].id, GATE_QUESTION);
+        let crate::decide::QuestionKind::Choice { criteria } = &qs[0].kind else {
+            panic!("门控该是个选择题");
+        };
+        assert_eq!(criteria.len(), 6, "六类都要有判据");
+        for (name, how) in criteria {
+            assert!(!how.trim().is_empty(), "{name} 没写判据");
+            // 每一类的判据都要能翻回来，否则模型选了也没用
+            assert!(need_from_choice(Some(name)).is_some(), "{name} 翻不回来");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
