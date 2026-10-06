@@ -23,18 +23,16 @@ use yunxi_bot_core::task::engine::{LedgerTaskStore, TaskStore};
 use yunxi_bot_core::think::{ModelSpec, ReasoningEffort, TaskKind, TaskProfile};
 use yunxi_bot_core::{TickOptions, now_millis, policy, tick};
 
+/// 数据目录。**委托给内核那一份**，不在这里重算。
+///
+/// 这里原本自己算了一遍（`YUNXI_BOT_HOME` → `%LOCALAPPDATA%\YunXiBot` →
+/// `~/.yunxi-bot`），而 sidecar 在 Python 里又算了一遍。两边算法看起来一样，
+/// 但只要有一处漏了对齐，表现就是最难查的那类错：sidecar 说"没配置"，
+/// 而使用者的配置文件明明就在那儿。
+///
+/// 端到端测试抓到过一次真实的路径不一致——所以现在只有一份定义。
 fn default_home() -> PathBuf {
-    if let Ok(v) = std::env::var("YUNXI_BOT_HOME") {
-        return PathBuf::from(v);
-    }
-    if cfg!(windows) {
-        if let Ok(la) = std::env::var("LOCALAPPDATA") {
-            return PathBuf::from(la).join("YunXiBot");
-        }
-    }
-    let mut p = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
-    p.push(".yunxi-bot");
-    p
+    yunxi_bot_core::default_home()
 }
 
 fn ledger_path() -> PathBuf {
@@ -99,6 +97,10 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
   yunxi-bot notify \"<标题>\" [\"<正文>\"]  发一条桌面通知（同时验证通知出口通不通）
       --tag <标签>          替换同类通知而不是堆积
       --console             强制走控制台出口（验证出口可换）
+  yunxi-bot mail [选项]       看未读邮件（只读，不会标成已读）
+      --limit <n>           取几封（默认 20）
+      --read <uid>          看某封的正文
+      --port <n>            sidecar 端口（默认 17871）
   yunxi-bot tools             列出工具及其能力类别（不需要模型）
   yunxi-bot tasks             列出执行框架里的任务及其步骤
   yunxi-bot tasks <id>        看一个任务的步骤明细
@@ -186,6 +188,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "tasks" => cmd_tasks(rest),
         "tools" => cmd_tools(rest),
         "notify" => cmd_notify(rest),
+        "mail" => cmd_mail(rest),
         "resume" => cmd_resume(rest),
         "cost" => cmd_cost(rest),
         "log" => cmd_log(rest),
@@ -1518,6 +1521,132 @@ fn cmd_notify(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 ///
 /// 这个命令存在的理由：使用者要写 `--allow` 规则，就得知道工具叫什么、
 /// 粒度是什么、默认会不会问。让人去翻源码是把成本推给使用者。
+/// 看未读邮件。**只读**——不会把你的邮件标成已读。
+///
+/// 这个命令存在的理由和 `notify` 一样：使用者需要能**自己确认**助理看到了什么。
+/// 一个说"我帮你处理邮件了"的助理，你得有办法核实它到底看到了哪些。
+///
+/// 它也是"信息源"这一层的验证入口——三种失败会被明确分开报：
+/// sidecar 没起来 / 起来了但没配邮箱 / 配好了但取不到。
+/// 第三种会转述 sidecar 的原话（比如"QQ 用的是授权码不是登录密码"）。
+fn cmd_mail(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::info::InfoSource;
+    use yunxi_bot_core::info::mail::{MailSource, credentials_path};
+
+    let port: u16 = flag(args, "--port")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(yunxi_bot_core::info::mail::DEFAULT_PORT);
+    let src = MailSource::new(port);
+
+    // `--read <uid>` 看一封的正文
+    if let Some(uid) = flag(args, "--read") {
+        match src.read(uid) {
+            Ok(body) => {
+                println!("UID {uid} 的正文（前 1200 字）：");
+                println!();
+                if body.trim().is_empty() {
+                    println!("（正文是空的——可能是纯 HTML 邮件或只有附件）");
+                } else {
+                    println!("{body}");
+                }
+                return Ok(0);
+            }
+            Err(e) => {
+                eprintln!("读取失败: {e}");
+                return Ok(1);
+            }
+        }
+    }
+
+    // 先报健康状态：把"没配"和"连不上"分开说清
+    let cfg_path = credentials_path(&default_home());
+    match src.health() {
+        Ok(()) => {
+            // **说清读的是哪个邮箱。** 使用者看到"未读 12 封"时得能确认
+            // 读的是对的地方——一个报数字却不说从哪读的助理没法核实。
+            match src.describe() {
+                Some(who) => println!("sidecar   : 正常（端口 {port}，账号 {who}）"),
+                None => println!("sidecar   : 正常（端口 {port}）"),
+            }
+        }
+        Err(e) => {
+            eprintln!("不可用    : {e}");
+            eprintln!("配置文件  : {}", cfg_path.display());
+            eprintln!();
+            eprintln!("需要这样一份 JSON（IMAP 密码填邮箱的**授权码**，不是登录密码）：");
+            eprintln!("  {{");
+            eprintln!("    \"imap_host\": \"imap.qq.com\",");
+            eprintln!("    \"imap_port\": 993,");
+            eprintln!("    \"username\": \"you@qq.com\",");
+            eprintln!("    \"password\": \"授权码\"");
+            eprintln!("  }}");
+            return Ok(1);
+        }
+    }
+
+    let limit: usize = flag(args, "--limit")
+        .map(str::parse)
+        .transpose()?
+        .unwrap_or(20);
+    let batch = match src.fetch(limit) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("取未读失败: {e}");
+            return Ok(1);
+        }
+    };
+
+    println!("未读总数  : {} 封", batch.total_unseen);
+    println!("本次取到  : {} 封", batch.items.len());
+    if batch.skipped > 0 {
+        // **"没看全"必须说出来**，否则使用者以为这就是全部
+        println!("取不到    : {} 封（这些没被看到）", batch.skipped);
+    }
+    println!();
+
+    if batch.items.is_empty() {
+        println!("（没有未读）");
+        return Ok(0);
+    }
+
+    for it in &batch.items {
+        // 打扰判定会用的几个信号，这里显出来好让使用者自己核对
+        let tag = if it.direct {
+            "直接"
+        } else if it.looks_bulk() {
+            "群发"
+        } else {
+            "抄送"
+        };
+        println!(
+            "[{tag}] {:<24} {}",
+            truncate_chars(it.display_from(), 22),
+            truncate_chars(it.display_subject(), 40)
+        );
+        println!("        uid={} 收件人={}", it.id, it.recipient_count);
+        if !it.preview.trim().is_empty() {
+            println!(
+                "        {}",
+                truncate_chars(&it.preview.replace('\n', " "), 70)
+            );
+        }
+    }
+    println!();
+    println!("看某封正文: yunxi-bot mail --read <uid>");
+    println!("（这一层是只读的：不会把你的邮件标成已读）");
+    Ok(0)
+}
+
+/// 按字符截断。按字节切会落在汉字中间。
+fn truncate_chars(s: &str, n: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= n {
+        return t.to_string();
+    }
+    format!("{}…", t.chars().take(n).collect::<String>())
+}
+
 fn cmd_tools(_args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::tool::Capability;
 

@@ -1,11 +1,21 @@
 //! 最小 HTTP/1.1 客户端，只服务本机回环上的 JSON 接口。
 //!
 //! 为什么不引 HTTP 库：这是唯一需要联网的地方，而且只对 `127.0.0.1` 说
-//! 一个固定形状的 POST。为它拉进一整棵依赖树不划算（本项目运行时依赖目前
+//! 一个固定形状的请求。为它拉进一整棵依赖树不划算（本项目运行时依赖目前
 //! 只有 `chrono`）。
 //!
 //! 刻意不支持：TLS、重定向、分块传输、keep-alive。用不到，且每多支持一样
 //! 就多一处出错的地方。遇到不支持的响应直接报错，而不是猜。
+//!
+//! ## 它不只服务决策模型
+//!
+//! 邮件 sidecar 走的是同一个回环契约，所以也用这个客户端。
+//! **模块位置（`decide::http`）是历史原因**，它实质上是一个通用的
+//! "本机回环 JSON"客户端。
+//!
+//! 而 [`parse_endpoint`] 里的**回环限制才是它最值钱的地方**：决策 state 和
+//! 邮件内容都是私人信息，这个限制保证它们不可能被发到外部主机。加一个
+//! 新 sidecar 就白拿这条保证——比每个 sidecar 各写一份客户端可靠得多。
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -79,6 +89,58 @@ pub fn post_json(endpoint: &str, body: &str, timeout_ms: u64) -> Result<String, 
         len = body.len(),
     );
 
+    stream.write_all(request.as_bytes()).map_err(map_io)?;
+    stream.flush().map_err(map_io)?;
+
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > MAX_RESPONSE_BYTES {
+                    return Err(HttpError::TooLarge);
+                }
+            }
+            Err(e) => return Err(map_io(e)),
+        }
+    }
+
+    parse_response(&raw)
+}
+
+/// 向本机回环地址发一个 GET，返回响应体字符串。
+///
+/// 邮件 sidecar 的 `/health` 用它。与 [`post_json`] 共用端点解析
+/// （因而共用**回环限制**）和响应解析。
+pub fn get_json(endpoint: &str, timeout_ms: u64) -> Result<String, HttpError> {
+    let (addr, path) = parse_endpoint(endpoint)?;
+    let timeout = Duration::from_millis(timeout_ms);
+
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            HttpError::Timeout
+        } else {
+            HttpError::Connect(e.to_string())
+        }
+    })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| HttpError::Io(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| HttpError::Io(e.to_string()))?;
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: {host}:{port}\r\n\
+         Accept: application/json\r\n\
+         Connection: close\r\n\
+         \r\n",
+        host = addr.ip(),
+        port = addr.port(),
+    );
     stream.write_all(request.as_bytes()).map_err(map_io)?;
     stream.flush().map_err(map_io)?;
 

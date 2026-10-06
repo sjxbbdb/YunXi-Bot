@@ -18,6 +18,8 @@ pub mod companion;
 pub mod costlog;
 pub mod decide;
 pub mod exec;
+/// 信息源：助理"看外面"的入口。
+pub mod info;
 pub mod instance;
 pub mod job;
 pub mod ledger;
@@ -87,4 +89,36 @@ pub fn now_millis() -> Result<u64, CoreError> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .map_err(|e| CoreError::Clock(e.to_string()))
+}
+
+/// 数据目录。**这是内核里唯一一份定义。**
+///
+/// ## 为什么这件事值得有"唯一一份"
+///
+/// 之前 CLI 自己算一份、sidecar 在 Python 里再算一份。两边算法看起来一样
+/// （`YUNXI_BOT_HOME` → `%LOCALAPPDATA%\YunXiBot` → `~/.yunxi-bot`），
+/// 但只要有一处漏了对齐，表现就是**最难查的那类错**：
+/// sidecar 说"没配置"，而使用者的配置文件明明就在那儿。
+///
+/// 端到端测试抓到过一次真实的路径不一致。修法不是"让两边神奇地一致"
+/// ——那不可靠；而是**让不一致可被看见**（见 `info::mail` 里 health
+/// 的路径比对）。但源头仍然应该只有一份。
+///
+/// 与 `sidecar/mail_server.py` 的 `default_home()` 必须是同一套规则，
+/// 靠 `YUNXI_BOT_HOME` 对齐。Python 那边改不动这个事实，
+/// 所以 Rust 侧至少要保证自己不重复。
+pub fn default_home() -> std::path::PathBuf {
+    if let Ok(v) = std::env::var("YUNXI_BOT_HOME") {
+        if !v.trim().is_empty() {
+            return std::path::PathBuf::from(v);
+        }
+    }
+    if cfg!(windows) {
+        if let Ok(la) = std::env::var("LOCALAPPDATA") {
+            return std::path::PathBuf::from(la).join("YunXiBot");
+        }
+    }
+    let mut p = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    p.push(".yunxi-bot");
+    p
 }
