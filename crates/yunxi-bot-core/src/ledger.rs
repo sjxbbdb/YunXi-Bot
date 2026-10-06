@@ -88,6 +88,12 @@ pub enum EventKind {
     /// 尝试把一条通知送出去。**记投递结果的四档**，
     /// 包括"交给了系统但未确认可见"——那不算送达。
     NoticeSent,
+    /// 使用者对一条通知的处置。
+    ///
+    /// **记的是"他当时看到的那条信息长什么样"**，不只是 id——
+    /// 事后翻台账的人看到 `id=17` 什么也判断不了。
+    /// 以及这条反馈**实际改动了什么**（`rule_added`）。
+    FeedbackRecorded,
 
     // —— 记忆（由 memory::Memory::from_events 投影）——
     MemoryRecorded,

@@ -102,6 +102,7 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --dry-run             只判定不真发通知（台账照记）
       --no-notify           完全不出通知，只看判定结果
       --console             通知打到终端
+  yunxi-bot feedback [选项]   表个态：--last --never / --read / --ignored
   yunxi-bot mail [选项]       看未读邮件（只读，不会标成已读）
       --limit <n>           取几封（默认 20）
       --read <uid>          看某封的正文
@@ -195,6 +196,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "notify" => cmd_notify(rest),
         "mail" => cmd_mail(rest),
         "check" => cmd_check(rest),
+        "feedback" => cmd_feedback(rest),
         "resume" => cmd_resume(rest),
         "cost" => cmd_cost(rest),
         "log" => cmd_log(rest),
@@ -1523,10 +1525,151 @@ fn cmd_notify(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     }
 }
 
-/// 列出工具及其能力类别。**不需要模型，不花钱。**
+/// 对一条通知表个态。**"这类以后别烦我"就靠这个。**
 ///
-/// 这个命令存在的理由：使用者要写 `--allow` 规则，就得知道工具叫什么、
-/// 粒度是什么、默认会不会问。让人去翻源码是把成本推给使用者。
+/// ## 两件事同时做，缺一不可
+///
+/// | 落到哪 | 有什么用 |
+/// |---|---|
+/// | 台账 | 事后能说清这条规则**是谁在什么时候为什么加的** |
+/// | 策略文件 | 下一次判断**真的会用它** |
+///
+/// 只写台账不改策略 = 记了不做。只改策略不写台账 = 做了但说不清来由，
+/// 三个月后你会盯着 `block_senders` 里一条 `@x.com` 想不起为什么。
+///
+/// ## 规则建在"当时那条"上，不重新去取
+///
+/// 从台账里找回系统判定时看到的那条记录。不重新联网取有两个理由，
+/// 第二个更重要：不用联网（sidecar 没起来时"以后别烦我"仍该生效——
+/// 那正是最想说这句话的时刻）；以及**重新取有可能取到同一 UID 的更新版本**，
+/// 于是规则建在了另一条信息上。
+fn cmd_feedback(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::feedback::{
+        Feedback, Scope, apply_never, feedback_event_data, find_item, last_notified,
+    };
+    use yunxi_bot_core::triage::{POLICY_FILE, load_policy, save_policy};
+    use yunxi_bot_core::{EventKind, Ledger};
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("用法: yunxi-bot feedback [--last | --id <uid>] [选项]");
+        println!();
+        println!("  --last              对最近一条真的通知过你的表态（最常用）");
+        println!("  --id <uid>          对指定的一条表态");
+        println!("  --never             这类以后别烦我（会写进策略文件）");
+        println!("  --read              看过了，有用（只记台账，不改策略）");
+        println!("  --ignored           看到了没管（只记台账，不改策略）");
+        println!("  --domain            范围扩大到整个域名（默认只屏蔽这个发件人）");
+        println!("  --note \"<说明>\"     附一句话，一并记进台账");
+        return Ok(0);
+    }
+
+    let never = args.iter().any(|a| a == "--never");
+    let read = args.iter().any(|a| a == "--read");
+    let ignored = args.iter().any(|a| a == "--ignored");
+    let picked = [never, read, ignored].iter().filter(|x| **x).count();
+    if picked == 0 {
+        eprintln!("要说清是什么意思：--never（以后别烦我）/ --read（有用）/ --ignored（没管）");
+        return Ok(2);
+    }
+    if picked > 1 {
+        eprintln!("--never / --read / --ignored 只能选一个");
+        return Ok(2);
+    }
+    let feedback = if never {
+        Feedback::Never
+    } else if read {
+        Feedback::Read
+    } else {
+        Feedback::Ignored
+    };
+
+    let scope = if args.iter().any(|a| a == "--domain") {
+        Scope::Domain
+    } else {
+        Scope::Sender
+    };
+
+    let mut ledger = Ledger::open(ledger_path())?;
+    let events = ledger.events().to_vec();
+
+    // 找回"当时那条"
+    let item = if args.iter().any(|a| a == "--last") {
+        match last_notified(&events) {
+            Some(i) => i,
+            None => {
+                eprintln!("台账里没有找到「真的通知过你」的记录。");
+                eprintln!("（演练模式的不算——那条没到你眼前。）");
+                eprintln!("先跑一轮 yunxi-bot check，或者用 --id 指定。");
+                return Ok(1);
+            }
+        }
+    } else if let Some(id) = flag(args, "--id") {
+        match find_item(&events, id) {
+            Some(i) => i,
+            None => {
+                eprintln!("台账里没有 id={id} 的判定记录。");
+                eprintln!("（只能对系统判过的信息表态——它得先看过。）");
+                return Ok(1);
+            }
+        }
+    } else {
+        eprintln!("要说清对哪一条表态：--last 或 --id <uid>");
+        return Ok(2);
+    };
+
+    println!("针对      : {} 的「{}」", item.from_addr, item.subject);
+
+    let note = flag(args, "--note").unwrap_or("");
+
+    // ---- 改策略（只有 --never 会改）----
+    let mut rule_added: Option<String> = None;
+    if feedback.changes_policy() {
+        let policy = match load_policy(&default_home()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("策略文件有问题，先修它: {e}");
+                return Ok(2);
+            }
+        };
+        let (next, added) = match apply_never(&policy, &item, scope) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("没法据此建规则: {e}");
+                return Ok(1);
+            }
+        };
+        match &added {
+            Some(rule) => {
+                save_policy(&default_home(), &next)?;
+                println!("范围      : {}", scope.label());
+                println!("新规则    : 拉黑 {rule}");
+                println!(
+                    "策略文件  : {}（现在 {} 条黑名单）",
+                    default_home().join(POLICY_FILE).display(),
+                    next.block_senders.len()
+                );
+                rule_added = added;
+            }
+            None => {
+                println!("范围      : {}", scope.label());
+                println!("（这条规则已经有了，没重复添加——同一句话不该把策略文件撑大）");
+            }
+        }
+    } else {
+        println!("说明      : {}（只记台账，不改策略）", feedback.label());
+        println!("（忽略一条不等于永远不想看这一类——所以它不动策略。）");
+    }
+
+    // ---- 落台账 ----
+    ledger.append(
+        EventKind::FeedbackRecorded,
+        None,
+        feedback_event_data(&item, feedback, Some(scope), rule_added.as_deref(), note),
+    )?;
+    println!("台账      : {}", ledger_path().display());
+    Ok(0)
+}
+
 /// 看一眼信息源，判断，**该通知你的就通知你**，全程落台账。
 ///
 /// 这是"助理"这条链路的第一个完整形态：
@@ -1671,11 +1814,27 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         }
     };
 
+    // 从台账里取出"已经真的通知过你的"。**这是"同一类不该反复问"的落点。**
+    let seen = yunxi_bot_core::feedback::seen(ledger.events());
     let mut notified = 0usize;
     let mut held = 0usize;
     let mut silent = 0usize;
+    let mut skipped_seen = 0usize;
 
     for it in &batch.items {
+        // **已经真的通知过你的，不再判第二次。**
+        //
+        // 没有这一句时，`check` 每跑一轮就把所有未读重判一遍——
+        // 一封已经通知过的邮件会在下一轮再被通知一次。那不是"判定不准"，
+        // 是**没有记忆**。
+        //
+        // 判定成 Hold 的不在此列：攒着的意思就是"以后再说"，
+        // 把它们也跳过会让攒着的东西永远不再被提及。
+        if yunxi_bot_core::feedback::already_seen(&seen, it) {
+            skipped_seen += 1;
+            continue;
+        }
+
         let d = triage_item(&mut engine, it, &triage_policy, &companion, &ctx, hour, now);
 
         // **每条判定都落台账，包括"决定不通知"的那些。**
@@ -1744,6 +1903,16 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 "channel": notifier.name(),
                 "source": it.source,
                 "id": it.id,
+                // **结构化字段要和渲染好的 title/body 一起记。**
+                //
+                // 只记 title/body 是不够的：`feedback --last` 要从这条记录里
+                // 推出"拉黑谁"，而 title/body 是给通知用的展示串，
+                // 格式随时可能变。规则必须建在结构化字段上——
+                // 这个坑是端到端测试抓到的（`from` 读出来是空的，
+                // 于是"以后别烦我"报"这条信息没有发件人地址"）。
+                "from": it.from_addr,
+                "from_name": it.from_name,
+                "subject": it.subject,
                 "title": n.title,
                 "body": n.body,
                 "result": delivery.label(),
@@ -1765,6 +1934,10 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 
     println!();
     println!("通知 {notified} 条 · 攒着 {held} 条 · 不提 {silent} 条");
+    if skipped_seen > 0 {
+        // **说清"没重判"这件事**，否则使用者会以为漏了
+        println!("已经告诉过你 {skipped_seen} 条（不重复打扰）");
+    }
     println!("台账: {}", ledger_path().display());
     if dry_run {
         println!("（演练模式：没有真的发通知，但台账照记）");
@@ -1898,6 +2071,10 @@ fn truncate_chars(s: &str, n: usize) -> String {
     format!("{}…", t.chars().take(n).collect::<String>())
 }
 
+/// 列出工具及其能力类别。**不需要模型，不花钱。**
+///
+/// 这个命令存在的理由：使用者要写 `--allow` 规则，就得知道工具叫什么、
+/// 粒度是什么、默认会不会问。让人去翻源码是把成本推给使用者。
 fn cmd_tools(_args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::tool::Capability;
 

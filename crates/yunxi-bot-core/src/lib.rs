@@ -18,6 +18,8 @@ pub mod companion;
 pub mod costlog;
 pub mod decide;
 pub mod exec;
+/// 反馈回写：使用者的处置，以及下一次判断要不要记得它。
+pub mod feedback;
 /// 信息源：助理"看外面"的入口。
 pub mod info;
 pub mod instance;

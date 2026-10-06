@@ -45,11 +45,9 @@ import mail_server as ms  # noqa: E402
 from fake_imap import FakeImapServer  # noqa: E402
 from http.server import ThreadingHTTPServer  # noqa: E402
 from test_mail_server import make_message  # noqa: E402
+from e2e_common import ensure_fresh_binary  # noqa: E402
 
-REPO = Path(__file__).resolve().parent.parent
-BIN = REPO / "target" / "debug" / "yunxi-bot.exe"
-if not BIN.exists():
-    BIN = REPO / "target" / "debug" / "yunxi-bot"
+
 
 
 def free_port() -> int:
@@ -61,9 +59,9 @@ def free_port() -> int:
 
 
 def main() -> int:
-    if not BIN.exists():
-        print(f"找不到二进制 {BIN}，先跑 cargo build --workspace", file=sys.stderr)
-        return 2
+    # **必须重建**：cargo clippy / cargo test 都不刷新这个 exe，
+    # 不重建就会验到上一次 build 的旧二进制，得到假结果。
+    BIN = ensure_fresh_binary()
 
     ok = True
 
