@@ -361,6 +361,45 @@ impl ChatHandler {
         self.sessions.retain(|k, _| k.intent != Intent::Chat);
     }
 
+    /// 拿一个客户端来做摘要。
+    ///
+    /// **优先便宜的那个**：摘要是简单活，用贵模型是浪费。
+    /// 拿不到就返回 `None`，由调用方退回兜底——压缩不能失败。
+    pub fn summarizer_thinker(&mut self) -> Option<std::sync::Arc<OpenAiThinker>> {
+        for spec in [ModelSpec::AGNES_FLASH, ModelSpec::DEEPSEEK_FLASH] {
+            if let Ok(t) = self.thinker(&spec) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    /// 上下文用量。`None` 表示这个会话还不存在。
+    pub fn chat_usage(&self) -> Option<yunxi_bot_core::think::context::ContextUsage> {
+        self.chat_layout().map(|l| l.usage())
+    }
+
+    /// 超出预算就压缩。返回压缩记录，`None` 表示没压。
+    ///
+    /// **压缩是一次性的、有意的前缀变更。** 代价是那一次缓存未命中，
+    /// 换来的是不撞上下文上限。设计细节见
+    /// [`yunxi_bot_core::think::context`] 的模块文档。
+    pub fn compact_if_needed(
+        &mut self,
+        budget: &yunxi_bot_core::think::context::ContextBudget,
+        summarizer: &dyn yunxi_bot_core::think::context::Summarizer,
+        keep_recent: usize,
+    ) -> Option<yunxi_bot_core::think::context::Compaction> {
+        let key = self
+            .sessions
+            .iter()
+            .find(|(k, _)| k.intent == Intent::Chat)
+            .map(|(k, _)| k.clone())?;
+        self.sessions
+            .get_mut(&key)?
+            .compact(summarizer, budget, keep_recent)
+    }
+
     /// 一次带会话的调用。返回模型正文。
     ///
     /// 内部走的是**工具循环**：没挂工具时它等价于一次普通调用
@@ -450,8 +489,21 @@ impl ChatHandler {
         })?;
 
         // 把这一轮所有模型调用的用量一次性交出去
+        //
+        // **同时拿最大的一次 `prompt_tokens` 当上下文用量的锚点。**
+        // 那是"我们这次实际发出去多少 token"的**精确值**——
+        // 有了它，字符估算法就只是两次响应之间的临时补丁，误差不会累积。
+        //
+        // 取最大而不是最后一次：工具循环里提示词逐轮变长，最后一次通常最大；
+        // 取最大是保守的，而**保守在这里是安全的**（高估只是早一点压缩，
+        // 低估会撞上限）。
+        let mut anchor = None;
         if let Ok(mut m) = meter.lock() {
+            anchor = m.iter().map(|r| r.usage.prompt_tokens).max();
             records.append(&mut m);
+        }
+        if let (Some(a), Some(l)) = (anchor, self.sessions.get_mut(&key)) {
+            l.anchor_usage(a as usize);
         }
         // "总是允许"的规则要能留到后面的调用——它是使用者的决定，不该每轮重问
         self.policy = runner.policy().clone();

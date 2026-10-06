@@ -30,6 +30,9 @@
 //! 而不是一句写在文档里的叮嘱。见模块测试。
 
 use super::Message;
+use super::context::{
+    COMPACT_MARKER, Compaction, ContextBudget, ContextUsage, Summarizer, message_chars,
+};
 
 /// 三段式提示词布局。
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -37,9 +40,43 @@ pub struct PromptLayout {
     /// 稳定前缀：系统提示词 + 人格 + 工具定义。**跨调用必须字节一致。**
     stable: String,
     /// 追加式历史。只允许往后加，不允许改前面的。
+    ///
+    /// **唯一的例外是压缩**——它会把最老的一段换成一条摘要消息。
+    /// 那是**一次性的、有意的**前缀变更：代价是那一次缓存未命中，
+    /// 换来的是不撞上下文上限。见 [`crate::think::context`] 的模块文档。
     history: Vec<Message>,
     /// 易变尾部：当前要问的问题。
     volatile: String,
+    /// 上下文用量：精确锚点 + 增量估算。
+    #[serde(default)]
+    usage: ContextUsage,
+}
+
+/// 找一个**不会劈开工具调用序列**的切割点。
+///
+/// 从 `want` 往前退，直到 `history[cut]` 不是 `Role::Tool`。
+/// 退到 0 说明整个历史都在一个工具序列里——那就压不了，
+/// 调用方要如实返回"没压成"，而不是硬切。
+///
+/// ## 为什么不能硬切
+///
+/// 丢掉一条带 `tool_calls` 的助手消息、却留下它的工具结果，
+/// 服务端会报 400，错误信息指向"缺少对应的 tool_call_id"——
+/// 看起来像工具出了问题，其实是切错了地方。
+/// **切错的代价（对话直接坏掉）比超限的代价（报错）更糟。**
+fn safe_cut(history: &[Message], want: usize) -> usize {
+    if history.is_empty() {
+        return 0;
+    }
+    // **最多切到"只剩最后一条"。**
+    //
+    // 允许切满（`cut == len`）有两个问题：一是数组越界（`history[cut]`），
+    // 二是语义上把整段历史清空——那不叫压缩，叫失忆。
+    let mut cut = want.min(history.len() - 1);
+    while cut > 0 && history[cut].role == super::Role::Tool {
+        cut -= 1;
+    }
+    cut
 }
 
 impl PromptLayout {
@@ -49,6 +86,7 @@ impl PromptLayout {
             stable: stable.into(),
             history: Vec::new(),
             volatile: String::new(),
+            usage: ContextUsage::default(),
         }
     }
 
@@ -70,8 +108,11 @@ impl PromptLayout {
             return;
         }
         let question = std::mem::take(&mut self.volatile);
-        self.history.push(Message::user(question));
-        self.history.push(Message::assistant(assistant));
+        let q = Message::user(question);
+        let a = Message::assistant(assistant);
+        self.usage.add(message_chars(&q) + message_chars(&a));
+        self.history.push(q);
+        self.history.push(a);
     }
 
     /// 设置本轮要问的问题。可以反复覆盖——它本来就是易变的。
@@ -136,14 +177,140 @@ impl PromptLayout {
     pub fn push_raw(&mut self, msg: Message) {
         if !self.volatile.is_empty() {
             let q = std::mem::take(&mut self.volatile);
-            self.history.push(Message::user(q));
+            let m = Message::user(q);
+            self.usage.add(message_chars(&m));
+            self.history.push(m);
         }
+        self.usage.add(message_chars(&msg));
         self.history.push(msg);
     }
 
     /// 前缀的字符长度，用于估算 token 与成本。
     pub fn stable_len(&self) -> usize {
         self.stable.chars().count()
+    }
+
+    // ---- 上下文用量与压缩 ----
+
+    /// 当前的上下文用量。
+    pub fn usage(&self) -> ContextUsage {
+        self.usage
+    }
+
+    /// 历史的第一条。压缩之后它就是那条摘要。
+    ///
+    /// 单独给一个访问器是因为 `build()[0]` 是**系统消息**（稳定前缀），
+    /// 历史从下标 1 开始——这个偏移很容易看错，而看错的表现是
+    /// "摘要明明写了却说没有"。
+    pub fn head(&self) -> Option<&Message> {
+        self.history.first()
+    }
+
+    /// 记下一次 API 响应报告的真实 `prompt_tokens`。
+    ///
+    /// **这是精度的来源。** 它把我们实际发出去多少 token 的精确值拉回来，
+    /// 于是估算误差不会累积。
+    pub fn anchor_usage(&mut self, prompt_tokens: usize) {
+        self.usage.anchor(prompt_tokens);
+    }
+
+    /// 超出预算时压缩最老的一段。返回 `None` 表示还没到该压的时候。
+    ///
+    /// ## 两个必须做对的地方
+    ///
+    /// **一、切割点不能劈开工具调用序列。**
+    ///
+    /// 丢掉一条带 `tool_calls` 的助手消息、却留下它的工具结果，
+    /// 服务端会报 400——而错误信息指的是"缺少对应的 tool_call_id"，
+    /// 看起来像是工具出了问题，其实是我们切错了地方。
+    /// 所以切割点要从目标位置**往前退到第一个不是 `Role::Tool` 的消息**。
+    ///
+    /// **二、摘要要调模型，但模型不可用时不能失败。**
+    ///
+    /// 压缩被触发时我们已经接近上限了——这时候"摘要失败了所以不压"
+    /// 会让下一轮直接撞上限报错。所以失败就退回 [`context::DropMarker`]：
+    /// **信息有损，但对话能继续**，而且有损是写在台账里的。
+    pub fn compact(
+        &mut self,
+        summarizer: &dyn Summarizer,
+        budget: &ContextBudget,
+        keep_recent: usize,
+    ) -> Option<Compaction> {
+        if !budget.should_compact(&self.usage) {
+            return None;
+        }
+
+        // **`keep_recent` 是偏好，不是下限。**
+        //
+        // 最初的写法是 `if history.len() <= keep_recent { return None }`——
+        // 于是"消息不多但每条很大"的会话（6 轮长内容 = 12 条）永远压不了，
+        // 然后直接撞上限报错。**而那正是压缩要防的事。**
+        //
+        // 这个 bug 是端到端测试抓到的：`/usage` 显示 3212 token、
+        // 触发线 984，却始终没压。
+        //
+        // 现在：超预算就必须让出空间。同时**至少砍掉一半**——
+        // 只砍一两条在"超了三倍"时毫无意义，下一轮又要压一次，
+        // 而每次压缩都意味着一次缓存未命中。
+        let len = self.history.len();
+        if len < 2 {
+            return None;
+        }
+        // **至少留住最后一轮交换（2 条）。**
+        // 少于这个数就等于让模型失去眼前的上下文——那比超限更糟，
+        // 因为它会开始问你已经说过的事。
+        let keep = keep_recent.min((len / 2).max(2));
+        let want_cut = len - keep;
+        let cut = safe_cut(&self.history, want_cut);
+        if cut == 0 {
+            // 整个历史都在一个工具序列里——压不了。
+            // **不强行压**：切错位置的代价是 400，比超限更糟。
+            return None;
+        }
+
+        let before_tokens = self.usage.estimated_tokens();
+        let dropped: Vec<Message> = self.history.drain(..cut).collect();
+        let dropped_chars: usize = dropped.iter().map(message_chars).sum();
+        let dropped_tool_calls: usize = dropped.iter().map(|m| m.tool_calls.len()).sum();
+
+        // 兜底摘要。**压缩不能失败**，所以无论模型那边出什么事，
+        // 这里都要产出一段可用的文字。
+        let fallback = |err: Option<String>| -> (String, bool, Option<String>) {
+            let text = super::context::DropMarker
+                .summarize(&dropped)
+                .unwrap_or_else(|_| format!("{COMPACT_MARKER}（此前内容已省略）"));
+            (text, false, err)
+        };
+        let (summary, summarized, summary_error) = match summarizer.summarize(&dropped) {
+            Ok(s) if !s.trim().is_empty() => (s, true, None),
+            // 空摘要等于把历史扔了却不留任何说明——那比兜底更糟
+            Ok(_) => fallback(Some("模型返回了空摘要".into())),
+            // **失败原因必须留下来**：静默退兜底会让"每次压缩都在丢信息"
+            // 完全不可见，而使用者的感受是"它怎么不记得了"，无从追查。
+            Err(e) => fallback(Some(e)),
+        };
+
+        let head = Message::user(format!("{COMPACT_MARKER}\n{summary}"));
+        let head_chars = message_chars(&head);
+        self.history.insert(0, head);
+
+        // 剩余内容：摘要 + 保住的历史。**锚点作废**——
+        // 下一轮的精确值由下一次响应给。
+        let remaining: usize = self.history.iter().map(message_chars).sum();
+        self.usage.reset_after_compaction(remaining);
+
+        let c = Compaction {
+            dropped_messages: dropped.len(),
+            dropped_chars,
+            dropped_tool_calls,
+            kept_messages: self.history.len() - 1,
+            before_tokens,
+            after_tokens: self.usage.estimated_tokens(),
+            summarized,
+            summary_error,
+        };
+        let _ = head_chars;
+        Some(c)
     }
 }
 
@@ -164,6 +331,353 @@ pub fn build_persona(name: &str, persona: &str, rules: &[String]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use crate::think::Role;
+    use crate::think::context::{ContextBudget, DropMarker};
+
+    /// 一个只在小预算下才触发的预算。
+    fn tiny_budget() -> ContextBudget {
+        ContextBudget {
+            window_tokens: 200,
+            reserve_for_reply: 0,
+            compact_at: 0.5,
+        }
+    }
+
+    fn layout_with_turns(n: usize, chars: usize) -> PromptLayout {
+        let mut l = PromptLayout::new("稳定前缀");
+        for i in 0..n {
+            l.ask(format!("问题 {i} {}", "字".repeat(chars)));
+            l.record_reply(format!("回答 {i} {}", "字".repeat(chars)));
+        }
+        l
+    }
+
+    // ---- 触发条件 ----
+
+    #[test]
+    fn nothing_happens_below_the_budget() {
+        let mut l = layout_with_turns(1, 10);
+        assert!(l.compact(&DropMarker, &tiny_budget(), 2).is_none());
+    }
+
+    #[test]
+    fn a_short_but_huge_history_still_compacts() {
+        // **这个 bug 是端到端测试抓到的。**
+        //
+        // 6 轮长内容 = 12 条消息，正好等于 `KEEP_RECENT`。
+        // 而最初的写法是 `len <= keep_recent 就不压`——于是
+        // "消息不多但每条很大"的会话永远压不了，然后直接撞上限报错。
+        // **而那正是压缩要防的事。**
+        let mut l = layout_with_turns(6, 2000); // 12 条，每条很大
+        let c = l
+            .compact(&DropMarker, &tiny_budget(), 12)
+            .expect("超出预算就必须压——消息条数少不是不压的理由");
+        assert!(c.saved_tokens() > 0);
+    }
+
+    #[test]
+    fn compaction_cuts_at_least_half_when_the_message_count_is_low() {
+        // 只砍一两条在"超了三倍"时毫无意义：下一轮又要压一次，
+        // 而每次压缩都意味着一次缓存未命中。
+        let mut l = layout_with_turns(6, 2000);
+        let c = l.compact(&DropMarker, &tiny_budget(), 12).unwrap();
+        assert!(
+            c.dropped_messages >= 4,
+            "至少该砍掉一半（12 条里的 6 条），实际砍了 {}",
+            c.dropped_messages
+        );
+    }
+
+    #[test]
+    fn a_preferred_keep_count_is_honoured_when_there_is_enough_history() {
+        // 历史够长时，`keep_recent` 该被尊重——否则每次都砍掉一半，
+        // 模型很快就会忘记刚才在说什么
+        let mut l = layout_with_turns(100, 50);
+        let c = l.compact(&DropMarker, &tiny_budget(), 12).unwrap();
+        assert!(
+            c.kept_messages >= 12,
+            "该留住 12 条，实际留了 {}",
+            c.kept_messages
+        );
+    }
+
+    #[test]
+    fn compaction_fires_when_over_budget() {
+        let mut l = layout_with_turns(30, 100);
+        let c = l.compact(&DropMarker, &tiny_budget(), 4).expect("该压了");
+        assert!(c.dropped_messages > 0);
+        assert!(c.saved_tokens() > 0, "压了却一点没省: {c:?}");
+    }
+
+    #[test]
+    fn a_single_exchange_is_never_compacted() {
+        // **至少留住最后一轮交换。** 压掉它等于让模型失去眼前的上下文——
+        // 那比超限更糟，因为它会开始问你已经说过的事。
+        let mut l = layout_with_turns(1, 5000);
+        assert!(
+            l.compact(&DropMarker, &tiny_budget(), 4).is_none(),
+            "只有一轮交换时没有可压的"
+        );
+    }
+
+    // ---- 硬约束一：不劈开工具调用序列 ----
+
+    #[test]
+    fn a_cut_never_leaves_an_orphan_tool_result() {
+        // **丢掉请求工具的助手消息、却留下工具结果，服务端会报 400。**
+        // 而错误信息指向"缺少 tool_call_id"——看起来像工具坏了，
+        // 其实是切错了地方。
+        let mut l = PromptLayout::new("p");
+        for i in 0..10 {
+            l.ask(format!("问题 {i}"));
+            l.push_raw(Message::assistant_tool_calls(vec![serde_json::json!({
+                "id": format!("call_{i}"), "type": "function",
+                "function": {"name": "now", "arguments": "{}"}
+            })]));
+            l.push_raw(Message::tool_result(format!("call_{i}"), "结果"));
+            l.record_reply("说完了");
+        }
+        l.compact(&DropMarker, &tiny_budget(), 3);
+
+        // **不变量：每一条工具结果都能找到它对应的助手请求。**
+        let h = l.build();
+        for (i, m) in h.iter().enumerate() {
+            if m.role != Role::Tool {
+                continue;
+            }
+            let id = m.tool_call_id.as_deref().expect("工具结果必须有 id");
+            let found = h[..i].iter().any(|prev| {
+                prev.tool_calls
+                    .iter()
+                    .any(|tc| tc.get("id").and_then(|v| v.as_str()) == Some(id))
+            });
+            assert!(found, "第 {i} 条工具结果成了孤儿（{id}）：压缩切错了位置");
+        }
+    }
+
+    #[test]
+    fn a_cut_lands_on_a_boundary_not_inside_a_tool_run() {
+        let history = vec![
+            Message::user("u0"),
+            Message::assistant_tool_calls(vec![serde_json::json!({"id": "a"})]),
+            Message::tool_result("a", "r"),
+            Message::assistant("a0"),
+            Message::user("u1"),
+        ];
+        // 想切 3 条，但第 3 条是工具结果 —— 要退到 2
+        let cut = safe_cut(&history, 3);
+        // **要断言的是不变量，不是一个具体数字。**
+        // 切在 3 也是对的：工具请求 [1] 和它的结果 [2] 一起被丢掉，
+        // 没有孤儿。写死数字会把正确的实现判成错的。
+        assert_ne!(history[cut].role, Role::Tool, "切点不能落在工具结果上");
+    }
+
+    #[test]
+    fn a_history_that_is_one_tool_run_cannot_be_cut() {
+        // 退到 0 说明整段都在一个工具序列里 —— **不硬切**。
+        // 切错的代价（对话直接坏掉）比超限的代价（报错）更糟。
+        let history = vec![
+            Message::assistant_tool_calls(vec![serde_json::json!({"id": "a"})]),
+            Message::tool_result("a", "r"),
+        ];
+        assert_eq!(safe_cut(&history, 2), 0);
+    }
+
+    #[test]
+    fn a_normal_boundary_is_used_as_is() {
+        let history = vec![Message::user("u0"), Message::assistant("a0")];
+        assert_eq!(safe_cut(&history, 1), 1);
+    }
+
+    // ---- 硬约束二：压缩后前缀稳定 ----
+
+    #[test]
+    fn the_prefix_is_byte_stable_between_compactions() {
+        // **这是缓存纪律的核心。**
+        //
+        // 压缩一次 → 未命中一次；之后每轮都要命中。
+        // 如果摘要每轮都重算，前缀就每轮都变，缓存全废——
+        // 而那种失效是静默的，只表现为账单变贵。
+        let mut l = layout_with_turns(30, 100);
+        l.compact(&DropMarker, &tiny_budget(), 4).expect("该压了");
+
+        // 压缩之后前缀长这样：稳定前缀 + 摘要
+        let after_compact: Vec<Message> = l.build();
+        let head_after = after_compact[0..2.min(after_compact.len())].to_vec();
+
+        // 再聊几轮（不该再触发压缩）
+        let mut l2 = l.clone();
+        l2.ask("新问题");
+        l2.record_reply("新回答");
+        let after_more: Vec<Message> = l2.build();
+
+        assert_eq!(
+            &after_more[0..head_after.len()],
+            &head_after[..],
+            "追加消息不该改动前缀——否则每轮都缓存未命中"
+        );
+    }
+
+    #[test]
+    fn the_summary_message_is_visibly_marked() {
+        // 读台账的人（和模型）都要一眼看出"这里之前的东西被压掉了"，
+        // 而不是以为对话就是从这儿开始的
+        let mut l = layout_with_turns(30, 100);
+        l.compact(&DropMarker, &tiny_budget(), 4);
+        assert!(
+            l.head().unwrap().content.contains(COMPACT_MARKER),
+            "摘要要带标记: {}",
+            l.head().unwrap().content
+        );
+        // 顺带确认 `build()` 的结构：第 0 条是系统消息（稳定前缀），
+        // 摘要从第 1 条开始——**这个偏移很容易看错**
+        assert_eq!(l.build()[0].role, Role::System);
+        assert!(l.build()[1].content.contains(COMPACT_MARKER));
+    }
+
+    #[test]
+    fn compacting_twice_does_not_double_up_markers_at_the_front() {
+        // 第二次压缩会把上一次的摘要一起压掉——那是对的（它也是历史），
+        // 但结果里不该出现两条并列的摘要头
+        let mut l = layout_with_turns(40, 200);
+        l.compact(&DropMarker, &tiny_budget(), 4);
+        // 再塞很多，逼出第二次
+        for i in 0..40 {
+            l.ask(format!("追加 {i} {}", "字".repeat(200)));
+            l.record_reply("好");
+        }
+        l.compact(&DropMarker, &tiny_budget(), 4);
+        let heads = l
+            .build()
+            .iter()
+            .take(3)
+            .filter(|m| m.content.contains(COMPACT_MARKER))
+            .count();
+        assert_eq!(heads, 1, "开头不该堆多个摘要");
+    }
+
+    // ---- 用量记账 ----
+
+    #[test]
+    fn appending_updates_the_usage_estimate() {
+        let mut l = PromptLayout::new("p");
+        let before = l.usage().estimated_tokens();
+        l.ask("很长的问题".repeat(50));
+        l.record_reply("很长的回答".repeat(50));
+        assert!(l.usage().estimated_tokens() > before);
+    }
+
+    #[test]
+    fn an_anchor_makes_the_usage_exact() {
+        let mut l = PromptLayout::new("p");
+        l.ask("q");
+        l.anchor_usage(1234);
+        assert!(l.usage().is_exact());
+        assert_eq!(l.usage().estimated_tokens(), 1234);
+    }
+
+    #[test]
+    fn compaction_invalidates_the_anchor() {
+        // 压缩之后内容全变了，旧锚点不再代表现在的用量
+        let mut l = layout_with_turns(30, 100);
+        l.anchor_usage(999_999);
+        l.compact(&DropMarker, &tiny_budget(), 4);
+        assert!(l.usage().anchor_tokens.is_none(), "旧锚点必须作废");
+        assert!(
+            l.usage().estimated_tokens() < 999_999,
+            "压缩之后估出来的应该小得多"
+        );
+    }
+
+    #[test]
+    fn tool_calls_count_toward_the_trigger() {
+        // 工具调用的 JSON 占的 token 不少，只算 content 会低估，
+        // 而低估的后果是撞上限
+        let mut a = PromptLayout::new("p");
+        a.ask("q");
+        a.record_reply("a");
+        let mut b = PromptLayout::new("p");
+        b.ask("q");
+        b.push_raw(Message::assistant_tool_calls(vec![serde_json::json!({
+            "id": "call_1", "type": "function",
+            "function": {"name": "web_search", "arguments": "{\"q\":\"很长的查询字符串\"}"}
+        })]));
+        assert!(b.usage().estimated_tokens() > a.usage().estimated_tokens());
+        let _ = a;
+    }
+
+    // ---- 摘要失败要兜底 ----
+
+    struct AlwaysFails;
+    impl Summarizer for AlwaysFails {
+        fn summarize(&self, _: &[Message]) -> Result<String, String> {
+            Err("模型不可用".into())
+        }
+    }
+
+    struct ReturnsEmpty;
+    impl Summarizer for ReturnsEmpty {
+        fn summarize(&self, _: &[Message]) -> Result<String, String> {
+            Ok("   ".into())
+        }
+    }
+
+    #[test]
+    fn a_failing_summarizer_still_compacts() {
+        // **压缩不能失败。** 它被触发时我们已经接近上限了——
+        // "摘要失败所以不压"会让下一轮直接撞上限报错。
+        let mut l = layout_with_turns(30, 100);
+        let c = l
+            .compact(&AlwaysFails, &tiny_budget(), 4)
+            .expect("必须压成");
+        assert!(!c.summarized, "要如实标出用的是兜底");
+        assert!(c.saved_tokens() > 0);
+    }
+
+    #[test]
+    fn an_empty_summary_is_treated_as_failure() {
+        // 空摘要等于把历史扔了却不留任何说明——那比兜底更糟
+        let mut l = layout_with_turns(30, 100);
+        let c = l
+            .compact(&ReturnsEmpty, &tiny_budget(), 4)
+            .expect("必须压成");
+        assert!(!c.summarized);
+        assert!(l.head().unwrap().content.contains(COMPACT_MARKER));
+    }
+
+    #[test]
+    fn the_fallback_still_says_how_much_was_lost() {
+        let mut l = layout_with_turns(30, 100);
+        l.compact(&AlwaysFails, &tiny_budget(), 4);
+        let head = &l.head().unwrap().content;
+        assert!(head.contains("消息"), "要说清丢了多少: {head}");
+    }
+
+    // ---- 压缩之后对话还能继续 ----
+
+    #[test]
+    fn a_compacted_layout_can_keep_growing() {
+        let mut l = layout_with_turns(30, 100);
+        l.compact(&DropMarker, &tiny_budget(), 4);
+        let after = l.history_len();
+        l.ask("压完之后的新问题");
+        l.record_reply("新回答");
+        assert_eq!(l.history_len(), after + 2, "压缩之后还要能正常追加");
+    }
+
+    #[test]
+    fn compaction_is_recorded_with_readable_numbers() {
+        let mut l = layout_with_turns(30, 100);
+        let c = l.compact(&DropMarker, &tiny_budget(), 4).unwrap();
+        let s = c.summary();
+        assert!(s.contains("压缩"), "{s}");
+        assert!(s.contains("token"), "{s}");
+    }
 }
 
 #[cfg(test)]

@@ -126,6 +126,7 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --resume [--id <名字>]  接着上次聊；不给 --id 就接最近那个
       chat list             看有哪些会话
       --thinking auto|on|off 思考模式
+      --context-window <n>   上下文窗口（token，默认按模型定）
   yunxi-bot mcp list          连上配置的 MCP server 并列出它的工具
   yunxi-bot mcp call <s> <t>  调一个 MCP 工具（--args '{...}'）
   yunxi-bot tools             列出工具及其能力类别（不需要模型）
@@ -2144,7 +2145,33 @@ fn cmd_chat(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             ),
         ));
 
-    chat::run(&mut handler, &store, session_id, resume, effort)
+    // 台账：压缩要留痕（"它怎么不记得了"的答案在这里）
+    let mut ledger = Ledger::open(ledger_path())?;
+    // 预算按模型定。这里先按默认的对话模型给——真正的窗口由 router 选中的模型决定，
+    // 而那个在每一轮才知道；用最保守的一档起步，宁可早压。
+    // `--context-window` 让使用者能自己调，也让端到端验证能在合理的
+    // 时间内触发压缩（不然要聊几十轮才到 32k）。
+    let mut budget = yunxi_bot_core::think::context::ContextBudget::for_model("agnes");
+    if let Some(w) = flag(args, "--context-window") {
+        let w: usize = w.parse()?;
+        if w < 512 {
+            eprintln!("--context-window 太小了（{w}），至少 512");
+            return Ok(2);
+        }
+        budget.window_tokens = w;
+        // 预留跟着窗口缩，否则小窗口下永远触发不了压缩
+        budget.reserve_for_reply = budget.reserve_for_reply.min(w / 8);
+    }
+
+    chat::run(
+        &mut handler,
+        &store,
+        session_id,
+        resume,
+        effort,
+        Some(&mut ledger),
+        budget,
+    )
 }
 
 /// MCP：列出外部 server 的工具，或者调一个。

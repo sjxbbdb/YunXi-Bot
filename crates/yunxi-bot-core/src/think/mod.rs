@@ -18,6 +18,7 @@
 //! 这不是为了省钱的优化，是这个配额下的结构必然。
 
 pub mod agnes;
+pub mod context;
 pub mod cost;
 pub mod prompt;
 pub mod router;

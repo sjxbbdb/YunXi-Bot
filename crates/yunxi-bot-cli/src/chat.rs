@@ -44,6 +44,114 @@ use crate::chat_handler::ChatHandler;
 /// 在很久以后发现"它怎么不记得了"，而那时已经无从追查。
 pub const MAX_TURNS: usize = 200;
 
+/// 压缩时保留最近多少条消息。
+///
+/// 12 条大约覆盖"最近三四轮对话"——够让模型接得上刚才在说什么，
+/// 又不至于让压缩白做（留太多就等于没压）。
+pub const KEEP_RECENT_MESSAGES: usize = 12;
+
+/// 用模型做摘要。
+///
+/// ## 为什么摘要要调模型
+///
+/// 兜底方案（`DropMarker`）只说"这里少了 40 条"，模型拿不到任何内容——
+/// 于是它会重新问你已经说过的事。模型摘要贵一次调用，
+/// 但换来的是**压缩之后对话还能接得上**。
+///
+/// 失败时如实返回 `Err`，由 `PromptLayout::compact` 退回兜底——
+/// **压缩本身不能失败**，它被触发时我们已经接近上限了。
+pub struct ModelSummarizer {
+    thinker: std::sync::Arc<yunxi_bot_core::think::OpenAiThinker>,
+}
+
+impl ModelSummarizer {
+    pub fn new(thinker: std::sync::Arc<yunxi_bot_core::think::OpenAiThinker>) -> Self {
+        Self { thinker }
+    }
+}
+
+impl yunxi_bot_core::think::context::Summarizer for ModelSummarizer {
+    fn summarize(&self, dropped: &[yunxi_bot_core::think::Message]) -> Result<String, String> {
+        use yunxi_bot_core::think::{Message, ThinkRequest, Thinker};
+
+        // 把要丢的消息拼成一段文本交给模型。**工具调用要说出工具名**——
+        // "调用了 web_search" 比 "调用了某工具" 有用得多。
+        let mut body = String::new();
+        for m in dropped {
+            if !m.tool_calls.is_empty() {
+                let names: Vec<String> = m
+                    .tool_calls
+                    .iter()
+                    .filter_map(|tc| {
+                        tc.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect();
+                body.push_str(&format!("[调用了工具：{}]\n", names.join("、")));
+            }
+            if !m.content.trim().is_empty() {
+                body.push_str(&m.content);
+                body.push('\n');
+            }
+        }
+
+        let req = ThinkRequest {
+            messages: vec![
+                Message::system(
+                    "你在压缩一段即将被丢弃的对话历史。\
+                     写一段简洁的摘要，保留：① 使用者说过的偏好与约束 \
+                     ② 已经做了什么、结果如何 ③ 还没做完的事 \
+                     ④ 重要的具体值（路径、文件名、数字）。\
+                     丢掉寒暄和重复。直接给摘要，不要开场白。",
+                ),
+                Message::user(body),
+            ],
+            max_tokens: Some(800),
+            temperature: None,
+            thinking: Some(yunxi_bot_core::think::Thinking::Disabled),
+            tools: Vec::new(),
+        };
+
+        // **摘要也要走限流等待。**
+        //
+        // 这个是端到端测试抓到的：压缩发生在对话中途，而那时往往
+        // 正好卡在 10 RPM 上——绕过等待直接调，摘要必然被限流打掉，
+        // 于是每次都退到兜底（有损），使用者看到的是"它怎么不记得了"。
+        //
+        // D17 已经定过"本地限流不是失败"：等一等再发。摘要没有理由例外。
+        let resp = crate::chat_handler::retry_throttled(
+            || self.thinker.think(&req),
+            |wait| {
+                eprintln!("  （摘要调用遇到本地限流，等 {} ms）", wait.as_millis());
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(resp.content)
+    }
+}
+
+/// 超预算就压。**摘要用模型；失败退回兜底。**
+fn compact_now(
+    handler: &mut ChatHandler,
+    budget: &yunxi_bot_core::think::context::ContextBudget,
+) -> Option<yunxi_bot_core::think::context::Compaction> {
+    // 用量还没到就别白花一次调用
+    let usage = handler.chat_usage()?;
+    if !budget.should_compact(&usage) {
+        return None;
+    }
+    // 用哪个模型做摘要：优先便宜的那个（摘要是简单活），
+    // 拿不到就退回兜底——**压缩不能失败**。
+    let summarizer: Box<dyn yunxi_bot_core::think::context::Summarizer> =
+        match handler.summarizer_thinker() {
+            Some(t) => Box::new(ModelSummarizer::new(t)),
+            None => Box::new(yunxi_bot_core::think::context::DropMarker),
+        };
+    handler.compact_if_needed(budget, summarizer.as_ref(), KEEP_RECENT_MESSAGES)
+}
+
 /// 跑一个交互式会话。
 ///
 /// 返回退出码。
@@ -53,7 +161,10 @@ pub fn run(
     session_id: String,
     resume: bool,
     effort: ReasoningEffort,
+    ledger: Option<&mut yunxi_bot_core::Ledger>,
+    budget: yunxi_bot_core::think::context::ContextBudget,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    let mut ledger = ledger;
     let stdin = std::io::stdin();
     let mut turns: u32 = 0;
 
@@ -154,6 +265,32 @@ pub fn run(
                     println!("已开新会话（旧的还在，用 `chat list` 能看到）。");
                     continue;
                 }
+                "usage" => {
+                    // **把估价和"是不是精确"一起显示。**
+                    // 只说一个数字会让人以为那是准确值——而它多数时候是估算。
+                    match handler.chat_usage() {
+                        Some(u) => {
+                            println!(
+                                "上下文：约 {} token{}（窗口 {}，{} 时压缩）",
+                                u.estimated_tokens(),
+                                if u.is_exact() {
+                                    "（精确，来自上次响应）"
+                                } else {
+                                    "（估算）"
+                                },
+                                budget.window_tokens,
+                                budget.trigger_at()
+                            );
+                            if let Some(a) = u.anchor_tokens {
+                                println!("  锚点：{a} token（上一次响应报告的真实值）");
+                            } else {
+                                println!("  锚点：还没有（纯估算，误差会大一些）");
+                            }
+                        }
+                        None => println!("还没有会话。"),
+                    }
+                    continue;
+                }
                 "history" => {
                     println!("本会话 {turns} 轮。");
                     if let Some(l) = handler.chat_layout() {
@@ -165,6 +302,33 @@ pub fn run(
                     eprintln!("未知命令 `/{other}`。`/help` 看有哪些。");
                     continue;
                 }
+            }
+        }
+
+        // ---- 压缩检查：**在花掉这一轮之前做** ----
+        //
+        // 放在这里而不是响应之后：响应回来时已经花掉了，
+        // 而超限的响应本身就是失败（API 报错）。所以要在发出去之前压。
+        if let Some(c) = compact_now(handler, &budget) {
+            println!("  （{}）", c.summary());
+            if let Some(l) = ledger.as_mut() {
+                let _ = l.append(
+                    yunxi_bot_core::EventKind::ContextCompacted,
+                    None,
+                    serde_json::json!({
+                        "session": session_id,
+                        "dropped_messages": c.dropped_messages,
+                        "dropped_chars": c.dropped_chars,
+                        "dropped_tool_calls": c.dropped_tool_calls,
+                        "kept_messages": c.kept_messages,
+                        "before_tokens": c.before_tokens,
+                        "after_tokens": c.after_tokens,
+                        "saved_tokens": c.saved_tokens(),
+                        // **摘要是不是模型写的。** 兜底是有损的，
+                        // 事后追查"它怎么不记得了"要靠这一位。
+                        "summarized": c.summarized,
+                    }),
+                );
             }
         }
 
@@ -252,6 +416,7 @@ fn print_help() {
     println!("  /help              看这个");
     println!("  /save              立刻存盘（其实每轮都自动存）");
     println!("  /history           看本会话有多少轮");
+    println!("  /usage             看上下文用了多少、什么时候会压缩");
     println!("  /clear             开一个新会话（旧的保留）");
     println!("  /exit              退出（等价于 Ctrl+D）");
     println!();
