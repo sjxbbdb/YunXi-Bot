@@ -40,6 +40,7 @@ pub mod notify;
 /// 在没有它们的平台上放一个永远返回失败的实现只会制造噪音。
 #[cfg(windows)]
 pub mod notify_windows;
+pub mod persona;
 pub mod policy;
 pub mod profile;
 pub mod recall_gate;

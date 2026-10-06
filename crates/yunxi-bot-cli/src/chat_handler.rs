@@ -219,7 +219,20 @@ fn resident_memory_block(home: &std::path::Path) -> String {
 
 impl ChatHandler {
     /// `persona_text` 与 `rules` 来自配置；它们会被拼进稳定前缀。
+    ///
+    /// ## 人格文件优先
+    ///
+    /// 传进来的 `persona_name` / `persona_text` 现在是**内置默认**，
+    /// 只在该文件不存在时用。真正生效的是 `<数据目录>/persona.md`。
+    ///
+    /// **为什么在这里读而不是在调用方读**：有 5 处构造点，每一处都
+    /// 自己去读一遍的话，迟早有一处忘了读——而那一处的表现是
+    /// **"改了人格但那条链路没变"**，最难查。放在唯一入口里，
+    /// "所有链路用同一个人格"就成了结构上的保证。
     pub fn new(home: PathBuf, persona_name: &str, persona_text: &str, rules: Vec<String>) -> Self {
+        let loaded = yunxi_bot_core::persona::load(&home, persona_name, persona_text);
+        let persona_name = loaded.name.as_str();
+        let persona_text = loaded.text.as_str();
         // **项目规则在这里读一次，就定下来。**
         //
         // 它进稳定前缀，而前缀每轮变的话缓存全废——所以不能
@@ -1045,6 +1058,12 @@ impl TaskHandler for ChatHandler {
 }
 
 /// 默认人格。等使用者给出自己的版本就能覆盖。
+/// 内置的助理名字。
+///
+/// **它只是"还没建过 `persona.md` 时的起点"。** 改名字请改那个文件——
+/// 改这里要重编译，那就不是"你的人格"了。
+pub const DEFAULT_PERSONA_NAME: &str = "云熙";
+
 pub const DEFAULT_PERSONA: &str = "\
 你是常驻在用户自己电脑上的个人助理。说话克制、直接、不客套，不堆感叹号。\
 不确定的事就说不确定，不要用漂亮的措辞掩盖没把握。";

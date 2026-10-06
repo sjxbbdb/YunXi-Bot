@@ -206,6 +206,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "remember" => cmd_remember(rest),
         "memory" => cmd_memory(rest),
         "profile" => cmd_profile(rest),
+        "persona" => cmd_persona(rest),
         "journal" => cmd_journal(rest),
         "install-autostart" => cmd_autostart(AutostartAction::Install),
         "uninstall-autostart" => cmd_autostart(AutostartAction::Uninstall),
@@ -1717,6 +1718,72 @@ fn cmd_remember(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     println!("已记住 [{}] {}", kind.label(), text);
     println!("  编号 : {id}");
     println!("  台账 : {}", ledger.path().display());
+    Ok(0)
+}
+
+/// 看 / 初始化助理的人格。
+///
+/// ## 为什么要能改
+///
+/// 在这之前人格是**写死在代码里的常量**（`DEFAULT_PERSONA`），
+/// 名字"云熙"也是。想改只能改代码重编译——**那就不是"你的人格"，
+/// 是"开发者的人格"**。
+///
+/// ## 代价要说清楚
+///
+/// **它进稳定前缀的第一段。** 改了它，后面所有字节的偏移都变了，
+/// 缓存整段作废——**一次未命中**。之后重新稳定。
+///
+/// 所以这个命令把这句话说出来，而不是让人自己去猜"为什么改完变慢了"。
+fn cmd_persona(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::persona::{MAX_PERSONA_BYTES, PERSONA_FILE, PersonaSource, TEMPLATE};
+
+    let home = default_home();
+    let path = home.join(PERSONA_FILE);
+
+    if args.iter().any(|a| a == "--init") {
+        if path.exists() && !args.iter().any(|a| a == "--force") {
+            eprintln!("人格文件已经存在：{}", path.display());
+            eprintln!("要重写就加 --force（**会覆盖你现在写的内容**）。");
+            return Ok(2);
+        }
+        std::fs::create_dir_all(&home)?;
+        std::fs::write(&path, TEMPLATE)?;
+        println!("已创建人格模板：{}", path.display());
+        println!();
+        println!("**第一行的一级标题就是名字**，改成你想要的；下面写人格。");
+        return Ok(0);
+    }
+
+    let p = yunxi_bot_core::persona::load(
+        &home,
+        chat_handler::DEFAULT_PERSONA_NAME,
+        chat_handler::DEFAULT_PERSONA,
+    );
+    println!("名字    : {}", p.name);
+    println!(
+        "来源    : {}",
+        match p.source {
+            PersonaSource::Builtin => "内置默认（还没建过自己的）",
+            PersonaSource::File => "你自己的文件",
+        }
+    );
+    println!("文件    : {}", path.display());
+    println!(
+        "正文    : {} 字 / 上限 {} KB",
+        p.text.chars().count(),
+        MAX_PERSONA_BYTES / 1024
+    );
+    println!();
+    println!("{}", p.text.trim());
+    println!();
+    if p.source == PersonaSource::Builtin {
+        println!("─────────────────────────────────────");
+        println!("建一份自己的：yunxi-bot persona --init");
+        println!();
+    }
+    println!("**注意**：人格进稳定前缀的第一段，改它会让缓存失效一次");
+    println!("（之后重新稳定）。它本来就不该频繁改。");
     Ok(0)
 }
 
