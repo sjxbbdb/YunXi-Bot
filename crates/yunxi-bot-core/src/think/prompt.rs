@@ -116,6 +116,34 @@ impl PromptLayout {
         self.history.push(a);
     }
 
+    /// 历史（含已冻结的易变内容）里出现过这段文字吗？
+    ///
+    /// ## 这是"不重复注入"的依据
+    ///
+    /// `record_reply` 会把 volatile **取走塞进历史**——所以上几轮注入的
+    /// 记忆段现在已经冻在历史里、并且被缓存了。这一轮若又召回同一条，
+    /// 就是**同一件事在上下文里出现两次**：白占 token、还可能让模型
+    /// 以为"这事被强调过"。
+    ///
+    /// 参考实现（Miyu 的 `retain_unseen_association`）管这个叫
+    /// "已经在可见历史里的内容不再重复注入"。
+    ///
+    /// ## 为什么不用"召回次数"来降权
+    ///
+    /// 我一开始写的是疲劳计数（同一条召回超过 5 次就按对数降权）。
+    /// **那是在给自己造出来的问题打补丁**：真正要判的是"它现在在不在
+    /// 上下文里"，而计数只是它的一个粗糙代理——同一条记忆在新会话里
+    /// 该正常召回，计数却把它按下去。
+    ///
+    /// **查实际存在与否，比统计次数准。**
+    pub fn history_mentions(&self, needle: &str) -> bool {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            return true; // 空串当成"见过"，免得调用方不小心把空的拼进去
+        }
+        self.history.iter().any(|m| m.content.contains(needle))
+    }
+
     /// 设置本轮要问的问题。可以反复覆盖——它本来就是易变的。
     pub fn ask(&mut self, question: impl Into<String>) {
         self.volatile = question.into();
@@ -1017,6 +1045,56 @@ mod compaction_tests {
         let s = c.summary();
         assert!(s.contains("压缩"), "{s}");
         assert!(s.contains("token"), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod history_mentions_tests {
+    use super::*;
+
+    #[test]
+    fn a_frozen_volatile_is_visible_in_history() {
+        // **这是"不重复注入"的依据。**
+        //
+        // `record_reply` 会把 volatile 取走塞进历史——所以上几轮注入的
+        // 记忆段现在已经冻在历史里、并且被缓存了。要能查得到，
+        // 否则每一轮都会把同一条记忆再注入一次。
+        let mut l = PromptLayout::new("稳定前缀");
+        l.ask("你记得：使用者住在杭州\n我住在哪？");
+        l.record_reply("杭州。");
+        assert!(
+            l.history_mentions("使用者住在杭州"),
+            "注入过的记忆该能在历史里查到"
+        );
+    }
+
+    #[test]
+    fn something_never_injected_is_not_reported_as_seen() {
+        let mut l = PromptLayout::new("稳定前缀");
+        l.ask("你好");
+        l.record_reply("你好。");
+        assert!(
+            !l.history_mentions("使用者养了一只叫豆豆的猫"),
+            "没注入过的不能报成'见过'——那会让该召回的永远召不回来"
+        );
+    }
+
+    #[test]
+    fn a_pending_question_is_not_history_yet() {
+        // 还没 `record_reply` 的 volatile 不算历史——它在**这一轮**里，
+        // 这一轮注入的东西本来就该出现一次
+        let mut l = PromptLayout::new("稳定前缀");
+        l.ask("使用者住在杭州");
+        assert!(!l.history_mentions("使用者住在杭州"));
+    }
+
+    #[test]
+    fn an_empty_needle_is_treated_as_seen() {
+        // **空串当成"见过"是有意的**：反过来的话，调用方一不小心
+        // 传个空串进来，就会把一条空记忆注入到上下文里
+        let l = PromptLayout::new("稳定前缀");
+        assert!(l.history_mentions(""));
+        assert!(l.history_mentions("   "));
     }
 }
 

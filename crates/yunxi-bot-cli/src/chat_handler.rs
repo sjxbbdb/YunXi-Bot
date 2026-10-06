@@ -165,11 +165,6 @@ pub struct ChatHandler {
     /// 常驻记忆段（构造时定下）。**单独存着**，因为它要拼进稳定前缀，
     /// 而稳定前缀只能有一份来源——两份必然漂移（见 `stable_prefix`）。
     memory_block: String,
-    /// 会话内每条记忆被召回了几次。用于"过度召回降权"。
-    ///
-    /// **不落盘**：每次召回都写台账的话，审计线会被召回记录淹没。
-    /// 它要防的是"同一次对话里同一条霸屏"，那是会话内的事。
-    recall_fatigue: std::collections::HashMap<String, u32>,
     /// 启动时读到的项目规则。**留着是为了能报出来源**——
     /// 模型说"按项目约定应该……"时，使用者得能查到那指的是哪一条。
     project_rules: yunxi_bot_core::rules::RuleSet,
@@ -248,7 +243,6 @@ impl ChatHandler {
             thinkers: BTreeMap::new(),
             sessions: BTreeMap::new(),
             memory_block,
-            recall_fatigue: std::collections::HashMap::new(),
             project_rules,
             persona: build_persona(persona_name, persona_text, &rules),
             tools: ToolRegistry::new(),
@@ -387,6 +381,25 @@ impl ChatHandler {
             RECALL_BUDGET_CHARS, RECALL_LIMIT, build_recall_block,
         };
 
+        // **已经不重复注入了。**
+        //
+        // `record_reply` 会把 volatile 取走塞进历史——所以前几轮注入的
+        // 记忆段现在冻在历史里、并且被缓存。这一轮若又召回同一条，
+        // 就是同一件事在上下文里出现两次：白占 token，还可能让模型
+        // 以为"这事被强调过"。
+        //
+        // 参考实现（Miyu 的 `retain_unseen_association`）管这个叫
+        // "已经在可见历史里的内容不再重复注入"。
+        //
+        // **我一开始写的是疲劳计数**（同一条召回超过 5 次就按对数降权）——
+        // 那是在给自己造出来的问题打补丁：真正要判的是"它现在在不在
+        // 上下文里"，而计数只是它的粗糙代理，还会在新会话里把该召回的
+        // 那条按下去。**查实际存在与否，比统计次数准。**
+        let key = SessionKey {
+            intent: Intent::Chat,
+            provider: CHAT_SESSION_KEY.to_string(),
+        };
+
         // 台账读不到就当没有记忆：**记忆是增强，不是对话能不能进行的前提。**
         let Ok(ledger) = yunxi_bot_core::ledger::Ledger::open(self.home.join("ledger.jsonl"))
         else {
@@ -396,25 +409,28 @@ impl ChatHandler {
         let Ok(now) = yunxi_bot_core::now_millis() else {
             return input.to_string();
         };
+        // 疲劳参数留着但**不再用了**——`recall_for_prompt` 的签名里它是
+        // "会话内计数"，这里传空表；要恢复那套只需把它换成真实计数。
         let hits = mem.recall_for_prompt(
             input,
             now,
             RECALL_LIMIT,
             RECALL_BUDGET_CHARS,
-            &self.recall_fatigue,
+            &std::collections::HashMap::new(),
         );
         let picked: Vec<&yunxi_bot_core::memory::MemoryEntry> = hits
             .iter()
             .filter(|h| h.route == yunxi_bot_core::memory::RecallRoute::Picked)
+            // **已经在历史里的不再注入。**
+            .filter(|h| {
+                self.sessions
+                    .get(&key)
+                    .is_none_or(|l| !l.history_mentions(&h.entry.text))
+            })
             .map(|h| h.entry)
             .collect();
         if picked.is_empty() {
             return input.to_string();
-        }
-        // 记下"这条被召回过"，供下次降权用。
-        // **只在会话内**——写台账的话审计线会被召回记录淹没。
-        for e in &picked {
-            *self.recall_fatigue.entry(e.id.clone()).or_insert(0) += 1;
         }
         let block = build_recall_block(&picked);
         if block.is_empty() {
