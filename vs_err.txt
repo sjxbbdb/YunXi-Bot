@@ -1,3 +1,0 @@
-[verdict-server] 监听 http://127.0.0.1:17870  /decide  /health
-Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 2805.07it/s]
-[verdict-server] 模型已加载: verdict-small  ← C:\Users\24763\AppData\Local\YunXiBot\models\verdict-small

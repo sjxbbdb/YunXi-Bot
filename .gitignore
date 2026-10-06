@@ -36,3 +36,5 @@ config.local.json
 .idea/
 .DS_Store
 Thumbs.db
+vs_out.txt
+vs_err.txt
