@@ -185,9 +185,18 @@ impl PromptLayout {
 
     /// 拼成发给模型的消息列表。
     pub fn build(&self) -> Vec<Message> {
-        let mut msgs = Vec::with_capacity(self.history.len() + 2);
+        let mut msgs = Vec::with_capacity(HISTORY_TURNS * 2 + 2);
         msgs.push(Message::system(self.stable.clone()));
-        msgs.extend(self.history.iter().cloned());
+        // **只带最近若干轮，不是全部历史。**
+        //
+        // 原来是 `msgs.extend(self.history.iter().cloned())`——全量。
+        // 而压缩的触发线是 `ContextBudget` 的 75%（默认窗口 131k，
+        // 约 98k token）才动手。对一个 7×24 常驻的陪伴助理，
+        // **那意味着每轮请求都在往 98k 的方向涨**：
+        // 陪伴感没多多少，token 账单一路上扬。
+        //
+        // 截断点必须落在**轮边界**上，见 `tail_turns` 的文档。
+        msgs.extend(tail_turns(&self.history, HISTORY_TURNS));
         if !self.volatile.is_empty() {
             msgs.push(Message::user(self.volatile.clone()));
         }
@@ -1284,5 +1293,145 @@ mod tests {
     fn empty_volatile_is_omitted() {
         let p = PromptLayout::new("S");
         assert_eq!(p.build().len(), 1, "没问问题时不该多出一条空消息");
+    }
+}
+
+/// 一次请求里最多带多少**轮**历史。
+///
+/// ## 为什么要有这个上限
+///
+/// 上下文窗口（默认 131k）和"该带多少历史"是两件事。
+/// 只靠窗口上限的话，历史会一直涨到约 98k token（窗口的 75%）
+/// 才触发压缩——**每一次请求都背着这一大坨**。
+///
+/// 对陪伴型助理这么做得不偿失：
+/// - **陪伴感来自"最近聊了什么"，不是"三个月前聊过什么"**
+/// - 更早的东西该沉进记忆（`memory.rs`）按需召回，而不是每轮重发
+/// - 常驻意味着一天几百轮，**每轮多背一点，账单就多一大截**
+///
+/// 20 轮约 40 条消息。够维持语气与指代。**它是偏好不是硬约束。**
+pub const HISTORY_TURNS: usize = 20;
+
+/// 取历史末尾的最近若干**轮**。
+///
+/// ## 为什么按轮切，而不是按条数切
+///
+/// **从中间截会把工具调用拆开。** 带工具的一轮长这样：
+///
+/// ```text
+/// user:      做这件事
+/// assistant: [tool_calls: write_file]     ← 声明要调工具
+/// tool:      ok                            ← 必须紧跟它
+/// assistant: 做完了
+/// ```
+///
+/// 按条数切在第 2 条上，请求里就只剩一条带着 `tool_calls` 却没有结果的
+/// 助手消息——**服务端直接 400**，而且报的是一句和截断毫无关系的
+/// `must be followed by tool messages`。
+///
+/// **`user` 消息是天然的轮边界**：每一轮都从一个 `user` 开始，
+/// 工具往返全在它后面。所以从后往前数 `user`，数够 N 个就从那里切。
+///
+/// 历史里连 N 个 `user` 都不到，就整段带——**不为了凑数而截**。
+fn tail_turns(history: &[Message], turns: usize) -> Vec<Message> {
+    use crate::think::Role;
+
+    let mut seen = 0usize;
+    let mut cut = 0usize;
+    for (i, m) in history.iter().enumerate().rev() {
+        if m.role == Role::User {
+            seen += 1;
+            if seen == turns {
+                cut = i;
+                break;
+            }
+        }
+    }
+    history[cut..].to_vec()
+}
+
+#[cfg(test)]
+mod history_tail_tests {
+    use super::*;
+    use crate::think::Role;
+
+    fn u(t: &str) -> Message {
+        Message::user(t.to_string())
+    }
+    fn a(t: &str) -> Message {
+        Message::assistant(t.to_string())
+    }
+    fn tool_call() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![serde_json::json!({"id": "c1", "type": "function",
+                "function": {"name": "t", "arguments": "{}"}})],
+            tool_call_id: None,
+        }
+    }
+    fn tool_result() -> Message {
+        Message {
+            role: Role::Tool,
+            content: "ok".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("c1".to_string()),
+        }
+    }
+
+    #[test]
+    fn only_the_last_n_turns_are_kept() {
+        let mut h = Vec::new();
+        for i in 0..30 {
+            h.push(u(&format!("问题{i}")));
+            h.push(a(&format!("回答{i}")));
+        }
+        let t = tail_turns(&h, 20);
+        assert_eq!(t.len(), 40, "20 轮 = 40 条");
+        assert_eq!(t[0].content, "问题10", "该从第 10 轮开始");
+        assert_eq!(t[39].content, "回答29", "结尾不能动");
+    }
+
+    #[test]
+    fn a_cut_never_separates_a_tool_call_from_its_result() {
+        // **这条是要害。** 从中间截会让"带 tool_calls 的助手消息"
+        // 后面不跟结果 → 服务端 400，而且报的错和截断毫无关系。
+        let mut h = Vec::new();
+        for i in 0..5 {
+            h.push(u(&format!("第{i}轮")));
+            h.push(tool_call());
+            h.push(tool_result());
+            h.push(a("做完了"));
+        }
+        let t = tail_turns(&h, 3);
+        assert_eq!(t[0].content, "第2轮");
+        assert_eq!(t.len() % 4, 0, "必须整轮保留");
+        for i in 0..t.len() {
+            if !t[i].tool_calls.is_empty() {
+                assert!(i + 1 < t.len(), "最后一条不该是带 tool_calls 的助手消息");
+                assert_eq!(
+                    t[i + 1].role,
+                    Role::Tool,
+                    "第 {i} 条声明了工具调用，后面却不是结果——这一对必须整轮保留"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_history_is_carried_whole() {
+        let h = vec![u("a"), a("b"), u("c"), a("d"), u("e"), a("f")];
+        assert_eq!(tail_turns(&h, 20).len(), 6, "不为了凑数而截");
+    }
+
+    #[test]
+    fn an_empty_history_is_fine() {
+        assert!(tail_turns(&[], 20).is_empty());
+    }
+
+    #[test]
+    fn history_without_enough_user_messages_is_carried_whole() {
+        let h = vec![a("孤儿"), u("a"), a("b")];
+        assert_eq!(tail_turns(&h, 20).len(), 3, "数不够就整段带");
     }
 }
