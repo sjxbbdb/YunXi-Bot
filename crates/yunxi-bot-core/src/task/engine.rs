@@ -97,6 +97,51 @@ pub enum StepVerdict {
     Unmarked(String),
 }
 
+impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
+    /// 这一步的输入：**声明过的依赖** + **指令里点名提到的步骤**，两者的结果。
+    ///
+    /// ## 为什么抽出来共用
+    ///
+    /// `run_step` 和 `run_decision` 都要它。各写一份的话必然漂移——
+    /// 而漂移的表现是"某一条路有证据、另一条没有"，**最难查**
+    /// （这个 session 里已经栽过好几次：两份来源迟早对不上）。
+    ///
+    /// ## 决策点尤其需要它
+    ///
+    /// 决策步此前**什么都不带**：`goal` 是空的、前置结果一个没有。
+    /// 于是生成选项的模型只能凭那句话编，而 `Verdict`（双编码器，
+    /// 按选项文本打分）更是一点证据都拿不到——**它是在猜**。
+    ///
+    /// 真机后果：决策步选了「门槛按 `>` 判定」，而前面的分析步骤
+    /// 已经写着 `README` 明说「满减的边界条件写错了」。执行步骤
+    /// 当场发现矛盾、拒绝照做，任务卡住。**那不是它拍错，
+    /// 是我们没给它拍板所需的材料。**
+    fn collect_inputs(
+        &self,
+        task_id: &str,
+        step_id: &str,
+    ) -> Result<Vec<(String, String)>, TaskError> {
+        let task = self.load(task_id)?;
+        let Some(step) = task.step(step_id) else {
+            return Ok(Vec::new());
+        };
+        let mut wanted: Vec<String> = step.depends_on.clone();
+        for id in mentioned_step_ids(&step.instruction, &task) {
+            if !wanted.contains(&id) {
+                wanted.push(id);
+            }
+        }
+        Ok(wanted
+            .iter()
+            .filter_map(|d| {
+                task.step(d)
+                    .and_then(|s| s.result.clone())
+                    .map(|r| (d.clone(), r))
+            })
+            .collect())
+    }
+}
+
 /// 指令里**点名提到的**、且确实存在于这个任务里的其他步骤 id。
 ///
 /// ## 为什么需要它
@@ -250,6 +295,17 @@ pub struct ObserveRequest {
     pub goal: String,
     pub step_id: String,
     pub question: String,
+    /// 前置步骤的结果。
+    ///
+    /// **决策点必须看到证据。** 在这之前这里什么都没有：`goal` 传的是
+    /// 空字符串、前置结果一个都没带，于是生成选项的模型只能凭那句话编，
+    /// 而 `Verdict`（双编码器，按选项文本打分）**更是一点证据都拿不到**——
+    /// 它是在猜。
+    ///
+    /// 真机后果：决策步选了「门槛按 `>` 判定」，而前面的分析步骤已经
+    /// 写着 `README` 明说「满减的边界条件写错了」。执行步骤当场发现矛盾、
+    /// 拒绝照做，任务卡住。**那不是它拍错，是我们没给它拍板所需的材料。**
+    pub inputs: Vec<(String, String)>,
 }
 
 /// 一次推进的结果。
@@ -719,31 +775,7 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             return self.run_decision(self.decider, task_id, &step, &question, ledger, records);
         }
 
-        // 输入 = 声明了依赖的那些步骤的结果
-        //      + **指令里点名提到的那些步骤的结果**
-        //
-        // 第二项是真机上补的。第 9 步的指令写着「按 s3 的边界清单逐条核对」，
-        // 而 `depends_on` 里没写 s3——引擎只把声明过的依赖当输入，
-        // 于是模型拿不到 s3 的内容，只能如实回「无法获取 s3 的边界清单原文」。
-        // **一步白做，还连累了依赖它的后面几步。**
-        //
-        // 计划是模型写的，引用一个步骤却忘了声明依赖，是很自然的事
-        // （它不会因为漏写就少引用一次）。指令里点名了谁就把谁的结果给它——
-        // 这是**在补一个模型漏写的依赖，不是在猜**：id 必须真的存在于这个任务里。
-        let mut wanted: Vec<String> = step.depends_on.clone();
-        for id in mentioned_step_ids(&step.instruction, &task) {
-            if !wanted.contains(&id) {
-                wanted.push(id);
-            }
-        }
-        let inputs: Vec<(String, String)> = wanted
-            .iter()
-            .filter_map(|d| {
-                task.step(d)
-                    .and_then(|s| s.result.clone())
-                    .map(|r| (d.clone(), r))
-            })
-            .collect();
+        let inputs = self.collect_inputs(task_id, &step.id)?;
         let req = StepRequest {
             task_id: task_id.to_string(),
             goal: task.goal.clone(),
@@ -889,9 +921,13 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             &routing,
             &ObserveRequest {
                 task_id: task_id.to_string(),
-                goal: String::new(),
+                // **目标要带上。** 原来这里是空的——而"这一步在纠结什么"
+                // 只有放回整条任务的目标里才判得准。
+                goal: self.load(task_id)?.goal.clone(),
                 step_id: step.id.clone(),
                 question: question.to_string(),
+                // **前置证据也要带上**，理由见 `collect_inputs` 的文档。
+                inputs: self.collect_inputs(task_id, &step.id)?,
             },
             records,
         )?;

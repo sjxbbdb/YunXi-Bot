@@ -1182,7 +1182,22 @@ impl TaskHandler for ChatHandler {
         run: &ObserveRequest,
         records: &mut Vec<CallRecord>,
     ) -> Result<String, TaskError> {
-        let volatile = format!("需要拍板的问题：{}", run.question);
+        // **决策点必须看到证据。**
+        //
+        // 在这之前这里只有一句话（那一步的指令）：`goal` 是空的、
+        // 前置步骤的结果一个都没带。于是生成选项的模型只能凭那句话编，
+        // 而 Verdict（双编码器，按选项文本打分）**更是一点证据都拿不到**。
+        //
+        // 真机后果：决策步选了「门槛按 > 判定」，而前面的分析步骤已经
+        // 写着 README 明说「满减的边界条件写错了」。执行步骤当场发现
+        // 矛盾、拒绝照做，任务卡住。**那不是它拍错，是没给它材料。**
+        let mut volatile = format!("总目标：{}\n\n需要拍板的问题：{}", run.goal, run.question);
+        if !run.inputs.is_empty() {
+            volatile.push_str("\n\n判断所需的证据（前置步骤的结果）：");
+            for (id, out) in &run.inputs {
+                volatile.push_str(&format!("\n[{id}] {out}"));
+            }
+        }
         self.converse(
             routing,
             Intent::Options,
