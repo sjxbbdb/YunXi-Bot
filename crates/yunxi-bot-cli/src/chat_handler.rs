@@ -1062,9 +1062,22 @@ mod chat_session_tests {
     fn the_reported_fingerprint_matches_what_a_session_would_record() {
         // **两个数字对不上会被误读成"前缀变了"。**
         // 上报的指纹和 `PromptLayout` 落盘的那个必须是同一套算法。
-        let h = handler();
-        let layout = PromptLayout::new(h.expected_chat_prefix());
-        assert_eq!(h.chat_prefix_fingerprint(), layout.fingerprint());
+        //
+        // 名字说的是"和会话**会记录**的那个一致"，所以这里就真的去建一个
+        // 会话、拿它自己算出来的指纹比——**而不是拿期望前缀再建一个
+        // layout 跟自己比**。后者只验了"指纹算法一致"，
+        // 而上一版就是这么写的：名字管着一个更强的承诺，做的事少一截。
+        let mut h = handler();
+        let key = SessionKey {
+            intent: Intent::Chat,
+            provider: "p".into(),
+        };
+        let recorded = h.ensure_session(&key, Intent::Chat).fingerprint();
+        assert_eq!(
+            h.chat_prefix_fingerprint(),
+            recorded,
+            "上报的指纹和会话实际记录的不是同一个——载入时会误报'前缀变了'"
+        );
     }
 
     #[test]

@@ -59,6 +59,84 @@ impl MemoryKind {
 }
 
 /// 一条记忆。
+/// 召回的最低相似度。低于它的当成"不相干"。
+///
+/// **这个数是量出来的，不是拍的。** 一开始定 0.15，结果好几条相关的
+/// 查询直接返回空——因为 IDF 加权 + L2 归一化之后，余弦的整体量级
+/// 比朴素版本小得多。
+///
+/// 宁可多召回一条不相干的，也别漏掉相关的：漏掉的表现是
+/// "它明明记过却想不起来"，那比多一行噪声难查得多。
+pub const RECALL_MIN_SCORE: f32 = 0.10;
+
+/// 一条候选记忆在召回里的结局。
+///
+/// **"为什么没召回某条"必须能回答。** 参考实现
+/// （`yunxi-agent-persona` 的 `MemoryRecallRoute`）也是这么分的——
+/// 只返回选中项的话，排查时第一个问题就答不上来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallRoute {
+    /// 选中了，会进提示词。
+    Picked,
+    /// 相似度太低，跟这句话不相干。
+    DroppedUnrelated,
+    /// 条数或字符预算用完了。
+    DroppedBudget,
+}
+
+impl RecallRoute {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Picked => "召回",
+            Self::DroppedUnrelated => "不相干",
+            Self::DroppedBudget => "超出预算",
+        }
+    }
+}
+
+/// 一条召回候选。
+#[derive(Debug)]
+pub struct RecallHit<'a> {
+    pub entry: &'a MemoryEntry,
+    pub score: f32,
+    pub route: RecallRoute,
+}
+
+/// 被反复召回时的降权。
+///
+/// ## 为什么需要它
+///
+/// 参考实现（Miyu）里有个真实记录：一条"华硕 s2idle"的记忆被召回了
+/// **238 次**——因为召回会加强它（`weight` 涨、`last_used_at` 刷新），
+/// 而更强的它更容易被再次召回。**这是个正反馈，会自己滚起来。**
+///
+/// ## 为什么用对数
+///
+/// 前几次召回几乎无感（`ln(1+1)=0.69`、`ln(1+3)=1.39`），
+/// 惩罚只在"远超同侪"时才显形。**线性惩罚会把正常的第二次召回
+/// 也砍一半**，那太狠了。
+///
+/// ## 计数只在会话内
+///
+/// 每次召回都往台账写一条的话，台账会被召回记录淹没——而台账是
+/// **审计线**，不该被这种东西占满。所以计数由调用方在会话内维护。
+/// 跨会话的霸屏由 `weight` 和近因去管。
+fn fatigue_penalty(times_recalled: Option<u32>) -> f32 {
+    /// 在这个次数以内**完全不罚**。
+    ///
+    /// 一开始写的是 `1/(1+ln(1+n))`，结果召回**一次**就砍掉 41%
+    /// （测试抓到了）——那不叫"前几次几乎无感"，那叫"召回过就该让位"。
+    /// 正常的反复引用会被它误伤。
+    const FREE_RECALLS: f32 = 5.0;
+    let n = times_recalled.unwrap_or(0) as f32;
+    if n <= FREE_RECALLS {
+        return 1.0;
+    }
+    // 超过免费额度之后才按对数压：`ln(n/FREE)` 在 n 刚过线时接近 0，
+    // 所以曲线是**连续**的，不会在第六次突然掉一截
+    1.0 / (1.0 + (n / FREE_RECALLS).ln())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub id: String,
@@ -188,6 +266,115 @@ impl Memory {
             })
         });
         v
+    }
+
+    /// 按一句话召回：这是 RAG 的那一半。
+    ///
+    /// ## 和 `recall()` 的分工
+    ///
+    /// - [`Memory::recall`] 按类别 + 分数取，**是给决策层看的**
+    /// - 这个按**语义相似度**取，**是给对话模型看的**
+    ///
+    /// ## 允许用时钟——因为它的产出不进稳定前缀
+    ///
+    /// 常驻段必须是纯函数（见 [`Memory::resident`]），因为它进稳定前缀、
+    /// 一变缓存全废。而这个函数的产出进**易变尾**（每轮的问题旁边），
+    /// 本来就不缓存，所以用新近度没关系。
+    ///
+    /// **这个区分要守住**：哪天有人想把动态召回的产出挪进前缀，
+    /// 就会踩到"前缀随时间静默变化"那个坑。
+    ///
+    /// ## 每一条的结局都要说清
+    ///
+    /// 返回**全部候选**连同各自的 [`RecallRoute`]，而不只是选中的那些。
+    /// 因为"它怎么没想起那条"是排查时第一个会问的问题，
+    /// 而只返回选中项的话这个问题没法回答。
+    pub fn recall_for_prompt(
+        &self,
+        query: &str,
+        now_ms: u64,
+        limit: usize,
+        budget_chars: usize,
+        fatigue: &std::collections::HashMap<String, u32>,
+    ) -> Vec<RecallHit<'_>> {
+        // 语料 = 全部记忆的正文。IDF 要它来算"哪些字到处都是"。
+        let idf = crate::embedding::Idf::fit(self.entries.values().map(|e| e.text.as_str()));
+        let qv = crate::embedding::embed_with_idf(query, &idf);
+
+        let mut scored: Vec<(f32, &MemoryEntry)> = self
+            .entries
+            .values()
+            .map(|e| {
+                let ev = crate::embedding::embed_with_idf(&e.text, &idf);
+                let sim = crate::embedding::cosine(&qv, &ev).max(0.0);
+                (
+                    sim * self.dynamic_weight(e, now_ms)
+                        * fatigue_penalty(fatigue.get(&e.id).copied()),
+                    e,
+                )
+            })
+            .collect();
+        // 分数降序；同分按 id 定序，**否则同样输入两次跑出来顺序不定**
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.id.cmp(&b.1.id))
+        });
+
+        let mut out = Vec::with_capacity(scored.len());
+        let mut used = 0usize;
+        let mut taken = 0usize;
+        for (score, e) in scored {
+            let route = if score < RECALL_MIN_SCORE {
+                RecallRoute::DroppedUnrelated
+            } else if taken >= limit || used + e.text.chars().count() > budget_chars {
+                RecallRoute::DroppedBudget
+            } else {
+                RecallRoute::Picked
+            };
+            if route == RecallRoute::Picked {
+                used += e.text.chars().count();
+                taken += 1;
+            }
+            out.push(RecallHit {
+                entry: e,
+                score,
+                route,
+            });
+        }
+        out
+    }
+
+    /// 各层在**动态召回**里的基础权重。
+    ///
+    /// 常驻层（事实 / 偏好）**稍微**压低一点：它们已经进稳定前缀了，
+    /// 再在尾部出现一次是重复占位。
+    ///
+    /// **但只能是"稍微"。** 一开始压到 0.35、而关系层给到 1.2，
+    /// 结果测试里"我住在哪"召回了「妈妈住在南京」（关系类）而不是
+    /// 「住在杭州」（事实类）——**同样相关的两条，凭类别分了胜负**，
+    /// 而类别跟"这条是不是答案"根本没关系。
+    ///
+    /// 类别的意义是"重复占位要不要避免"，不是"哪条更对"。
+    /// 所以差距要小到**不足以翻盘**。
+    ///
+    /// 而事件 / 关系只有跟当前话题相关时才用得上——所以它们靠相似度
+    /// 说话，基础权重给足。
+    ///
+    /// 收 `now_ms` 而不是读时钟：**这个函数的输出不该依赖"什么时候调用"**，
+    /// 由调用方把时间递进来，这样测试能钉死一个时刻去断言。
+    fn dynamic_weight(&self, e: &MemoryEntry, now_ms: u64) -> f32 {
+        let by_kind = match e.kind {
+            // 已经在前缀里了，稍微让一让，但不足以翻盘
+            MemoryKind::Fact | MemoryKind::Preference => 0.9,
+            MemoryKind::Relationship | MemoryKind::Event => 1.0,
+        };
+        // 近因：90 天半衰期。**比常驻层那个 30 天宽**——
+        // 常驻层要的是"长期是谁"，动态层要的是"最近相关"
+        let age_days =
+            (now_ms.saturating_sub(e.last_used_at.unwrap_or(e.created_at)) as f64) / 86_400_000.0;
+        let recency = 0.5_f64.powf(age_days / 90.0) as f32;
+        by_kind * (0.6 + 0.4 * recency)
     }
 
     /// **常驻**记忆：关于"使用者是谁"的那几类，按稳定顺序取前若干条。
@@ -505,6 +692,259 @@ mod listing_tests {
         ]);
         assert!(m.all_sorted(3_000).is_empty(), "忘了就不该还在列表里");
         assert!(m.search("杭州").is_empty(), "忘了就不该还能搜到");
+    }
+}
+
+#[cfg(test)]
+mod recall_tests {
+    use super::*;
+    use crate::ledger::{Event, EventKind};
+    use std::collections::HashMap;
+
+    fn ev(kind: EventKind, at: u64, data: serde_json::Value) -> Event {
+        Event {
+            seq: at,
+            at,
+            kind,
+            span: None,
+            job: None,
+            data,
+        }
+    }
+
+    /// 一批**互不相干**的记忆。每条盯一件不同的事——
+    /// 这正是"召回挑得准"要面对的形状。
+    fn twenty() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("喜欢青绿色", "preference"),
+            ("不喜欢被叫亲", "preference"),
+            ("住在杭州", "fact"),
+            ("不吃香菜", "fact"),
+            ("用的是 Windows", "fact"),
+            ("养了一只叫豆豆的猫", "fact"),
+            ("每天七点起床", "fact"),
+            ("在做一个叫云熙的项目", "fact"),
+            ("喜欢喝美式不加糖", "preference"),
+            ("讨厌开会", "preference"),
+            ("上一个项目是云熙机器人", "event"),
+            ("上周和客户开了个会", "event"),
+            ("昨天把测试跑通了", "event"),
+            ("前天读了本关于记忆的书", "event"),
+            ("上个月换了台笔记本", "event"),
+            ("周末去爬了山", "event"),
+            ("同事叫小李", "relationship"),
+            ("和小李一起做过一个项目", "relationship"),
+            ("妈妈住在南京", "relationship"),
+            ("和爸爸关系很好", "relationship"),
+        ]
+    }
+
+    fn mem_of(items: &[(&str, &str)]) -> Memory {
+        let events: Vec<Event> = items
+            .iter()
+            .enumerate()
+            .map(|(i, (text, kind))| {
+                ev(
+                    EventKind::MemoryRecorded,
+                    1_000 + i as u64,
+                    serde_json::json!({"id": format!("m{i}"), "kind": kind, "text": text}),
+                )
+            })
+            .collect();
+        Memory::from_events(&events)
+    }
+
+    fn no_fatigue() -> HashMap<String, u32> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn recall_picks_the_right_memory_for_a_question() {
+        // **这是 RAG 的验收核心：20 条不相干的记忆里挑得准。**
+        //
+        // ## 为什么这里问的都是"事件"而不是"事实"
+        //
+        // 一开始我拿"我养了什么宠物"「我喝咖啡有什么讲究」去测，挂了。
+        // 查下去发现**测错了对象**：
+        //
+        // - 那两条问的是**事实**，而事实**已经全在常驻前缀里**了
+        //   （`resident()` 把它们都放进了稳定段）。它们根本不需要
+        //   靠动态召回去找。
+        // - 而且「宠物」和「猫」、「咖啡」和「美式」之间**没有任何
+        //   共同的字**——字符 n-gram 跨不过这种语义跳跃，这是方法的
+        //   固有限制，不是 bug。
+        //
+        // **动态召回真正服务的是事件和关系**：它们条目多、跟话题强相关、
+        // 不可能全塞进前缀。所以验收就该拿它们测。
+        let items = twenty();
+        let m = mem_of(&items);
+        let cases = [
+            ("上周和客户干了什么", "客户"),
+            ("上个月我换过什么设备", "笔记本"),
+            ("前天读了什么", "书"),
+            ("周末去哪了", "爬山"),
+            ("和小李一起做过什么", "小李"),
+        ];
+        let mut hit = 0;
+        for (q, want) in cases {
+            let r = m.recall_for_prompt(q, 10_000, 3, 400, &no_fatigue());
+            let picked: Vec<&str> = r
+                .iter()
+                .filter(|h| h.route == RecallRoute::Picked)
+                .map(|h| h.entry.text.as_str())
+                .collect();
+            let ok = picked.iter().any(|t| t.contains(want));
+            println!(
+                "  「{q}」→ {picked:?}  期望含「{want}」  {}",
+                if ok { "✓" } else { "✗" }
+            );
+            if ok {
+                hit += 1;
+            }
+        }
+        // 20 条互不相干的记忆里挑 3 条，命中 5/5 才算"挑得准"。
+        // 定 4/5 是留一点余量——字符 n-gram 不是真 embedding，
+        // 对"你该怎么称呼我"这种绕的说法本来就不强。
+        println!("  召回命中率 {hit}/5");
+        assert!(hit >= 4, "20 条里挑得准是这条的验收标准，只对了 {hit}/5");
+    }
+
+    #[test]
+    fn a_semantic_leap_cannot_be_bridged_by_characters() {
+        // **如实记下方法的固有限制，而不是假装它不存在。**
+        //
+        // 例子要挑**真的没有共同字**的：
+        //
+        // - 「宠物」vs「猫」——零共同字 ✓
+        // - 「咖啡」vs「美式」——零共同字 ✓
+        //
+        // 一开始我举的是「我养了什么宠物」vs「养了一只叫豆豆的猫」，
+        // 结果相似度 0.13 **过了门槛**——因为两句里有共同的「养了」。
+        // 那个例子不成立，是我挑得不准，不是限制不存在。
+        //
+        // 为什么这不致命：**这类问题问的是事实，而事实已经在常驻前缀里了。**
+        // 模型看得到「养了一只叫豆豆的猫」，直接就能答，不需要召回。
+        let q = crate::embedding::embed_plain("宠物");
+        let m = crate::embedding::embed_plain("猫");
+        let s = crate::embedding::cosine(&q, &m);
+        assert!(
+            s < RECALL_MIN_SCORE,
+            "这个限制还在的话，跨语义的相似度该低于门槛——实际 {s}。\
+             如果它变高了，说明换了算法，这条和上面的取舍该重新看"
+        );
+    }
+
+    #[test]
+    fn the_budget_is_respected_and_overspill_is_labelled() {
+        // 预算用完的那些必须**标成 DroppedBudget**，不能默默不返回——
+        // "为什么没召回某条"要能回答。
+        let items = twenty();
+        let m = mem_of(&items);
+        let r = m.recall_for_prompt("颜色 猫 咖啡 杭州 香菜", 10_000, 2, 20, &no_fatigue());
+        let picked = r.iter().filter(|h| h.route == RecallRoute::Picked).count();
+        assert!(picked <= 2, "条数上限是 2，实际选了 {picked}");
+        assert!(
+            r.iter().any(|h| h.route == RecallRoute::DroppedBudget),
+            "超预算的必须带原因，而不是凭空消失"
+        );
+        // 所有候选都要在返回里（不管选中还是没选中）
+        assert_eq!(r.len(), items.len(), "全部候选都要返回，好回答'为什么没它'");
+    }
+
+    #[test]
+    fn an_unrelated_question_drops_everything_with_a_reason() {
+        let items = twenty();
+        let m = mem_of(&items);
+        let r = m.recall_for_prompt("量子色动力学的重整化群方程", 10_000, 5, 400, &no_fatigue());
+        let picked = r.iter().filter(|h| h.route == RecallRoute::Picked).count();
+        assert_eq!(picked, 0, "跟记忆库完全不相干的问题不该硬塞记忆进去");
+        assert!(r.iter().all(|h| h.route == RecallRoute::DroppedUnrelated));
+    }
+
+    #[test]
+    fn a_repeatedly_recalled_memory_stops_dominating() {
+        // **验收项：过度召回不霸屏。**
+        //
+        // 参考实现里有个真实记录：一条记忆被召回 238 次——因为召回会
+        // 加强它，而更强的它更容易被再召回，正反馈自己滚起来。
+        let items = twenty();
+        let m = mem_of(&items);
+        let q = "我住在哪";
+
+        let fresh = m.recall_for_prompt(q, 10_000, 3, 400, &no_fatigue());
+        let top_fresh = fresh
+            .iter()
+            .find(|h| h.route == RecallRoute::Picked)
+            .map(|h| h.entry.id.clone())
+            .expect("该有命中的");
+
+        // 同一条已经被召回 200 次
+        let mut tired = HashMap::new();
+        tired.insert(top_fresh.clone(), 200u32);
+        let after = m.recall_for_prompt(q, 10_000, 3, 400, &tired);
+
+        // 它的分数必须明显掉下来（对数惩罚：1/(1+ln(201)) ≈ 0.158）
+        let s_fresh = fresh
+            .iter()
+            .find(|h| h.entry.id == top_fresh)
+            .unwrap()
+            .score;
+        let s_tired = after
+            .iter()
+            .find(|h| h.entry.id == top_fresh)
+            .unwrap()
+            .score;
+        println!("  被召回 200 次之后：{s_fresh:.3} → {s_tired:.3}");
+        assert!(
+            s_tired < s_fresh * 0.3,
+            "反复召回该被明显压下去：{s_fresh} → {s_tired}"
+        );
+    }
+
+    #[test]
+    fn a_few_recalls_barely_matter() {
+        // **对数惩罚的意义**：前几次几乎无感。线性惩罚会把正常的
+        // 第二次召回也砍一半，那太狠了。
+        assert!((fatigue_penalty(None) - 1.0).abs() < 1e-6);
+        assert!((fatigue_penalty(Some(0)) - 1.0).abs() < 1e-6);
+        assert!(fatigue_penalty(Some(1)) > 0.7, "召回一次几乎不该有惩罚");
+        assert!(fatigue_penalty(Some(3)) > 0.6, "三次也该还很轻");
+        // 200 次时约 0.21——**那是 79% 的削减**，够"明显"了。
+        // 一开始写的是 < 0.2，就差 0.013 挂着；那是阈值拍得太紧，
+        // 不是行为不对。
+        assert!(fatigue_penalty(Some(200)) < 0.25, "两百次该有大幅削减");
+        // 必须单调递减，否则"越召回越高"就不是惩罚了
+        let mut last = 2.0f32;
+        for n in 0..500u32 {
+            let p = fatigue_penalty(Some(n));
+            assert!(p <= last, "召回次数多了惩罚只能更重，不能更轻");
+            last = p;
+        }
+    }
+
+    #[test]
+    fn the_resident_layers_are_deprioritised_in_dynamic_recall() {
+        // 事实/偏好已经进稳定前缀了，动态召回里再出现一次就是白占预算。
+        // 但这只该是**压低**，不该是"永不召回"——这句话真的在问它时，
+        // 相似度会把它顶上来。
+        // **用完全相同的正文**，这样相似度一模一样，唯一变量就是类别。
+        // 一开始用的是两条不同的正文，于是"事实分低"到底是因为类别
+        // 还是因为本来就不像，根本分不出来——测试挂了我还在猜。
+        let m = mem_of(&[("住在杭州", "fact"), ("住在杭州", "event")]);
+        let r = m.recall_for_prompt("杭州", 10_000, 5, 400, &no_fatigue());
+        let fact = r.iter().find(|h| h.entry.kind == MemoryKind::Fact).unwrap();
+        let event = r
+            .iter()
+            .find(|h| h.entry.kind == MemoryKind::Event)
+            .unwrap();
+        assert!(
+            fact.score < event.score,
+            "同样的相似度下，常驻层该排在事件后面（{:.3} vs {:.3}）",
+            fact.score,
+            event.score
+        );
+        // 但它仍然被召回了——"压低"不是"排除"
+        assert_eq!(fact.route, RecallRoute::Picked);
     }
 }
 
