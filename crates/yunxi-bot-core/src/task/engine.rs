@@ -42,6 +42,19 @@ pub const STEP_MAX_TOKENS: u32 = 1024;
 /// 拆解输出的上限。步骤清单本身不长，但思考过程要占位置。
 pub const PLAN_MAX_TOKENS: u32 = 2048;
 
+/// **开了思考时，输出预算要额外加的余量。**
+///
+/// `max_tokens` 是"思考过程 + 正文"的总和，不是正文的额度。
+/// 所以思考开着时，原来那个"够写正文"的数字就不够了。
+///
+/// 这是真机测出来的：拆解请求在 `max_tokens=2048` 时被截断
+/// （`finish_reason=length`），思考吃掉 280~540 token，剩下的不够写完 JSON。
+/// 而截断的表现是——一个残缺的 `{"steps":[{"id":"s1",...`，被解析器
+/// 当成"没有 steps 字段"，**指向完全错误的方向**。
+///
+/// 同一批实测里 `max_tokens=4096` 正常结束（`finish=stop`）。
+pub const THINKING_OUTPUT_HEADROOM: u32 = 2048;
+
 /// 决策点生成选项的输出上限。
 pub const OPTIONS_MAX_TOKENS: u32 = 512;
 

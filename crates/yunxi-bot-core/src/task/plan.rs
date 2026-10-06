@@ -64,7 +64,16 @@ pub struct PlannedStep {
 /// 由调用方决定重试还是升级人工，而不是丢一个半成品给执行层。
 pub fn parse_plan(raw: &str) -> Result<Vec<PlannedStep>, TaskError> {
     let value = extract_json(raw).map_err(|detail| unparsable(detail, raw))?;
-    let steps = steps_from_value(value).map_err(|detail| unparsable(detail, raw))?;
+    let steps = steps_from_value(value).map_err(|detail| {
+        // **截断要说出来。** 否则"没有 steps 字段"会把人送去查解析逻辑，
+        // 而真正的问题是输出预算不够。
+        let detail = if looks_truncated(raw) {
+            format!("{detail}；**回复看起来被截断了**（最外层括号没闭合）——多半是输出预算不够")
+        } else {
+            detail
+        };
+        unparsable(detail, raw)
+    })?;
     check_usable(&steps, raw)?;
 
     // 依赖图交给 model 的纯函数查：它同时管"引用了不存在的步骤"和"成环"，
@@ -178,6 +187,27 @@ fn unparsable(detail: impl Into<String>, raw: &str) -> TaskError {
     }
 }
 
+/// 回复看起来是不是**被截断**了。
+///
+/// ## 为什么需要这个判断
+///
+/// 真机上遇到的一种失败：回复是 `{"steps":[{"id":"s1",...` 但被 `max_tokens`
+/// 从中间切断。这时 `container_slices` 用括号配对找片段，
+/// **最外层 `{` 没有配对的 `}`，于是它返回了内部每个完整的步骤对象**——
+/// 那些能正常解析，但没有 `steps` 字段。
+///
+/// 结果报出来的是「顶层对象里没有 steps 字段」，**指向完全错误的方向**：
+/// 人会去查解析逻辑，而真正的问题是预算不够。
+///
+/// 判据：文里出现了 `{` 或 `[`，但从**第一个**开始找不到配对的闭合。
+/// 正常的回复不会这样——哪怕前面有说明文字，JSON 本身也是闭合的。
+fn looks_truncated(raw: &str) -> bool {
+    let Some(start) = raw.find(['{', '[']) else {
+        return false;
+    };
+    balanced_from(raw, start).is_none()
+}
+
 /// 原文开头。只留开头，够定位是哪一类回复，又不至于把日志撑爆。
 fn raw_head(raw: &str) -> String {
     raw.chars().take(RAW_HEAD_CHARS).collect()
@@ -215,7 +245,12 @@ fn extract_json(raw: &str) -> Result<Value, String> {
         return Err("回复里找不到任何 JSON 片段".to_string());
     }
     Err(format!(
-        "{tried} 个候选片段都没能解析成 JSON；首个错误：{first_error}"
+        "{tried} 个候选片段都没能解析成 JSON；首个错误：{first_error}{}",
+        if looks_truncated(raw) {
+            "；**回复看起来被截断了**（最外层括号没闭合）"
+        } else {
+            ""
+        }
     ))
 }
 

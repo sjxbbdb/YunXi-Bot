@@ -536,6 +536,20 @@ impl ChatHandler {
             runner = runner.with_sink(std::sync::Arc::clone(s));
         }
 
+        // **思考模式的输出预算是"思考 + 正文"的总和。**
+        //
+        // `max_tokens` 不是正文的额度——思考过程从同一个池子里扣。
+        // 所以思考开着时不加余量，正文就会被**从中间截断**，
+        // 而截断的表现极具误导性（残缺的 JSON 被当成"没有 steps 字段"）。
+        //
+        // 放在这里而不是各个调用点：**一处覆盖所有意图**，
+        // 也就不会出现"某个意图忘了加"。
+        let max_tokens = if routing.thinking {
+            max_tokens.saturating_add(yunxi_bot_core::task::engine::THINKING_OUTPUT_HEADROOM)
+        } else {
+            max_tokens
+        };
+
         let outcome = runner.run(&metered, layout, max_tokens).map_err(|e| {
             TaskError::Core(yunxi_bot_core::CoreError::Ledger(format!(
                 "工具循环失败: {e}"

@@ -267,8 +267,18 @@ struct StreamChunk {
     model: String,
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// **必须是 `Option`，不能只靠 `#[serde(default)]`。**
+    ///
+    /// DeepSeek 在**每一个** chunk 里都带 `"usage": null`，只有最后一块是对象。
+    /// 而 `#[serde(default)]` 只在**键不存在**时生效——键存在但是 `null` 时，
+    /// 反序列化照样失败。
+    ///
+    /// 这个 bug 的表现极具误导性：每个 chunk 都解析失败 → 被静默跳过 →
+    /// 最后报"流结束了，但既没有正文也没有工具调用"。
+    /// **看起来像模型没回内容，其实是我们的解析器不认这个形状。**
+    /// 而它只影响 DeepSeek——也就是所有复杂任务走的那条路。
     #[serde(default)]
-    usage: Usage,
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -629,6 +639,12 @@ impl OpenAiThinker {
         let mut calls: std::collections::BTreeMap<u64, ToolCallAccum> =
             std::collections::BTreeMap::new();
         let mut saw_done = false;
+        // 解析统计：**"全都解析不了"必须和"模型没回内容"分开报**
+        let mut parsed = 0usize;
+        let mut with_choices = 0usize;
+        let mut skipped = 0usize;
+        let mut first_parse_error: Option<String> = None;
+        let mut first_bad_payload: Option<String> = None;
 
         for line in reader.lines() {
             let line = line.map_err(|e| ThinkError::Network(format!("读流失败: {e}")))?;
@@ -644,19 +660,35 @@ impl OpenAiThinker {
                 saw_done = true;
                 break;
             }
-            let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) else {
-                // **单块解析不了不致命。** 有些网关会在流里插非 JSON 的心跳。
-                // 为它把整次调用判失败，代价远大于收益。
-                continue;
+            let chunk = match serde_json::from_str::<StreamChunk>(payload) {
+                Ok(c) => c,
+                Err(e) => {
+                    // **单块解析不了不致命**（有些网关会插非 JSON 的心跳），
+                    // 但**全都解析不了就是致命的**——而那正是"解析器不认这个
+                    // 形状"的表现，会被下面那句"没有正文也没有工具调用"
+                    // 伪装成"模型没回内容"。
+                    //
+                    // 所以这里记下来，攒够证据再一起报。
+                    skipped += 1;
+                    if first_parse_error.is_none() {
+                        first_parse_error = Some(e.to_string());
+                        first_bad_payload = Some(payload.chars().take(200).collect());
+                    }
+                    continue;
+                }
             };
+            parsed += 1;
+            if !chunk.choices.is_empty() {
+                with_choices += 1;
+            }
             if !chunk.model.is_empty() {
                 model = chunk.model;
             }
-            if chunk.usage.total_tokens > 0
-                || chunk.usage.prompt_tokens > 0
-                || chunk.usage.completion_tokens > 0
+            // `usage` 只在最后一块是对象，前面都是 `null`
+            if let Some(u) = chunk.usage
+                && (u.total_tokens > 0 || u.prompt_tokens > 0 || u.completion_tokens > 0)
             {
-                usage = chunk.usage;
+                usage = u;
             }
             let Some(choice) = chunk.choices.into_iter().next() else {
                 // 只带 usage 的那一块没有 choices —— 这是正常的
@@ -688,10 +720,32 @@ impl OpenAiThinker {
             .collect();
 
         if content.is_empty() && tool_calls.is_empty() {
-            return Err(ThinkError::Malformed(if saw_done {
-                "流结束了，但既没有正文也没有工具调用".into()
+            // **分清三种情况。** 混成一句会把人送到错的地方：
+            // - 全都解析失败 → 我们的解析器不认这个形状（产品 bug）
+            // - 解析成功但没内容 → 模型真的没回东西（模型行为）
+            // - 流被中断 → 网络/服务端
+            return Err(ThinkError::Malformed(if parsed == 0 && skipped > 0 {
+                format!(
+                    "流里的 {} 块**一块都没解析成功**——多半是响应形状变了。\
+                     第一块的错：{}；原文开头：{}",
+                    skipped,
+                    first_parse_error.unwrap_or_default(),
+                    first_bad_payload.unwrap_or_default(),
+                )
+            } else if saw_done {
+                // **把诊断信息带出来。** 只说"没有正文也没有工具调用"
+                // 会让人分不清是模型没回、还是我们没接住——
+                // 而这两种的修法完全不同。
+                format!(
+                    "流结束了，但既没有正文也没有工具调用。\
+                     诊断：解析成功 {parsed} 块 / 跳过 {skipped} 块；\
+                     有 choices 的 {with_choices} 块；\
+                     思考过程 {} 字；                     finish_reason={finish_reason:?}；usage={:?}",
+                    reasoning.chars().count(),
+                    usage,
+                )
             } else {
-                "流被中断，且没有收到任何正文".into()
+                format!("流被中断，且没有收到任何正文（解析成功 {parsed} 块）")
             }));
         }
 

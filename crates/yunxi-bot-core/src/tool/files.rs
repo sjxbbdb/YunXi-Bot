@@ -100,6 +100,61 @@ fn require_str(args: &Value, key: &str) -> Result<String, ToolError> {
     }
 }
 
+/// `old_string` 没匹配上时，**诊断出真正的原因**。
+///
+/// ## 为什么值得单独写一个函数
+///
+/// 真机上观察到的失败链：`edit_file` 因为行尾不一致匹配不上 →
+/// 报错只说"要保持一致" → 模型不知道差在哪 → 试了几次之后
+/// **升级到用 `run_command` 写 PowerShell 脚本来改文件** →
+/// 脚本把 19 行的文件截成了 1 行。
+///
+/// 整条链的起点是**一句没有信息量的报错**。诊断出"你用的是 LF、
+/// 文件是 CRLF"，模型一步就能改对。
+///
+/// 只报能**确证**的原因：每种情况都实际验证过"改掉这一点就能匹配"，
+/// 不猜。猜错比不说更糟——模型会照着改，然后还是失败。
+fn diagnose_miss(content: &str, old: &str) -> String {
+    // 一、行尾不一致（最常见的一种）
+    let content_lf = content.replace("\r\n", "\n");
+    let old_lf = old.replace("\r\n", "\n");
+    if old_lf != old && !content.contains("\r\n") {
+        return "**文件用的是 LF 行尾，而 old_string 里带了 `\\r`。**\
+                去掉那些 `\\r` 再试。"
+            .to_string();
+    }
+    if !old_lf.contains('\r') && content_lf.contains(&old_lf) && content.contains("\r\n") {
+        let with_crlf = old_lf.replace('\n', "\r\n");
+        return format!(
+            "**文件用的是 CRLF 行尾，而 old_string 里是 LF。**\
+             把每个换行改成 `\\r\\n` 再试（也就是把 old_string 写成 {:?} 这种形状）。",
+            with_crlf.chars().take(60).collect::<String>()
+        );
+    }
+
+    // 二、行首尾空白不一致
+    let content_trimmed: Vec<&str> = content.lines().map(str::trim_end).collect();
+    let old_trimmed: Vec<&str> = old.lines().map(str::trim_end).collect();
+    if old_trimmed.len() <= content_trimmed.len() {
+        for w in content_trimmed.windows(old_trimmed.len()) {
+            if w == old_trimmed.as_slice() {
+                return "**行尾有空白差异**（行末多一个空格或制表符）。\
+                        把 old_string 的行尾空白改成和文件一致再试。"
+                    .to_string();
+            }
+        }
+    }
+
+    // 三、说不出具体原因时，**给可操作的下一步**，不留一句空话
+    format!(
+        "诊断不出具体差异（文件 {} 字 / old_string {} 字）。\
+         请重新 read_file {} 并**原样复制**要改的那几行——不要凭记忆重写。",
+        content.chars().count(),
+        old.chars().count(),
+        "一次"
+    )
+}
+
 /// 取必填字符串，且不接受空白串。
 ///
 /// 空白串单独拦住：`"path": " "` 会被当成合法路径一路走到 fs 调用，
@@ -1003,9 +1058,17 @@ impl Tool for EditFileTool {
         let count = content.matches(&old).count();
         if count == 0 {
             return Err(ToolError::Failed {
+                // **必须诊断出真正差在哪。**
+                //
+                // 只说"逐字符一致，包括缩进和行尾"是没用的——模型不知道
+                // 差在哪，于是开始乱试。真机上它试了几次就去写 PowerShell
+                // 脚本改文件，**最后把一个 19 行的文件截成了 1 行**。
+                //
+                // 一句能指出差异的诊断，比十条"请保持一致"的叮嘱有用。
                 detail: format!(
-                    "在 {} 里没找到 old_string（匹配 0 次）。它必须与文件内容逐字符一致，包括缩进和行尾；建议先 read_file 看一遍原文再改",
-                    display_path(&abs, &ctx.cwd)
+                    "在 {} 里没找到 old_string（匹配 0 次）。{}",
+                    display_path(&abs, &ctx.cwd),
+                    diagnose_miss(&content, &old)
                 ),
             });
         }
@@ -1035,6 +1098,74 @@ impl Tool for EditFileTool {
             "已修改 {}：替换 {count} 处",
             display_path(&abs, &ctx.cwd)
         )))
+    }
+}
+
+#[cfg(test)]
+mod miss_diagnosis_tests {
+    use super::*;
+
+    #[test]
+    fn an_lf_old_string_against_a_crlf_file_is_diagnosed() {
+        // **真机上就是这一种。** 报错只说"保持一致"的话，
+        // 模型会去试别的办法——真机上它写了个 PowerShell 脚本，
+        // 把 19 行的文件截成了 1 行。
+        let content = "第一行\r\n旧的这一行\r\n第三行\r\n";
+        let old = "旧的这一行\n";
+        let d = diagnose_miss(content, old);
+        assert!(d.contains("CRLF"), "要点名文件用的是 CRLF: {d}");
+        assert!(d.contains("LF"), "要点名调用方用的是 LF: {d}");
+        assert!(
+            d.contains("\\r\\n") || d.contains("再试"),
+            "要给出具体怎么改: {d}"
+        );
+    }
+
+    #[test]
+    fn a_crlf_old_string_against_an_lf_file_is_diagnosed() {
+        let content = "第一行\n旧的这一行\n第三行\n";
+        let old = "旧的这一行\r\n";
+        let d = diagnose_miss(content, old);
+        assert!(d.contains("LF"), "{d}");
+        assert!(d.contains('\\'), "要指出多余的 \\r: {d}");
+    }
+
+    #[test]
+    fn trailing_whitespace_differences_are_diagnosed() {
+        let content = "甲   \n乙\n";
+        let old = "甲\n";
+        let d = diagnose_miss(content, old);
+        assert!(d.contains("空白"), "{d}");
+    }
+
+    #[test]
+    fn a_completely_wrong_string_gets_an_actionable_next_step() {
+        // 说不出原因时也不能只留一句空话——要给可操作的下一步
+        let d = diagnose_miss("甲\n乙\n", "完全不存在的文本");
+        assert!(d.contains("read_file"), "要指向下一步: {d}");
+        assert!(d.contains("原样复制"), "要说清怎么做才对: {d}");
+    }
+
+    #[test]
+    fn the_diagnosis_never_claims_a_fix_that_would_not_work() {
+        // **诊断必须是真的。** 猜错比不说更糟——模型会照着改，然后还是失败。
+        // 这里验：说"行尾不一致"的场合，改掉行尾之后确实能匹配上。
+        let content = "甲\r\n乙\r\n";
+        let old = "甲\n乙\n";
+        let d = diagnose_miss(content, old);
+        assert!(d.contains("CRLF"), "{d}");
+        // 照着诊断改：
+        let fixed = old.replace('\n', "\r\n");
+        assert!(content.contains(&fixed), "诊断给的改法必须真的能匹配上");
+    }
+
+    #[test]
+    fn a_string_that_would_match_is_not_diagnosed_at_all() {
+        // 能匹配的调用方根本不会走到这里——真要说也得说"没差异"，
+        // 而不是编一个原因
+        let content = "甲\n乙\n";
+        let d = diagnose_miss(content, "甲\n");
+        assert!(!d.contains("CRLF"), "不该编一个不存在的行尾问题: {d}");
     }
 }
 
