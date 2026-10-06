@@ -54,7 +54,7 @@ pub mod web;
 
 pub use runner::{
     Approval, ApprovalRequest, Approver, DEFAULT_MAX_ROUNDS, RefusingApprover, ToolCallRecord,
-    ToolLoopError, ToolRunOutcome, ToolRunner,
+    ToolCallSink, ToolLoopError, ToolRunOutcome, ToolRunner,
 };
 
 /// 工具的能力类别。**审批策略的唯一依据。**

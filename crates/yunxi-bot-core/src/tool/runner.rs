@@ -106,6 +106,26 @@ impl ToolCallRecord {
     }
 }
 
+/// 工具调用的去处。**每一次调用都要有人接住。**
+///
+/// ## 为什么是一个 trait 而不是直接给 ledger
+///
+/// 工具层不该依赖台账的类型——它只需要"有地方记"这件事。
+/// 这样测试可以塞一个内存记录器，而 CLI 塞一个写台账的实现。
+///
+/// ## 为什么 `&self` 而不是 `&mut self`
+///
+/// 因为工具循环同时持有很多可变借用（会话、注册表）。要求 `&mut` 会让
+/// sink 和它们打架。实现方自己解决内部可变性（CLI 用 `Mutex<Ledger>`）。
+///
+/// ## 记录失败怎么办
+///
+/// **吞掉，但不静默。** 签名不给 `Result`：一次记录失败不该让工具循环
+/// 中断（那会为了留痕而拒绝干活）。实现方应该把失败打到 stderr——
+/// 台账写不进去是需要人知道的事，但它不是工具调用失败。
+pub trait ToolCallSink: Send + Sync {
+    fn record(&self, call: &ToolCallRecord);
+}
 /// 工具循环的产出。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolRunOutcome {
@@ -164,6 +184,8 @@ pub struct ToolRunner<'a> {
     ///
     /// `None` 表示不指定（不发这个字段），**不是"关"**。
     thinking: Option<crate::think::Thinking>,
+    /// 工具调用的去处。`None` 表示不记录——**测试与纯计算场景的显式选择**。
+    sink: Option<std::sync::Arc<dyn ToolCallSink>>,
     /// 一轮对话最多几次工具往返。
     pub max_rounds: u32,
 }
@@ -188,8 +210,18 @@ impl<'a> ToolRunner<'a> {
             decider: None,
             ctx,
             thinking: None,
+            sink: None,
             max_rounds: DEFAULT_MAX_ROUNDS,
         }
+    }
+
+    /// 设定工具调用的去处。
+    ///
+    /// **不设就是不记录**——那必须是一个显式的选择，而不是默认行为。
+    /// 默认静默会让"这次为什么没有工具记录"变成一个没有答案的问题。
+    pub fn with_sink(mut self, sink: std::sync::Arc<dyn ToolCallSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// 设定本轮的思考模式。**路由决定的，每个任务一次。**
@@ -264,6 +296,19 @@ impl<'a> ToolRunner<'a> {
 
             for tr in reqs {
                 let record = self.execute_one(&tr);
+                // **每一次调用都交给 sink。**
+                //
+                // 放在回灌模型之前、放进 `calls` 之前——因为那两步之后
+                // 还有可能出错（回灌本身失败、整轮被放弃），而
+                // **已经发生过的系统动作不能因为后续步骤失败就不留痕**。
+                //
+                // 这也是"工具调用不落台账"那个缺口的修正点：在此之前
+                // `ToolRunOutcome.calls` 生产出来就被丢掉，于是机器能读
+                // 使用者的文件、跑命令、抓网页，而台账里一条记录都没有
+                // ——破了 ADR D11「台账是唯一事实来源」。
+                if let Some(sink) = self.sink.as_ref() {
+                    sink.record(&record);
+                }
                 // **无论成败都要回灌。** 被拒绝、失败、成功——模型都得知道，
                 // 否则它会以为工具没被调用过而重复请求同一个。
                 let text = render_tool_result(&record);

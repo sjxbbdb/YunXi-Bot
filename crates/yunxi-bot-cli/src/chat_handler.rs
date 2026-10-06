@@ -119,6 +119,11 @@ pub struct ChatHandler {
     approver: std::sync::Arc<std::sync::Mutex<dyn Approver>>,
     /// 审批门禁第二层用的本地决策模型。
     decider: Option<std::sync::Arc<dyn Decider>>,
+    /// 工具调用的去处。`None` 表示这条链路不记录工具调用。
+    ///
+    /// **不设就是不记录**，而 CLI 一定会设——
+    /// 机器能改使用者的文件却不留记录，是 ADR D11 明令禁止的。
+    sink: Option<std::sync::Arc<dyn yunxi_bot_core::tool::ToolCallSink>>,
     /// 审批策略。
     policy: ToolPolicy,
 }
@@ -134,6 +139,9 @@ impl ChatHandler {
             tools: ToolRegistry::new(),
             approver: std::sync::Arc::new(std::sync::Mutex::new(RefusingApprover)),
             decider: None,
+            // 默认不记录。CLI 一定会用 `with_sink` 覆盖它——
+            // 默认值是给"这条链路不该记录"的场景留的显式出口。
+            sink: None,
             policy: ToolPolicy::default(),
         }
     }
@@ -159,7 +167,18 @@ impl ChatHandler {
         self
     }
 
-    /// 审批策略。
+    /// 设定工具调用的去处。
+    ///
+    /// **不设就是不记录**，而 CLI 一定会设——
+    /// 机器能改使用者的文件却不留记录，是 ADR D11 明令禁止的。
+    pub fn with_sink(
+        mut self,
+        sink: std::sync::Arc<dyn yunxi_bot_core::tool::ToolCallSink>,
+    ) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
     pub fn with_policy(mut self, policy: ToolPolicy) -> Self {
         self.policy = policy;
         self
@@ -268,6 +287,13 @@ impl ChatHandler {
             });
         if let Some(d) = &self.decider {
             runner = runner.with_decider(&**d);
+        }
+        // **每一次工具调用都要有人接住。**
+        //
+        // 不接的话，机器能读使用者的文件、跑命令、抓网页，
+        // 而台账里一条记录都没有——那是信任问题，不只是审计问题。
+        if let Some(s) = &self.sink {
+            runner = runner.with_sink(std::sync::Arc::clone(s));
         }
 
         let outcome = runner.run(&metered, layout, max_tokens).map_err(|e| {

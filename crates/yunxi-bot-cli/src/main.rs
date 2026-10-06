@@ -10,6 +10,7 @@
 
 mod approval;
 mod chat_handler;
+mod tool_sink;
 mod tooling;
 
 use std::path::PathBuf;
@@ -31,6 +32,19 @@ use yunxi_bot_core::{TickOptions, now_millis, policy, tick};
 /// 而使用者的配置文件明明就在那儿。
 ///
 /// 端到端测试抓到过一次真实的路径不一致——所以现在只有一份定义。
+/// 建工具调用 sink。**打不开台账时要说清楚，但不拒绝干活。**
+///
+/// 理由：为了留痕而拒绝服务是本末倒置。但也不能静默——"这次没有工具记录"
+/// 是使用者需要知道的事，所以打到 stderr。
+fn tool_sink_or_warn() -> std::sync::Arc<dyn yunxi_bot_core::tool::ToolCallSink> {
+    match tool_sink::LedgerToolSink::open(ledger_path()) {
+        Ok(s) => std::sync::Arc::new(s),
+        Err(e) => {
+            eprintln!("警告：工具调用写不进台账（{e}）——改为打到标准错误");
+            std::sync::Arc::new(tool_sink::StderrToolSink)
+        }
+    }
+}
 fn default_home() -> PathBuf {
     yunxi_bot_core::default_home()
 }
@@ -1720,6 +1734,13 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             .with_tools(tools)
             .with_approver(tooling::approver_from_args(args))
             .with_policy(tooling::policy_from_args(args))
+            // **每一次工具调用都要落台账。**
+            //
+            // 在此之前 `ToolRunOutcome.calls` 生产出来就被丢掉——
+            // 机器能读使用者的文件、跑命令、抓网页，而台账里一条记录都没有。
+            // 对一个"能替你动手"的助理，那是信任问题，不只是审计问题：
+            // 事后没法回答"它到底动过什么"。
+            .with_sink(tool_sink_or_warn())
             .with_decider(std::sync::Arc::new(
                 yunxi_bot_core::decide::LayaDecider::new(
                     flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
@@ -2439,6 +2460,8 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         .with_tools(tools)
         .with_approver(tooling::approver_from_args(args))
         .with_policy(tooling::policy_from_args(args))
+        // **每一次工具调用都要落台账**（见 `tool_sink` 模块文档）
+        .with_sink(tool_sink_or_warn())
         .with_decider(std::sync::Arc::new(
             yunxi_bot_core::decide::LayaDecider::new(
                 flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),

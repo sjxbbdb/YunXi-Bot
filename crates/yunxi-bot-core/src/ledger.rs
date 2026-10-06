@@ -88,6 +88,16 @@ pub enum EventKind {
     /// 尝试把一条通知送出去。**记投递结果的四档**，
     /// 包括"交给了系统但未确认可见"——那不算送达。
     NoticeSent,
+    /// 一次工具调用。**这是"机器做过什么"的原始记录。**
+    ///
+    /// 记的是**每一次**尝试：被批准的、被拒绝的、需要人工但没人应答的，
+    /// 全都要留痕。只记成功的那些等于把"谁试图动我的文件"这个问题
+    /// 变成了"谁成功动了我的文件"——而前者才是审计要问的。
+    ///
+    /// 这一条是 ADR D11「台账是唯一事实来源」在工具层的落点：
+    /// 在此之前机器能读使用者的文件、跑命令、抓网页，而台账里
+    /// 一条记录都没有。
+    ToolCalled,
     /// 使用者对一条通知的处置。
     ///
     /// **记的是"他当时看到的那条信息长什么样"**，不只是 id——
@@ -197,6 +207,53 @@ pub fn is_lossless_json(v: &Value) -> Result<(), String> {
     }
 }
 
+/// 读文件的最后一行。**不解码成 String**——逐字节往回扫，避免为一行的
+/// 需求把整个文件读进来。
+///
+/// 空文件或只有一行（头部）时返回 `None`。
+fn read_last_line(path: &Path) -> Result<Option<String>, LedgerError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(path).map_err(|e| LedgerError::Io(e.to_string()))?;
+    let len = f
+        .metadata()
+        .map_err(|e| LedgerError::Io(e.to_string()))?
+        .len();
+    if len == 0 {
+        return Ok(None);
+    }
+    // 从尾部往回找换行。留一点余量：一条事件通常几百字节，
+    // 但工具输出可能很长——所以是"找到换行就停"，不是固定窗口。
+    const CHUNK: u64 = 8192;
+    let mut end = len;
+    let mut buf: Vec<u8> = Vec::new();
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        f.seek(SeekFrom::Start(start))
+            .map_err(|e| LedgerError::Io(e.to_string()))?;
+        let mut chunk = vec![0u8; (end - start) as usize];
+        f.read_exact(&mut chunk)
+            .map_err(|e| LedgerError::Io(e.to_string()))?;
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+        // 去掉尾部的换行，再找倒数第二个换行 = 最后一行的起点
+        let trimmed = buf.len()
+            - buf
+                .iter()
+                .rev()
+                .take_while(|b| **b == b'\n' || **b == b'\r')
+                .count();
+        if let Some(pos) = buf[..trimmed].iter().rposition(|b| *b == b'\n') {
+            let line = &buf[pos + 1..trimmed];
+            return Ok(Some(String::from_utf8_lossy(line).into_owned()));
+        }
+        if start == 0 {
+            break;
+        }
+        end = start;
+    }
+    // 整个文件只有一行——那是头部，不是事件
+    Ok(None)
+}
 /// 台账。持有文件句柄、当前序号、边界状态与已加载的事件。
 #[derive(Debug)]
 pub struct Ledger {
@@ -206,6 +263,11 @@ pub struct Ledger {
     open_span: Option<u64>,
     next_span: u64,
     events: Vec<Event>,
+    /// 我们上次看到的文件长度。**不能用 `File::metadata()` 现查**——
+    /// 它返回的是**当前**长度，与本进程是否写过无关，于是"长度变了没有"
+    /// 这个判断永远为假、同步永远不发生。这个 bug 是被测试抓到的：
+    /// 两个 sink 写同一个文件，seq 出了 `[1, 1]`。
+    seen_len: u64,
 }
 
 impl Ledger {
@@ -222,6 +284,8 @@ impl Ledger {
         }
 
         let mut events = Vec::new();
+        // 开台账那一刻的文件长度。**后面用它判断"别人有没有在我之后追加过"。**
+        let header_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let existed = path.exists()
             && std::fs::metadata(&path)
                 .map(|m| m.len() > 0)
@@ -276,6 +340,9 @@ impl Ledger {
             open_span: None,
             next_span,
             events,
+            // 开台账时看到的长度。**用它判断"别人有没有追加过"**，
+            // 而不是现查 file 的元数据（那永远是当前值）。
+            seen_len: header_len,
         })
     }
 
@@ -321,6 +388,52 @@ impl Ledger {
         self.open_span.is_some()
     }
 
+    /// 把内存里的序号对齐到磁盘上最新的那个。
+    ///
+    /// ## 为什么需要这个
+    ///
+    /// `seq` 是**开台账时**从文件里算出来的。如果同一个进程里有两个
+    /// `Ledger` 实例指向同一个文件（比如任务 store 持一个、工具调用记录
+    /// 持另一个），另一个写入者追加之后，我们手里的 `seq` 就落后了——
+    /// 继续写会产生**重复的 seq**，而 `seq` 是时序与边界的依据，
+    /// 重复了就没有东西能说清谁先谁后。
+    ///
+    /// 只读最后一行而不是整个文件：写入是追加，最后一行就是最新的那条。
+    fn sync_seq_from_disk(&mut self) -> Result<(), LedgerError> {
+        let len = match std::fs::metadata(&self.path) {
+            Ok(m) => m.len(),
+            // 文件没了（被删/被移走）就保持现状：下一次 append 会自己重建
+            Err(_) => return Ok(()),
+        };
+        if len == 0 {
+            return Ok(());
+        }
+        // 快速路径：文件长度和我们上次看到的一样，说明没有人追加过。
+        //
+        // **必须用自己记的 `seen_len`，不能现查 `File::metadata()`**——
+        // 后者返回的是**当前**长度，与本进程是否写过无关，于是
+        // "长度变了没有"这个判断永远为假、同步永远不会发生。
+        // 这个 bug 是被测试抓到的：两个 sink 写同一个文件，seq 出了 `[1, 1]`。
+        if len == self.seen_len {
+            return Ok(());
+        }
+
+        let tail = read_last_line(&self.path)?;
+        let Some(line) = tail else {
+            return Ok(());
+        };
+        if let Ok(ev) = serde_json::from_str::<Event>(&line) {
+            if ev.seq > self.seq {
+                self.seq = ev.seq;
+            }
+            if ev.seq >= self.next_span {
+                self.next_span = ev.seq + 1;
+            }
+        }
+        self.seen_len = len;
+        Ok(())
+    }
+
     /// 追加一条事件。
     ///
     /// 需要边界的类型在边界外调用会**直接返回错误**，不写入任何内容。
@@ -334,6 +447,10 @@ impl Ledger {
             return Err(LedgerError::AuditOutsideSpan(kind));
         }
         is_lossless_json(&data).map_err(LedgerError::LossyJson)?;
+
+        // **每次追加前先对齐磁盘序号。** 同一个进程里可能有另一个
+        // `Ledger` 刚写过（工具调用记录就是这样），不对齐会产生重复 seq。
+        self.sync_seq_from_disk()?;
 
         let seq = self.seq + 1;
         let ev = Event {
@@ -353,6 +470,11 @@ impl Ledger {
 
         self.seq = seq;
         self.events.push(ev.clone());
+        // 记下写完之后的长度，供下一次 `sync_seq_from_disk` 判断
+        // "别人有没有在我之后追加过"。
+        if let Ok(m) = self.file.metadata() {
+            self.seen_len = m.len();
+        }
         Ok(ev)
     }
 
