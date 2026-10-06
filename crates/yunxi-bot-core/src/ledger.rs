@@ -130,6 +130,11 @@ pub enum EventKind {
     MemoryReinforced,
     MemoryForgotten,
 
+    // —— 画像提议（自动总结的东西**先 pending**，人确认了才进档案）——
+    ProfileProposed,
+    ProfileAccepted,
+    ProfileRejected,
+
     // —— 审计对（必须位于边界内）——
     DecisionAsked,
     DecisionDecided,

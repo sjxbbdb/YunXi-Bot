@@ -133,6 +133,104 @@ pub fn load_and_render(home: &Path) -> String {
     }
 }
 
+/// 一条**待确认**的画像提议。
+///
+/// ## 为什么自动总结的东西必须先 pending
+///
+/// 参考架构（研究文档 §4.6）的原话是："**自动抽取默认先 pending，
+/// 不直接改变核心用户档案**"。
+///
+/// 理由是：**画像是权威的**（它是"你希望它怎么理解你"），
+/// 而自动总结是**猜的**。猜的东西直接写进权威档案，档案就废了——
+/// 你没法再信它，因为你不知道哪句是自己写的、哪句是它猜的。
+///
+/// 而且自动总结**一定会错**：它可能把"帮我看看这个文件"当成
+/// "使用者在做文件相关的项目"。那种错如果无声地进了画像，
+/// 之后每一次对话都带着它。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileProposal {
+    pub id: String,
+    /// 提议写进画像的那句话。
+    pub text: String,
+    /// **它为什么这么提议。** 没这个的话人没法判断该不该接受——
+    /// 只能看那句话本身，而"这句话是从哪来的"恰恰是关键。
+    pub reason: String,
+    pub created_at: u64,
+}
+
+/// 从台账事件投影出**还没处理**的提议。
+///
+/// 事件驱动而不是存一个 JSON 文件：接受和否决**都要留痕**——
+/// "它提议过什么、我否掉了什么"本身是有用的信息
+/// （它总在提议某一类你不想要的东西时，该调的是提取的判据）。
+pub fn pending_from_events(events: &[crate::ledger::Event]) -> Vec<ProfileProposal> {
+    use crate::ledger::EventKind;
+    use std::collections::BTreeMap;
+
+    let mut open: BTreeMap<String, ProfileProposal> = BTreeMap::new();
+    for e in events {
+        match e.kind {
+            EventKind::ProfileProposed => {
+                let (Some(id), Some(text)) = (
+                    e.data.get("id").and_then(|v| v.as_str()),
+                    e.data.get("text").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                open.insert(
+                    id.to_string(),
+                    ProfileProposal {
+                        id: id.to_string(),
+                        text: text.to_string(),
+                        reason: e
+                            .data
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        created_at: e.at,
+                    },
+                );
+            }
+            // 接受和否决都把提议移出待办。**否决也要记**——
+            // 不然同一条会被反复提议，而使用者会以为它没听见。
+            EventKind::ProfileAccepted | EventKind::ProfileRejected => {
+                if let Some(id) = e.data.get("id").and_then(|v| v.as_str()) {
+                    open.remove(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    open.into_values().collect()
+}
+
+/// 被接受过的提议正文，按接受顺序。用来拼进画像文件。
+pub fn accepted_texts(events: &[crate::ledger::Event]) -> Vec<String> {
+    use crate::ledger::EventKind;
+    events
+        .iter()
+        .filter(|e| e.kind == EventKind::ProfileAccepted)
+        .filter_map(|e| e.data.get("text").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// 渲染待确认列表（给人看的）。
+pub fn render_pending(items: &[ProfileProposal]) -> String {
+    if items.is_empty() {
+        return "（没有待确认的提议）".to_string();
+    }
+    let mut out = String::new();
+    for p in items {
+        out.push_str(&format!("  [{}] {}\n", p.id, p.text));
+        if !p.reason.trim().is_empty() {
+            out.push_str(&format!("        它这么想的依据：{}\n", p.reason.trim()));
+        }
+    }
+    out
+}
+
 /// 初始模板。`yunxi-bot profile --init` 写它。
 ///
 /// ## 为什么给模板而不是让人对着空文件发呆
@@ -298,5 +396,119 @@ mod tests {
             }
             panic!("模板里不该有填好的内容行：{t}");
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+    use crate::ledger::{Event, EventKind};
+
+    fn ev(kind: EventKind, at: u64, data: serde_json::Value) -> Event {
+        Event {
+            seq: at,
+            at,
+            kind,
+            span: None,
+            job: None,
+            data,
+        }
+    }
+
+    #[test]
+    fn a_proposal_shows_up_as_pending() {
+        let evs = vec![ev(
+            EventKind::ProfileProposed,
+            10,
+            serde_json::json!({"id": "p1", "text": "使用者住在杭州", "reason": "他说「我在杭州」"}),
+        )];
+        let open = pending_from_events(&evs);
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].text, "使用者住在杭州");
+        assert_eq!(open[0].reason, "他说「我在杭州」");
+    }
+
+    #[test]
+    fn accepting_removes_it_from_pending_and_remembers_the_text() {
+        let evs = vec![
+            ev(
+                EventKind::ProfileProposed,
+                10,
+                serde_json::json!({"id": "p1", "text": "使用者住在杭州"}),
+            ),
+            ev(
+                EventKind::ProfileAccepted,
+                20,
+                serde_json::json!({"id": "p1", "text": "使用者住在杭州"}),
+            ),
+        ];
+        assert!(
+            pending_from_events(&evs).is_empty(),
+            "接受之后不该还在待办里"
+        );
+        assert_eq!(accepted_texts(&evs), vec!["使用者住在杭州"]);
+    }
+
+    #[test]
+    fn rejecting_also_removes_it() {
+        // **否决也要移出待办。** 不然同一条会被反复提议，
+        // 而使用者会以为它没听见——那比不提议更烦人。
+        let evs = vec![
+            ev(
+                EventKind::ProfileProposed,
+                10,
+                serde_json::json!({"id": "p1", "text": "使用者住在杭州"}),
+            ),
+            ev(
+                EventKind::ProfileRejected,
+                20,
+                serde_json::json!({"id": "p1"}),
+            ),
+        ];
+        assert!(pending_from_events(&evs).is_empty());
+        assert!(accepted_texts(&evs).is_empty(), "否决的不该进画像");
+    }
+
+    #[test]
+    fn a_malformed_proposal_event_is_skipped_not_fatal() {
+        // 台账是**追加式**的，写坏的一行不能让它整本读不出来
+        let evs = vec![
+            ev(
+                EventKind::ProfileProposed,
+                10,
+                serde_json::json!({"id": "p1"}),
+            ),
+            ev(
+                EventKind::ProfileProposed,
+                11,
+                serde_json::json!({"id": "p2", "text": "好的那条"}),
+            ),
+        ];
+        let open = pending_from_events(&evs);
+        assert_eq!(open.len(), 1, "缺 text 的那条该被跳过");
+        assert_eq!(open[0].text, "好的那条");
+    }
+
+    #[test]
+    fn several_pending_items_all_show() {
+        let evs = vec![
+            ev(
+                EventKind::ProfileProposed,
+                10,
+                serde_json::json!({"id": "p1", "text": "住在杭州"}),
+            ),
+            ev(
+                EventKind::ProfileProposed,
+                11,
+                serde_json::json!({"id": "p2", "text": "用 Rust"}),
+            ),
+        ];
+        assert_eq!(pending_from_events(&evs).len(), 2);
+    }
+
+    #[test]
+    fn an_empty_list_says_so_instead_of_printing_nothing() {
+        // **空白输出会让人以为命令坏了。** 说一句"没有"。
+        assert!(render_pending(&[]).contains("没有待确认"));
     }
 }

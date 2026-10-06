@@ -1802,6 +1802,103 @@ fn cmd_profile(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let path = home.join(PROFILE_FILE);
 
     // ---- 初始化 ----
+    // ---- 待确认的提议 ----
+    //
+    // **自动总结的东西必须先 pending。** 参考架构（研究文档 §4.6）的原话：
+    // "自动抽取默认先 pending，不直接改变核心用户档案"。
+    //
+    // 理由是**画像是权威的**（"你希望它怎么理解你"），而自动总结是猜的。
+    // 猜的东西直接写进权威档案，档案就废了——你没法再信它，
+    // 因为你不知道哪句是自己写的、哪句是它猜的。
+    if args.iter().any(|a| a == "--pending") {
+        let ledger = Ledger::open(ledger_path())?;
+        let open = yunxi_bot_core::profile::pending_from_events(ledger.events());
+        if open.is_empty() {
+            println!("{}", yunxi_bot_core::profile::render_pending(&[]));
+        } else {
+            println!("{} 条待确认：", open.len());
+            print!("{}", yunxi_bot_core::profile::render_pending(&open));
+            println!();
+            println!("接受：yunxi-bot profile --accept <编号>");
+            println!("否决：yunxi-bot profile --reject <编号>");
+        }
+        return Ok(0);
+    }
+
+    // ---- 手工提一条（自动提取还没做时的入口，也是"我直接告诉它"的路）----
+    if let Some(text) = flag(args, "--propose") {
+        let mut ledger = Ledger::open(ledger_path())?;
+        let id = format!("pp{}", yunxi_bot_core::now_millis()?);
+        ledger.append(
+            yunxi_bot_core::EventKind::ProfileProposed,
+            None,
+            serde_json::json!({ "id": id, "text": text, "reason": "使用者直接提的" }),
+        )?;
+        println!("已提议：{text}");
+        println!("  编号 : {id}");
+        println!("  它现在**还没进画像**——用 `yunxi-bot profile --accept {id}` 才进。");
+        return Ok(0);
+    }
+
+    // ---- 接受 ----
+    if let Some(id) = flag(args, "--accept") {
+        let ledger = Ledger::open(ledger_path())?;
+        let open = yunxi_bot_core::profile::pending_from_events(ledger.events());
+        let Some(item) = open.iter().find(|p| p.id == id) else {
+            eprintln!("没有编号为 {id} 的待确认提议。用 `yunxi-bot profile --pending` 看有哪些。");
+            return Ok(2);
+        };
+        let text = item.text.clone();
+
+        // **先进文件再记台账。** 反过来的话，写文件失败就留下一条
+        // "已接受"而档案里没有——那是最难查的一种不一致。
+        std::fs::create_dir_all(&home)?;
+        let mut body = if path.exists() {
+            std::fs::read_to_string(&path)?
+        } else {
+            String::new()
+        };
+        if body.is_empty() {
+            body.push_str("# 关于我\n\n");
+        }
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&format!("- {text}\n"));
+        std::fs::write(&path, body)?;
+
+        let mut ledger = Ledger::open(ledger_path())?;
+        ledger.append(
+            yunxi_bot_core::EventKind::ProfileAccepted,
+            None,
+            serde_json::json!({ "id": id, "text": text }),
+        )?;
+        println!("已接受并写进画像：{text}");
+        println!("  画像 : {}", path.display());
+        println!("  **下一次对话生效**（它进稳定前缀，改了会失效一次缓存）。");
+        return Ok(0);
+    }
+
+    // ---- 否决 ----
+    if let Some(id) = flag(args, "--reject") {
+        let mut ledger = Ledger::open(ledger_path())?;
+        let open = yunxi_bot_core::profile::pending_from_events(ledger.events());
+        let Some(item) = open.iter().find(|p| p.id == id) else {
+            eprintln!("没有编号为 {id} 的待确认提议。");
+            return Ok(2);
+        };
+        let text = item.text.clone();
+        ledger.append(
+            yunxi_bot_core::EventKind::ProfileRejected,
+            None,
+            serde_json::json!({ "id": id, "text": text }),
+        )?;
+        println!("已否决：{text}");
+        println!("  （台账里留了痕——**否决也要记**，不然同一条会被反复提议，");
+        println!("   而你会以为它没听见。）");
+        return Ok(0);
+    }
+
     if args.iter().any(|a| a == "--init") {
         if path.exists() && !args.iter().any(|a| a == "--force") {
             eprintln!("画像已经存在：{}", path.display());
