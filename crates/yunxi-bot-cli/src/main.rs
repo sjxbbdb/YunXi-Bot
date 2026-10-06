@@ -1687,8 +1687,17 @@ fn cmd_remember(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "preference" => MemoryKind::Preference,
         "relationship" => MemoryKind::Relationship,
         "event" => MemoryKind::Event,
+        // **工作目录记忆。** 它和别的类不一样：**会记下当前目录**，
+        // 之后只在那个目录下被召回。
+        //
+        // 为什么不让人手填目录：**人记的时候就在那个目录里**——
+        // 让他再抄一遍路径既多余，又会抄错（抄错的表现是
+        // "记了但它从来不提"，最难查）。
+        "workspace" => MemoryKind::Workspace,
         other => {
-            eprintln!("未知类别 {other}，可用: fact / preference / relationship / event");
+            eprintln!(
+                "未知类别 {other}，可用: fact / preference / relationship / event / workspace"
+            );
             return Ok(2);
         }
     };
@@ -1709,14 +1718,41 @@ fn cmd_remember(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 
     let mut ledger = Ledger::open(ledger_path())?;
     let id = format!("m{}", yunxi_bot_core::now_millis()?);
+    // **只有工作目录类带作用域。** 关于"这个人"的记忆不该跟着目录走——
+    // 在 A 目录记下的"使用者住在杭州"，去 B 目录也该知道。
+    //
+    // 归一方式和召回那边**必须一致**（`chat_handler::cwd_scope`）：
+    // 统一分隔符、去掉末尾斜杠。不一致的表现是"记了但它从来不提"。
+    let scope: Option<String> = if kind == MemoryKind::Workspace {
+        match std::env::current_dir() {
+            Ok(d) => {
+                let s = d.to_string_lossy().replace('/', "\\");
+                Some(s.trim_end_matches('\\').to_string())
+            }
+            Err(e) => {
+                // **不静默降级成"无作用域"。** 那样它会变成一条
+                // 哪个目录都不给的坏数据——人以为记住了，其实永远召不回。
+                eprintln!("拿不到当前目录（{e}），没法记工作目录记忆。");
+                return Ok(2);
+            }
+        }
+    } else {
+        None
+    };
+
     ledger.append(
         yunxi_bot_core::EventKind::MemoryRecorded,
         None,
-        serde_json::json!({ "id": id, "kind": kind, "text": text }),
+        serde_json::json!({ "id": id, "kind": kind, "text": text, "scope": scope }),
     )?;
 
     println!("已记住 [{}] {}", kind.label(), text);
     println!("  编号 : {id}");
+    // **作用域要打出来。** 不打印的话，人不知道它记到哪个目录下了——
+    // 而"记了但它从来不提"最常见的原因就是记错了目录。
+    if let Some(sc) = &scope {
+        println!("  作用域 : {sc}（只在那个目录下召回）");
+    }
     println!("  台账 : {}", ledger.path().display());
     Ok(0)
 }
