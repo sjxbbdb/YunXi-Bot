@@ -921,6 +921,37 @@ impl Tool for EditFileTool {
             return None;
         }
         let before = std::fs::read_to_string(&abs).ok()?;
+
+        // **先说清"这次编辑根本不会成功"。**
+        //
+        // 这是端到端测试抓到的：模型发来的 `old_string` 里是字面量 `\r\n`
+        // 而不是真的回车换行，于是它在文件里一个都找不到，`call` 必然失败。
+        // 而预览当时说的是"内容没有变化"——人看到那句会以为
+        // "没什么可批的"，**而实际是"批了也会失败"**。
+        //
+        // 预览最大的价值恰恰在这儿：**在问人之前就发现这次编辑是白问的。**
+        let hits = before.matches(old).count();
+        if hits == 0 {
+            let head: String = old
+                .lines()
+                .take(3)
+                .map(|l| format!("      {l}\n"))
+                .collect();
+            return Some(format!(
+                "要改 {raw}：**文件里找不到这段内容，这次编辑会失败。**\n  \
+                 想找的是（前 3 行）：\n{}  \
+                 （多半是空白或换行对不上——批准它也不会有任何改动。）",
+                head.trim_end()
+            ));
+        }
+        if hits > 1 && !replace_all {
+            return Some(format!(
+                "要改 {raw}：**这段内容出现了 {hits} 次，而 replace_all 没开，\
+                 这次编辑会失败。**\n  \
+                 （要全改就开 replace_all；只想改一处就把 old_string 写得更具体。）"
+            ));
+        }
+
         let after = if replace_all {
             before.replace(old, new)
         } else {
@@ -1082,6 +1113,58 @@ mod preview_tests {
             .unwrap();
         assert!(all.contains("加 3 行"), "全替换要如实说改了几处: {all}");
         assert!(!one.contains("加 3 行"), "默认只改一处: {one}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_preview_says_when_the_old_string_is_not_there_at_all() {
+        // **这是端到端抓到的。**
+        //
+        // 模型发来的 `old_string` 里是字面量 `\r\n` 而不是真的回车换行，
+        // 于是它在文件里一个都找不到，`call` 必然失败。
+        // 而预览当时说的是"内容没有变化"——人看到那句会以为
+        // "没什么可批的"，**而实际是"批了也会失败"**。
+        //
+        // 预览最大的价值正在这儿：**在问人之前就发现这次编辑是白问的。**
+        let d = tmp("edit-nomatch");
+        std::fs::write(d.join("a.md"), "第一行\n旧的这一行\n第三行\n").unwrap();
+        let args = json!({
+            "path": "a.md",
+            "old_string": "旧的这一行\\r\\n",   // 字面量反斜杠，不是真换行
+            "new_string": "新的这一行\\r\\n"
+        });
+        let p = EditFileTool.preview(&args, &ctx(&d)).expect("该有预览");
+        assert!(p.contains("找不到"), "要说清找不到: {p}");
+        assert!(p.contains("会失败"), "要说清后果: {p}");
+        assert!(
+            !p.contains("没有变化"),
+            "**不能说「没有变化」**——那句会让人以为没什么可批的: {p}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_preview_says_when_there_are_too_many_matches() {
+        // 出现多次而没开 replace_all —— `call` 也会失败
+        let d = tmp("edit-dup");
+        std::fs::write(d.join("a.md"), "x\nx\n").unwrap();
+        let args = json!({"path": "a.md", "old_string": "x", "new_string": "y"});
+        let p = EditFileTool.preview(&args, &ctx(&d)).unwrap();
+        assert!(p.contains("2 次"), "要说清出现了几次: {p}");
+        assert!(p.contains("replace_all"), "要给出下一步怎么办: {p}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_preview_still_diffs_when_the_edit_would_work() {
+        // 能成的编辑不该被上面那两条拦掉
+        let d = tmp("edit-ok");
+        std::fs::write(d.join("a.md"), "甲\n乙\n丙\n").unwrap();
+        let args = json!({"path": "a.md", "old_string": "乙", "new_string": "贰"});
+        let p = EditFileTool.preview(&args, &ctx(&d)).unwrap();
+        assert!(p.contains("- 乙"), "{p}");
+        assert!(p.contains("+ 贰"), "{p}");
+        assert!(!p.contains("会失败"), "{p}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
