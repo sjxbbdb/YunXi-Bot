@@ -42,6 +42,7 @@ pub mod notify;
 pub mod notify_windows;
 pub mod policy;
 pub mod profile;
+pub mod recall_gate;
 pub mod rules;
 pub mod runner;
 pub mod task;

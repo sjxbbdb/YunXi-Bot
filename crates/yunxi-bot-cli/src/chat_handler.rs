@@ -409,6 +409,22 @@ impl ChatHandler {
             provider: CHAT_SESSION_KEY.to_string(),
         };
 
+        // **先过门控：这一轮到底有没有记忆需求。**
+        //
+        // 在这之前每轮都无条件召回。后果两头：白花几毫秒；更坏的是
+        // 翻出来的东西看着相关其实是噪声，会把回答带偏。
+        // 参考架构 §4.2 的原话是"避免每轮盲目注入"。
+        //
+        // 门控是**确定性**的（关键词表），不调模型——它要是也得调模型，
+        // 省下来的调用还不够付它的；而且调模型的门控没法稳定测试，
+        // "召回结果为什么变了"就说不清了。
+        let need = yunxi_bot_core::recall_gate::gate(input);
+        if !need.needs_recall() {
+            // `none`：问的是世界，不是使用者，不去翻私人记忆
+            // `profile`：画像和常驻层**已经在稳定前缀里**了，再召一次是重复占位
+            return input.to_string();
+        }
+
         // 台账读不到就当没有记忆：**记忆是增强，不是对话能不能进行的前提。**
         let Ok(ledger) = yunxi_bot_core::ledger::Ledger::open(self.home.join("ledger.jsonl"))
         else {
