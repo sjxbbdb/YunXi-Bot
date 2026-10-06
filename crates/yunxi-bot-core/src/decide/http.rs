@@ -64,7 +64,10 @@ fn connect_error(addr: &SocketAddr, e: &std::io::Error) -> HttpError {
         ));
     }
     if e.kind() == std::io::ErrorKind::TimedOut {
-        return HttpError::Timeout;
+        return HttpError::Timeout(format!(
+            "连 {addr} 超时（{ }ms 内没连上）",
+            connect_timeout_for(addr, 0)
+        ));
     }
     HttpError::Connect(format!("{addr} 连不上：{e}"))
 }
@@ -74,7 +77,10 @@ pub enum HttpError {
     /// 无法解析或连接到目标地址。
     Connect(String),
     /// 读写超时。
-    Timeout,
+    ///
+    /// **带上地址和阶段。** 只说"调用超时"的话，拿到日志的人不知道
+    /// 是连不上还是读不动——而这两件事的下一步完全不同。
+    Timeout(String),
     Io(String),
     /// 响应不是合法的 HTTP/1.x。
     Malformed(String),
@@ -88,7 +94,7 @@ impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HttpError::Connect(m) => write!(f, "连接失败: {m}"),
-            HttpError::Timeout => write!(f, "请求超时"),
+            HttpError::Timeout(d) => write!(f, "请求超时: {d}"),
             HttpError::Io(m) => write!(f, "网络读写错误: {m}"),
             HttpError::Malformed(m) => write!(f, "响应格式非法: {m}"),
             HttpError::Status(code, msg) => write!(f, "服务返回 {code}: {msg}"),
@@ -203,7 +209,9 @@ pub fn get_json(endpoint: &str, timeout_ms: u64) -> Result<String, HttpError> {
 
 fn map_io(e: std::io::Error) -> HttpError {
     match e.kind() {
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => HttpError::Timeout,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            HttpError::Timeout(format!("读写超时（{e}）"))
+        }
         _ => HttpError::Io(e.to_string()),
     }
 }
@@ -351,7 +359,7 @@ mod loopback_tests {
             &addr("10.0.0.1", 1),
             &std::io::Error::from(std::io::ErrorKind::TimedOut),
         );
-        assert!(matches!(e, HttpError::Timeout), "{e:?}");
+        assert!(matches!(e, HttpError::Timeout(_)), "{e:?}");
     }
 
     #[test]

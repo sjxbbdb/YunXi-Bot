@@ -33,7 +33,7 @@ pub enum DecisionError {
     /// 1. 服务未启动 / 端口不通
     Unreachable(String),
     /// 2. 超时
-    Timeout,
+    Timeout(String),
     /// 3/5. 返回非法（schema 校验失败 / 概率缺失 / 越界）
     Invalid(String),
     /// 4. 服务端错误
@@ -44,7 +44,9 @@ impl std::fmt::Display for DecisionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DecisionError::Unreachable(m) => write!(f, "服务不可达: {m}"),
-            DecisionError::Timeout => write!(f, "调用超时"),
+            // **带上细节。** 只说"调用超时"的话，拿到日志的人不知道
+            // 是连不上还是读不动——而这两件事的下一步完全不同。
+            DecisionError::Timeout(d) => write!(f, "调用超时: {d}"),
             DecisionError::Invalid(m) => write!(f, "响应非法: {m}"),
             DecisionError::Server(m) => write!(f, "服务端错误: {m}"),
         }
@@ -56,7 +58,7 @@ impl std::error::Error for DecisionError {}
 impl From<http::HttpError> for DecisionError {
     fn from(e: http::HttpError) -> Self {
         match e {
-            http::HttpError::Timeout => DecisionError::Timeout,
+            http::HttpError::Timeout(d) => DecisionError::Timeout(d),
             http::HttpError::Connect(m) => DecisionError::Unreachable(m),
             http::HttpError::Status(c, m) => DecisionError::Server(format!("{c}: {m}")),
             http::HttpError::Malformed(m) | http::HttpError::Io(m) => DecisionError::Invalid(m),

@@ -162,7 +162,7 @@ struct ErrorResponse {
 fn explain(e: HttpError, s: &MailSource) -> String {
     match e {
         HttpError::Connect(m) => format!("连不上邮件 sidecar：{m}。\n{}", s.start_hint()),
-        HttpError::Timeout => format!(
+        HttpError::Timeout(_) => format!(
             "邮件 sidecar 在 {} 毫秒内没有响应（IMAP 服务器可能是慢或卡住了）",
             s.timeout_ms
         ),
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn timeout_maps_to_a_message_that_names_the_budget() {
         let s = MailSource::new(17871);
-        let e = explain(HttpError::Timeout, &s);
+        let e = explain(HttpError::Timeout("测试".into()), &s);
         assert!(e.contains("30000"), "要说清等了多少: {e}");
         assert!(e.contains("IMAP"), "要指出可能的原因: {e}");
     }
