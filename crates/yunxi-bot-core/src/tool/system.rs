@@ -269,12 +269,11 @@ impl Tool for RunCommandTool {
         let opts = ExecOptions {
             cwd,
             timeout_ms,
-            // **不要求** OS 级写入隔离：一是不属于工具层该做的判断（要不要跑、
-            // 跑在什么隔离里是策略层的事），二是该要求的语义是"拿不到就拒绝
-            // 执行"，而非 Windows 平台根本提供不了这个级别，那会让本工具在
-            // 那些平台上整个不可用。实际达到的隔离级别由 exec 如实返回，并写进
-            // 下面回灌给模型的文本里——绝不把进程内策略说成沙箱。
-            isolation: IsolationRequirement::ProcessOnly,
+            // **沙箱旋钮必须真的生效。** 原先这里硬编码 `ProcessOnly`，
+            // 于是 `--sandbox read-only` 是一条**被静默忽略的设置**——
+            // 使用者明确要了只读，实际拿到的是全权限。那比没有这个旋钮更糟：
+            // 他会以为自己被保护着。
+            isolation: isolation_for(ctx.sandbox),
             // 资源上限留给策略配置。工具层擅自设限，是另一种"静默降级"：
             // 使用者没要求过，命令却因为一个它不知道的限制被杀掉。
             memory_limit_bytes: None,
@@ -294,6 +293,99 @@ impl Tool for RunCommandTool {
     }
 }
 
+/// 把沙箱旋钮翻译成执行层的隔离要求。
+///
+/// ## 为什么这件事必须在工具层做
+///
+/// ADR D4 说沙箱和审批是**两个正交旋钮**。但在此之前，`run_command`
+/// 硬编码 `ProcessOnly`，于是沙箱那一半在工具层是**装饰性的**：
+/// 使用者写 `--sandbox read-only`，命令照样能写文件。
+///
+/// **一条被静默忽略的安全设置，比没有这条设置更糟**——前者会让人以为自己
+/// 被保护着。
+///
+/// ## 三档的映射，以及一处必须说清的做不到
+///
+/// | 沙箱 | 映射 | 能不能真的提供 |
+/// |---|---|---|
+/// | `ReadOnly` | `RequireOsWriteIsolation` | **能** |
+/// | `WorkspaceWrite` | `ProcessOnly` | **不能**（见下） |
+/// | `DangerFullAccess` | `ProcessOnly` | 本来就不要求 |
+///
+/// **`WorkspaceWrite` 是那个做不到的。** 当前可用的机制是低完整性令牌，
+/// 它给的是"哪都写不进用户目录"，**不是"只能写工作区"**——那是另一种限制，
+/// 不是同一种限制的方向性差异。
+///
+/// 所以这里如实退回 `ProcessOnly`，而不是谎称做到了。把关由**审批门禁**
+/// 承担（那条路是好的）：使用者要为一个写命令签一次字。
+/// 回灌给模型的文本里也会写明实际达到的级别——绝不把进程内策略说成沙箱。
+///
+/// `ReadOnly` 则**真的能提供**：低完整性进程写不进中完整性对象，
+/// 而用户目录里的文件都是中完整性。拿不到这个级别时 `exec` 会**拒绝执行**，
+/// 这正是 ADR D4 要的"要求了却拿不到就拒绝"。
+fn isolation_for(sandbox: crate::policy::SandboxMode) -> IsolationRequirement {
+    match sandbox {
+        crate::policy::SandboxMode::ReadOnly => IsolationRequirement::RequireOsWriteIsolation,
+        crate::policy::SandboxMode::WorkspaceWrite
+        | crate::policy::SandboxMode::DangerFullAccess => IsolationRequirement::ProcessOnly,
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use crate::policy::SandboxMode;
+
+    #[test]
+    fn read_only_sandbox_demands_real_write_isolation() {
+        // **这是"沙箱旋钮是装饰性的"那个 bug 的回归测试。**
+        //
+        // 原先 run_command 硬编码 ProcessOnly，于是 --sandbox read-only
+        // 是一条被静默忽略的设置：使用者要了只读，拿到的是全权限。
+        assert_eq!(
+            isolation_for(SandboxMode::ReadOnly),
+            IsolationRequirement::RequireOsWriteIsolation
+        );
+    }
+
+    #[test]
+    fn danger_full_access_does_not_demand_isolation() {
+        // 使用者显式要了不受限，就不该拿隔离去挡他
+        assert_eq!(
+            isolation_for(SandboxMode::DangerFullAccess),
+            IsolationRequirement::ProcessOnly
+        );
+    }
+
+    #[test]
+    fn workspace_write_falls_back_honestly() {
+        // **这一档是真的做不到，不是我们偷懒。**
+        //
+        // 低完整性令牌给的是"哪都写不进用户目录"，不是"只能写工作区"——
+        // 另一种限制，不是同一种的方向性差异。硬套 RequireOsWriteIsolation
+        // 会让所有命令都拒绝执行，而语义上也没有真的实现"工作区可写"。
+        //
+        // 所以如实退回 ProcessOnly，把关交给审批门禁。
+        // 这条测试把这个"做不到"钉住：将来有人做出了真正的工作区级隔离，
+        // 它会先看到这里，然后知道该改什么。
+        assert_eq!(
+            isolation_for(SandboxMode::WorkspaceWrite),
+            IsolationRequirement::ProcessOnly
+        );
+    }
+
+    #[test]
+    fn every_sandbox_mode_maps_somewhere() {
+        // 穷举所有档位，保证新增档位时不会忘掉映射
+        for m in [
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::DangerFullAccess,
+        ] {
+            let _ = isolation_for(m);
+        }
+    }
+}
 /// 校验并取出 `command` 参数。
 fn command_arg(args: &Value) -> Result<Vec<String>, ToolError> {
     let Some(raw) = args.get("command") else {

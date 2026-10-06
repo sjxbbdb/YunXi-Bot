@@ -498,6 +498,12 @@ pub struct RestrictedOutcome {
     pub stderr: String,
     /// 是否因超时被强制结束。
     pub timed_out: bool,
+    /// 输出里有多少字节不是合法 UTF-8、被有损解码替换掉了。
+    ///
+    /// 原先这里只做 `from_utf8_lossy` 而**不报替换了多少**，
+    /// 于是同一类静默失效换了张脸出现：文字看起来是好的，
+    /// 但里面缺了一块，而没有任何东西能告诉调用方。
+    pub invalid_utf8_bytes: usize,
 }
 
 /// 以受限令牌启动子进程并等待其结束。
@@ -597,8 +603,8 @@ pub fn run_restricted(
             }
         });
 
-    let stdout = read_all(out_r);
-    let stderr = read_all(err_r);
+    let (stdout, out_bad) = read_all(out_r);
+    let (stderr, err_bad) = read_all(err_r);
     unsafe {
         CloseHandle(out_r);
         CloseHandle(err_r);
@@ -629,6 +635,7 @@ pub fn run_restricted(
         stdout,
         stderr,
         timed_out,
+        invalid_utf8_bytes: out_bad + err_bad,
     })
 }
 
@@ -643,7 +650,12 @@ fn pipe(sa: &mut SecurityAttributes) -> Result<(*mut c_void, *mut c_void), Token
     Ok((r, w))
 }
 
-fn read_all(handle: *mut c_void) -> String {
+/// 按字节读完一根管道，返回（文本，被替换掉的字节数）。
+///
+/// **不能只做 `from_utf8_lossy` 就完事**：那样文字看起来是好的，
+/// 但缺的那一块没有任何痕迹，调用方也无从判断这段输出可不可信。
+/// 把替换数报出来，"这段文字有损"这件事才可被程序检查。
+fn read_all(handle: *mut c_void) -> (String, usize) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -666,7 +678,9 @@ fn read_all(handle: *mut c_void) -> String {
             break;
         }
     }
-    String::from_utf8_lossy(&buf).to_string()
+    // 解码逻辑只有一份，在 `exec` 里——两处各写一份的话，
+    // 迟早有一处忘了报有损，而那正是要消灭的那类静默失效。
+    crate::exec::decode_output_lossy(&buf)
 }
 
 /// 按 Windows 命令行引用规则拼 argv。

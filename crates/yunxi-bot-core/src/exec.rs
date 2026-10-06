@@ -9,7 +9,6 @@
 //!    而不是降级为不隔离地跑。这是诚实隔离（honest isolation）的落点。
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -168,11 +167,30 @@ pub struct ExecOutcome {
     pub duration_ms: u64,
     /// 实际达到的隔离级别——如实声明。
     pub isolation: IsolationLevel,
+    /// 子进程输出里有多少字节不是合法 UTF-8、被替换掉了。
+    ///
+    /// **这个字段存在的理由是一类静默失效。** 原先这里写的是
+    /// `let _ = p.read_to_string(&mut buf)`——`read_to_string` 要求输入是
+    /// 合法 UTF-8，Windows 上一条 GBK 输出的命令就会让它返回 `Err`，
+    /// 而 `let _ =` 把错误吞掉。结果模型看到一段**空输出**，
+    /// 分不清"命令没输出"和"解码失败了"——这两种情况的下一步完全不同。
+    ///
+    /// 现在改成按字节读 + 有损解码，并**把替换掉的字节数如实报出来**：
+    /// 调用方看到 `invalid_bytes > 0` 就知道"这段文字里有一部分没解出来"。
+    pub invalid_utf8_bytes: usize,
 }
 
 impl ExecOutcome {
     pub fn succeeded(&self) -> bool {
         self.exit_code == 0 && !self.timed_out
+    }
+
+    /// 输出是不是**完整可信**的。
+    ///
+    /// 有损解码时为假。调用方在把输出交给模型之前应该看一眼这个——
+    /// 一段被替换过的输出看起来和正常输出一模一样，但内容缺了一块。
+    pub fn output_is_faithful(&self) -> bool {
+        self.invalid_utf8_bytes == 0
     }
 }
 
@@ -320,6 +338,9 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
             timed_out: out.timed_out,
             duration_ms: started.elapsed().as_millis() as u64,
             isolation: IsolationLevel::WindowsRestrictedToken,
+            // 受限令牌那条路走的是另一套管道读取，它自己也是按字节读的；
+            // 这里如实带上它报的计数，不假装是 0
+            invalid_utf8_bytes: out.invalid_utf8_bytes,
         });
     }
 
@@ -360,20 +381,8 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
     // 管道必须边跑边读：等进程结束再读会在输出超过管道缓冲时死锁
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
-    let out_handle = thread::spawn(move || {
-        let mut buf = String::new();
-        if let Some(p) = out_pipe.as_mut() {
-            let _ = p.read_to_string(&mut buf);
-        }
-        buf
-    });
-    let err_handle = thread::spawn(move || {
-        let mut buf = String::new();
-        if let Some(p) = err_pipe.as_mut() {
-            let _ = p.read_to_string(&mut buf);
-        }
-        buf
-    });
+    let out_handle = thread::spawn(move || read_pipe(out_pipe.as_mut()));
+    let err_handle = thread::spawn(move || read_pipe(err_pipe.as_mut()));
 
     let deadline = started + Duration::from_millis(opts.timeout_ms);
     let mut timed_out = false;
@@ -397,8 +406,8 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
         }
     };
 
-    let stdout = out_handle.join().unwrap_or_default();
-    let stderr = err_handle.join().unwrap_or_default();
+    let (stdout, out_bad) = out_handle.join().unwrap_or_default();
+    let (stderr, err_bad) = err_handle.join().unwrap_or_default();
 
     let exit_code = status.and_then(|s| s.code()).unwrap_or(-1);
 
@@ -411,7 +420,66 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
         // 报告**实际达到**的级别，而不是"平台理论上支持的"。Job 建失败时
         // 这里会如实回落到 ProcessOnly，不会把没做到的说成做到了。
         isolation: effective_level,
+        invalid_utf8_bytes: out_bad + err_bad,
     })
+}
+
+/// 读完一根管道，返回（文本，被替换掉的字节数）。
+///
+/// ## 为什么不是 `read_to_string`
+///
+/// 因为 `read_to_string` **要求整段都是合法 UTF-8**。Windows 上一条
+/// GBK 输出的命令（`chcp 936` 的老工具、不少 .NET CLI）会让它返回 `Err`——
+/// 而原先这里是 `let _ = p.read_to_string(&mut buf)`，
+/// **错误被吞掉，`buf` 只保留出错前读到的部分（可能完全是空的）**。
+///
+/// 后果很隐蔽：模型看到一段空输出，分不清"命令没输出"和"解码失败了"。
+/// 前者该换个命令，后者该换个解编码方式——**两种情况的下一步完全不同，
+/// 而它看到的是同一个东西。**
+///
+/// 现在按字节读、有损解码，并把替换掉的字节数报给调用方。
+/// 信息不会丢：解不出来的部分变成 U+FFFD（肉眼可见的"这里有问题"），
+/// 而 [`ExecOutcome::invalid_utf8_bytes`] 让这件事**可被程序检查**。
+fn read_pipe(pipe: Option<&mut impl std::io::Read>) -> (String, usize) {
+    let Some(p) = pipe else {
+        return (String::new(), 0);
+    };
+    let mut raw = Vec::new();
+    // 读错误仍然吞掉（管道另一头被杀等），但**解码问题不再吞**
+    let _ = p.read_to_end(&mut raw);
+    decode_output_lossy(&raw)
+}
+
+/// 有损解码并统计被替换掉的字节数。
+///
+/// **这是内核里唯一一份输出解码实现。** 正常路径（`exec`）和受限令牌路径
+/// （`win_token`）都用它——两处各写一份的话，迟早有一处忘了报有损，
+/// 而那正是这个函数要消灭的那类静默失效。
+///
+/// 逐段推进 `from_utf8` 的错误位置，而不是按 `> 0x7F` 粗算——
+/// 后者会把**合法的中文**也算成坏的（中文每个字节都 > 0x7F）。
+pub(crate) fn decode_output_lossy(buf: &[u8]) -> (String, usize) {
+    if std::str::from_utf8(buf).is_ok() {
+        return (String::from_utf8_lossy(buf).into_owned(), 0);
+    }
+    let mut bad = 0usize;
+    let mut rest = buf;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(_) => break,
+            Err(e) => {
+                let valid = e.valid_up_to();
+                let skip = e.error_len().unwrap_or(rest.len() - valid);
+                bad += skip;
+                let next = valid + skip;
+                if next >= rest.len() {
+                    break;
+                }
+                rest = &rest[next..];
+            }
+        }
+    }
+    (String::from_utf8_lossy(buf).into_owned(), bad)
 }
 
 #[cfg(test)]
@@ -423,6 +491,97 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    // ---- 输出解码：静默失效的回归测试 ----
+
+    #[test]
+    fn valid_utf8_output_is_not_flagged() {
+        // 正常情况不该被误报——这条是防"修一个 bug 引入另一个"的
+        let (s, bad) = decode_probe("hello 世界".as_bytes());
+        assert_eq!(s, "hello 世界");
+        assert_eq!(bad, 0, "合法 UTF-8 不该报有损");
+    }
+
+    #[test]
+    fn gbk_output_is_decoded_lossily_and_flagged() {
+        // **这是那个静默失效的回归测试。**
+        //
+        // 0xB2 0xE2 0xCA 0xD4 是 GBK 的"测试"，不是合法 UTF-8。
+        // 原先 `let _ = p.read_to_string(&mut buf)` 会让这段变成**空输出**，
+        // 而错误被吞掉——模型分不清"命令没输出"和"解码失败了"。
+        //
+        // 现在：内容以 U+FFFD 的形式可见（肉眼能看出这里有问题），
+        // 且**字节数可被程序检查**。
+        let gbk = [0xB2u8, 0xE2, 0xCA, 0xD4];
+        let (s, bad) = decode_probe(&gbk);
+        assert!(!s.is_empty(), "解不出来也不能变成空输出——那就回到了老 bug");
+        assert!(s.contains('\u{FFFD}'), "坏字节要变成可见的替换字符");
+        assert_eq!(bad, 4, "四个坏字节都要被数出来");
+    }
+
+    #[test]
+    fn loss_count_ignores_valid_multibyte_characters() {
+        // **不能按 `> 0x7F` 粗算**：中文每个字节都 > 0x7F，
+        // 那样数出来的"坏字节"会把一段完全正常的中文全算进去。
+        let mixed = "中文".as_bytes().to_vec();
+        let mut with_bad = mixed.clone();
+        with_bad.extend_from_slice(&[0xFFu8, 0xFE]);
+        let (s, bad) = decode_probe(&with_bad);
+        assert!(s.starts_with("中文"));
+        assert_eq!(bad, 2, "只该数真正非法的两个字节，不该把中文算进去");
+    }
+
+    #[test]
+    fn a_clean_command_reports_faithful_output() {
+        // `output_is_faithful` 是给调用方判断"这段输出能不能直接交给模型"用的
+        let out = run_command(&echo_cmd(), &fast_opts());
+        let out = out.expect("echo 该能跑");
+        assert!(out.output_is_faithful(), "普通命令的输出该是完整可信的");
+        assert_eq!(out.invalid_utf8_bytes, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_gbk_emitting_command_keeps_its_output_and_flags_it() {
+        // **真机验证。** 用 PowerShell 直接吐 GBK 字节，
+        // 走完整条执行链路，确认输出不再被静默丢掉。
+        let cmd = vec![
+            "powershell".to_string(),
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            "[Console]::OpenStandardOutput().Write([byte[]](0xB2,0xE2,0xCA,0xD4),0,4)".to_string(),
+        ];
+        let out = run_command(&cmd, &fast_opts()).expect("该能跑");
+        assert_eq!(out.exit_code, 0);
+        assert!(
+            !out.stdout.is_empty(),
+            "**这就是老 bug：GBK 输出会变成空字符串**"
+        );
+        assert!(out.invalid_utf8_bytes > 0, "该如实报出有损解码");
+        assert!(!out.output_is_faithful());
+    }
+
+    #[cfg(windows)]
+    fn echo_cmd() -> Vec<String> {
+        vec!["cmd".to_string(), "/c".to_string(), "echo hi".to_string()]
+    }
+
+    #[cfg(not(windows))]
+    fn echo_cmd() -> Vec<String> {
+        vec!["echo".to_string(), "hi".to_string()]
+    }
+
+    fn fast_opts() -> ExecOptions {
+        ExecOptions {
+            timeout_ms: 15_000,
+            ..Default::default()
+        }
+    }
+
+    /// 直接测**真的那个**解码函数，不派生进程、不复制逻辑。
+    fn decode_probe(bytes: &[u8]) -> (String, usize) {
+        decode_output_lossy(bytes)
     }
 
     #[test]
