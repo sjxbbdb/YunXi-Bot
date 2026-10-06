@@ -22,6 +22,11 @@ pub mod instance;
 pub mod job;
 pub mod ledger;
 pub mod memory;
+pub mod notify;
+/// Windows toast 后端。**不在非 Windows 平台上编译**——它依赖 PowerShell + WinRT，
+/// 在没有它们的平台上放一个永远返回失败的实现只会制造噪音。
+#[cfg(windows)]
+pub mod notify_windows;
 pub mod policy;
 pub mod runner;
 pub mod task;

@@ -96,6 +96,9 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --provider <名>       强制全程用一个模型：agnes / deepseek
       --thinking <模式>      auto（默认，按任务类型）/ on / off
       --id <名字>           指定任务 id（默认自动生成）
+  yunxi-bot notify \"<标题>\" [\"<正文>\"]  发一条桌面通知（同时验证通知出口通不通）
+      --tag <标签>          替换同类通知而不是堆积
+      --console             强制走控制台出口（验证出口可换）
   yunxi-bot tools             列出工具及其能力类别（不需要模型）
   yunxi-bot tasks             列出执行框架里的任务及其步骤
   yunxi-bot tasks <id>        看一个任务的步骤明细
@@ -182,6 +185,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "do" => cmd_do(rest),
         "tasks" => cmd_tasks(rest),
         "tools" => cmd_tools(rest),
+        "notify" => cmd_notify(rest),
         "resume" => cmd_resume(rest),
         "cost" => cmd_cost(rest),
         "log" => cmd_log(rest),
@@ -1439,6 +1443,74 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             println!("结果      : 中途返回（{settled}/{total}）—— 这不该发生，请报告");
             Ok(1)
         }
+    }
+}
+
+/// 发一条桌面通知。**同时是"通知出口"的验证入口。**
+///
+/// 它存在的理由不只是"方便测"：使用者需要一条能**自己确认出口通不通**的命令。
+/// 一个助理说"我通知你了"，你得有办法核实——否则你只能信它。
+///
+/// 输出里会明确区分「已确认送达」和「已交给系统但未确认可见」，
+/// 因为**勿扰/专注助手开着时，通知仍然会进通知中心，只是不弹横幅**。
+/// 把这两种情况说成同一件事，就是虚报。
+fn cmd_notify(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::notify::{ConsoleNotifier, Notification, Notifier, Urgency};
+
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let Some(title) = positional.first() else {
+        eprintln!("用法: yunxi-bot notify \"<标题>\" [\"<正文>\"] [--tag <标签>] [--console]");
+        eprintln!();
+        eprintln!("标题和正文都会显示在通知上。--tag 用于替换同类通知（不再堆积）。");
+        return Ok(2);
+    };
+    let body = positional.get(1).map(|s| s.as_str()).unwrap_or("");
+
+    let urgency = match flag(args, "--urgency").unwrap_or("normal") {
+        "low" => Urgency::Low,
+        "normal" => Urgency::Normal,
+        "high" => Urgency::High,
+        other => {
+            eprintln!("未知紧急程度 {other}，可用: low / normal / high");
+            return Ok(2);
+        }
+    };
+
+    let mut n = Notification::new((*title).clone(), body).with_urgency(urgency);
+    if let Some(t) = flag(args, "--tag") {
+        n = n.with_tag(t);
+    }
+
+    // `--console` 强制走控制台出口：在没有通知能力的环境里（CI、远程会话），
+    // 这一条是唯一能确认的出口。它也顺带证明"出口可换"这件事是真的。
+    let backend: Box<dyn Notifier> = if args.iter().any(|a| a == "--console") {
+        Box::new(ConsoleNotifier)
+    } else {
+        #[cfg(windows)]
+        {
+            Box::new(yunxi_bot_core::notify_windows::WindowsToast::new())
+        }
+        #[cfg(not(windows))]
+        {
+            Box::new(yunxi_bot_core::notify::NullNotifier)
+        }
+    };
+
+    println!("出口      : {}", backend.name());
+    let d = backend.notify(&n);
+    println!("结果      : {}", d.label());
+    println!("详情      : {}", d.detail());
+    println!();
+    if d.can_claim_user_notified() {
+        println!("可以这样说：通知你了。");
+        Ok(0)
+    } else if d.left_the_process() {
+        println!("只能这样说：通知已经交给系统，但**无法确认你看见**。");
+        println!("（勿扰/专注助手开着时就是这种情况：进了通知中心，不弹横幅。）");
+        Ok(3)
+    } else {
+        println!("**没有送达。** 调用方必须换一条出口，不能当作已通知。");
+        Ok(1)
     }
 }
 
