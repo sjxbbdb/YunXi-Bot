@@ -217,6 +217,23 @@ fn resident_memory_block(home: &std::path::Path) -> String {
     yunxi_bot_core::think::prompt::build_memory_block(&entries, &version)
 }
 
+/// 一回合的诊断数据。
+///
+/// **打包成一个结构而不是八个位置参数**：八个参数里把 `lexical_n` 和
+/// `semantic_n` 传反了，编译器一句话都不会说，而输出看起来一切正常。
+/// 具名字段让这种错写不出来。
+struct TurnDiag<'a> {
+    input_chars: usize,
+    need: yunxi_bot_core::recall_gate::MemoryNeed,
+    /// 门控的结论是**决策模型**给的吗（还是关键词直接判的）。
+    gate_by_model: bool,
+    lexical_n: usize,
+    semantic_n: usize,
+    both_n: usize,
+    echoed: usize,
+    selected: Option<&'a [String]>,
+}
+
 impl ChatHandler {
     /// `persona_text` 与 `rules` 来自配置；它们会被拼进稳定前缀。
     ///
@@ -381,6 +398,59 @@ impl ChatHandler {
         self.converse(routing, Intent::Chat, volatile, CHAT_MAX_TOKENS, records)
     }
 
+    /// 一回合的**脱敏**召回诊断。
+    ///
+    /// ## 为什么要有它
+    ///
+    /// 研究文档 §4.7 点出了两个现存问题："**抽取命中率不清楚、没有诊断**"
+    /// 和"**召回 0 命中不知原因**"。而这两个问题在真机上我都撞到过：
+    ///
+    /// - D76 那次"任务跑完了但文件没改"——**它那一步判了什么、召回了什么，
+    ///   一个字都没留下**，所以到现在还没查清
+    /// - D82 的门控判了什么，也只能从行为反推
+    ///
+    /// **先有观测，才谈得上查。**
+    ///
+    /// ## 默认不打印，而且不打印正文
+    ///
+    /// 用环境变量 `YUNXI_BOT_MEMORY_DEBUG=1` 开关。两个理由：
+    ///
+    /// 1. **每轮都打会淹没对话**——它是查问题用的，不是日常输出
+    /// 2. **它含私人内容**。默认打的话会进终端回滚、进日志、进截图。
+    ///    所以这里**只打 id 和类别，不打正文**——id 足够回答
+    ///    "是哪一条"，而正文要看该去 `yunxi-bot memory`
+    ///
+    /// 这个区分不是洁癖：**日志里出现过的私人信息就收不回来了**，
+    /// 而排查绝大多数时候只需要知道"是哪一条"。
+    fn diag(d: TurnDiag<'_>) {
+        if std::env::var("YUNXI_BOT_MEMORY_DEBUG").is_err() {
+            return;
+        }
+        // 输入本身也可能含私人内容，所以只报长度和门控结果
+        eprintln!("[记忆] 这轮问题 {} 字", d.input_chars);
+        eprintln!(
+            "[记忆] memory_decision: {}   （由{}判定）",
+            d.need.label(),
+            if d.gate_by_model {
+                "决策模型"
+            } else {
+                "关键词"
+            }
+        );
+        eprintln!(
+            "[记忆] lexical_candidates {} / dense_candidates {} / 两路都中 {}",
+            d.lexical_n, d.semantic_n, d.both_n
+        );
+        eprintln!("[记忆] 因已在上下文里而不重复注入 {} 条", d.echoed);
+        match d.selected {
+            Some(ids) if !ids.is_empty() => {
+                eprintln!("[记忆] selected_ids: {}", ids.join(", "));
+                eprintln!("[记忆] （只看正文：yunxi-bot memory --search <词>）");
+            }
+            _ => eprintln!("[记忆] selected_ids: 无（fallback: no_match）"),
+        }
+    }
+
     /// 拿不准时问决策模型："这句话要不要去查关于他的记忆。"
     ///
     /// 返回 `None` 表示**问不出来**——没有决策器、调用失败、或者模型
@@ -465,14 +535,26 @@ impl ChatHandler {
         //
         // 模型失败/超时/给出听不懂的选项时**退回关键词的判断**——
         // 门控是优化，不是对话能不能进行的前提。
+        let from_keyword = need;
         let need = if need == yunxi_bot_core::recall_gate::MemoryNeed::Mixed {
             self.gate_with_model(input).unwrap_or(need)
         } else {
             need
         };
+        let gate_by_model = need != from_keyword;
         if !need.needs_recall() {
-            // `none`：问的是世界，不是使用者，不去翻私人记忆
-            // `profile`：画像和常驻层**已经在稳定前缀里**了，再召一次是重复占位
+            // **不召回也要留痕。** "它怎么没去查记忆"和"查了没找到"
+            // 是两件事，只记后者的话前者永远说不清。
+            Self::diag(TurnDiag {
+                input_chars: input.chars().count(),
+                need,
+                gate_by_model,
+                lexical_n: 0,
+                semantic_n: 0,
+                both_n: 0,
+                echoed: 0,
+                selected: None,
+            });
             return input.to_string();
         }
 
@@ -494,9 +576,29 @@ impl ChatHandler {
             RECALL_BUDGET_CHARS,
             &std::collections::HashMap::new(),
         );
+        use yunxi_bot_core::memory::{RecallRoute, RecallVia};
+        let lexical_n = hits
+            .iter()
+            .filter(|h| h.via == RecallVia::Lexical || h.via == RecallVia::Both)
+            .count();
+        let semantic_n = hits
+            .iter()
+            .filter(|h| h.via == RecallVia::Semantic || h.via == RecallVia::Both)
+            .count();
+        let both_n = hits.iter().filter(|h| h.via == RecallVia::Both).count();
+        let echoed = hits
+            .iter()
+            .filter(|h| h.route == RecallRoute::Picked)
+            .filter(|h| {
+                self.sessions
+                    .get(&key)
+                    .is_some_and(|l| l.history_mentions(&h.entry.text))
+            })
+            .count();
+
         let picked: Vec<&yunxi_bot_core::memory::MemoryEntry> = hits
             .iter()
-            .filter(|h| h.route == yunxi_bot_core::memory::RecallRoute::Picked)
+            .filter(|h| h.route == RecallRoute::Picked)
             // **已经在历史里的不再注入。**
             .filter(|h| {
                 self.sessions
@@ -505,6 +607,22 @@ impl ChatHandler {
             })
             .map(|h| h.entry)
             .collect();
+
+        let ids: Vec<String> = picked
+            .iter()
+            .map(|e| format!("{}:{}", e.kind.state_key(), e.id))
+            .collect();
+        Self::diag(TurnDiag {
+            input_chars: input.chars().count(),
+            need,
+            gate_by_model,
+            lexical_n,
+            semantic_n,
+            both_n,
+            echoed,
+            selected: Some(&ids),
+        });
+
         if picked.is_empty() {
             return input.to_string();
         }
