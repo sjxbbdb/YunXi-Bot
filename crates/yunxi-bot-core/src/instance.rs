@@ -64,6 +64,7 @@ pub fn is_process_alive(pid: u32) -> bool {
             dw_process_id: u32,
         ) -> *mut core::ffi::c_void;
         fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
+        fn GetLastError() -> u32;
     }
 
     if pid == 0 {
@@ -73,30 +74,34 @@ pub fn is_process_alive(pid: u32) -> bool {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            // 拿不到句柄有两种可能：进程不存在，或权限不足。
-            // 权限不足时说明进程确实在（只是不归我们管），所以再用 tasklist 兜一次。
-            return process_listed_by_tasklist(pid);
+            // **拿不到句柄有两种可能，而 `GetLastError()` 直接说清了是哪一种。**
+            //
+            // 这里原来是用 `tasklist` 兜底的——**那是个严重的问题**：
+            // 真机上 `tasklist /FI "PID eq 4"`（PID 4 是内核进程，
+            // `OpenProcess` 打不开）**会挂五分钟以上**。
+            // 而这段代码在 `InstanceLock::acquire` 里，
+            // 也就是**启动路径上**：一个"活没活"的探测把启动卡住几分钟。
+            //
+            // 那个卡顿还伪装成了测试失败——`refuses_when_lock_held_by_a_live_process`
+            // 报的是"没拒绝"，实际是"探测还没回来"。**查了半天才看出是它。**
+            //
+            // 而这两件事根本不需要外部命令：
+            // - **拒绝访问** → 进程存在，只是不归我们管 → **活着**
+            // - **参数无效** → 这个 PID 不存在 → **死了**
+            const ERROR_ACCESS_DENIED: u32 = 5;
+            const ERROR_INVALID_PARAMETER: u32 = 87;
+            let code = GetLastError();
+            return match code {
+                ERROR_ACCESS_DENIED => true,
+                ERROR_INVALID_PARAMETER => false,
+                // **说不清的时候按"活着"算。**
+                // 接管一个活进程持有的锁 = 两个实例同时写同一个 home，
+                // 那比"多拒绝启动一次"坏得多。
+                _ => true,
+            };
         }
         CloseHandle(handle);
         true
-    }
-}
-
-/// 兜底探测。只在 `OpenProcess` 失败时调用，避免常态下多起一个进程。
-#[cfg(windows)]
-fn process_listed_by_tasklist(pid: u32) -> bool {
-    let out = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .stdin(std::process::Stdio::null())
-        .output();
-    match out {
-        Ok(o) => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            // tasklist 找不到时输出 "信息: 没有运行的任务匹配指定标准。"
-            text.contains(&pid.to_string()) && !text.contains("没有运行")
-        }
-        // 探测本身失败：保守认为活着，避免重复启动
-        Err(_) => true,
     }
 }
 
