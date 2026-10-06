@@ -140,10 +140,10 @@ def main() -> int:
         # 先改文件、后面才遇到决策步骤。**断言写宽了会把正确行为判成错的**
         # （同一个坑在 human_answer 那条测试上刚踩过一次）。
 
-        if not m:
-            # 分支 B：它自己跑完了
+        if not m or decider_took_over:
+            # 分支 B：它自己跑完了（可能是决策模型接管的）
             print()
-            print("=== 没有决策步骤，任务自己跑完了 ===")
+            print("=== 决策模型接管 / 没有决策步骤，任务自己跑完了 ===")
             final = (work / "src" / "billing.py").read_text(encoding="utf-8")
             print(f"      billing.py 现在 {len(final.splitlines())} 行")
             check("**文件没被截断**", len(final.splitlines()) >= 10)
@@ -164,8 +164,25 @@ def main() -> int:
         state_out = (rt.stdout or "") + (rt.stderr or "")
         state_line = next((x for x in state_out.splitlines() if "状态" in x), "")
         print(f"      {state_line.strip()}")
-        check("**停在「等人工」而不是「卡住」**", "等人工" in state_out,
-              "变「卡住」的话人就再也答不上了——那正是 D44 的坑")
+        # **两种结局都算通过。**
+        #
+        # 这条断言是**决策模型缺席**时写的：那时每个 `decide:` 步骤都只能
+        # 升级人工，所以"停在等人工"是唯一正确的表现。
+        #
+        # 决策模型跑起来之后（Verdict sidecar，见 D74），**它能自己拍板**——
+        # 于是任务一路跑完、一次人都没问。那**恰恰是我们要的**：
+        # "非必要的时候决策模型接管，必要的时候人工介入"。
+        #
+        # 所以这里判的是"**它有没有走完**"，而不是"它有没有停下来问人"。
+        # 断言写的是当时的产品行为，而产品变好之后它就变成了错的。
+        decider_took_over = "完成" in state_out
+        check(
+            "**要么跑完、要么停在「等人工」**",
+            decider_took_over or ("等人工" in state_out),
+            "变「卡住」的话人就再也答不上了——那正是 D44 的坑",
+        )
+        if decider_took_over:
+            print("      （决策模型自己拍板了，未升级人工——这是预期内的）")
 
         # ================= 给答案 + 授权写入 =================
         print()
