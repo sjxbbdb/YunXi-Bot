@@ -522,6 +522,23 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             return Ok(StepRun::Settled);
         }
 
+        // **人的答案优先于一切重试计数。**
+        //
+        // 位置很要紧：必须在下面那个"重试次数用尽"的检查**之前**。
+        //
+        // 真机上踩过：决策步骤因为决策模型反复弃权，两次尝试用光成了 Failed；
+        // 人随后用 `resume --answer` 给了答案，答案也记进台账了，
+        // **可这一步还是被判失败**——因为引擎先看尝试次数，
+        // 根本没走到"有没有人答过"那一步。
+        //
+        // 人已经拍板了，这一步就该收尾。**重试计数是给模型用的，
+        // 不是给人的。**
+        if step.instruction.trim_start().starts_with(DECIDE_PREFIX)
+            && let Some(answer) = self.human_answer(task_id, step_id)
+        {
+            return self.settle_human_answer(task_id, &step, &answer);
+        }
+
         // 重试次数用尽 → 这一步判失败
         if step.attempts >= self.budget.max_attempts_per_step {
             self.store.write(
@@ -577,6 +594,8 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
         // 决策点走另一条路
         if let Some(question) = step.instruction.strip_prefix(DECIDE_PREFIX) {
             let question = question.trim().to_string();
+            // 人的答案已经在上面（重试计数之前）查过了——那里是唯一的检查点，
+            // 两处各查一遍的话，"哪一处先生效"迟早漂移。
             return self.run_decision(self.decider, task_id, &step, &question, ledger, records);
         }
 
@@ -666,6 +685,41 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
     /// 决策层用 `&dyn Decider` 传进来而不是从 `self.decider` 取：
     /// `self` 同时被 `handler`（可变）和 `store`（可变）借着，
     /// 从 `self` 里再借一个字段出来会和它们打架。显式传参把借用关系摆明了。
+    /// 人已经就这一步给过答案吗。**取最新的一条。**
+    ///
+    /// 取最新而不是第一条：人可能改主意，而"最后说的那句话"才算数。
+    fn human_answer(&self, task_id: &str, step_id: &str) -> Option<String> {
+        self.store
+            .human_answer(task_id, step_id)
+            .filter(|a| !a.trim().is_empty())
+    }
+
+    /// 用人的答案把这一步收尾。
+    ///
+    /// 产物形状**和决策模型选了某个选项时一致**，只是多了一个
+    /// `source: "human"`——事后回看要能分清"这是模型选的"还是"人定的"，
+    /// 那两种的可信度完全不同。
+    fn settle_human_answer(
+        &mut self,
+        task_id: &str,
+        step: &Step,
+        answer: &str,
+    ) -> Result<StepRun, TaskError> {
+        let result = serde_json::json!({
+            "choice": answer,
+            "rationale": "人工给出",
+            "alternatives": [],
+            "source": "human",
+        })
+        .to_string();
+        self.store.write(
+            task_id,
+            EventKind::StepSucceeded,
+            serde_json::json!({ "task": task_id, "step": step.id, "result": result }),
+        )?;
+        Ok(StepRun::Settled)
+    }
+
     fn run_decision(
         &mut self,
         decider: &dyn Decider,
@@ -879,6 +933,15 @@ pub trait TaskStore {
     fn record_cost(&mut self, _rec: &CallRecord) -> Result<(), TaskError> {
         Ok(())
     }
+
+    /// **人已经就某个决策步骤给过答案吗。**
+    ///
+    /// 有默认实现（返回 `None`），于是不落盘的 store 不必实现它。
+    /// 但真正落盘的那两个必须实现——**不实现就等于"人工介入是死路"**，
+    /// 而那正是加这个方法的理由。
+    fn human_answer(&self, _task_id: &str, _step_id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// 基于台账的实现。**唯一的事实来源。**
@@ -901,7 +964,37 @@ impl LedgerTaskStore {
     }
 }
 
+/// 从一串事件里找"人给这一步的答案"。**取最新的一条。**
+///
+/// 取最新而不是第一条：**人可能改主意，而最后说的那句才算数。**
+/// 两个 store 共用这一个实现——两处各写一遍的话，
+/// "取第一条还是最后一条"这种细节迟早漂移。
+fn human_answer_in(
+    events: &[crate::ledger::Event],
+    task_id: &str,
+    step_id: &str,
+) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find(|e| {
+            e.kind == EventKind::HumanAnswered
+                && e.data.get("task").and_then(|v| v.as_str()) == Some(task_id)
+                && e.data.get("step").and_then(|v| v.as_str()) == Some(step_id)
+        })
+        .and_then(|e| {
+            e.data
+                .get("answer")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+}
+
 impl TaskStore for LedgerTaskStore {
+    fn human_answer(&self, task_id: &str, step_id: &str) -> Option<String> {
+        human_answer_in(self.ledger.events(), task_id, step_id)
+    }
+
     fn write(
         &mut self,
         _task_id: &str,
@@ -954,6 +1047,10 @@ impl MemoryTaskStore {
 }
 
 impl TaskStore for MemoryTaskStore {
+    fn human_answer(&self, task_id: &str, step_id: &str) -> Option<String> {
+        human_answer_in(&self.events, task_id, step_id)
+    }
+
     fn write(
         &mut self,
         _task_id: &str,

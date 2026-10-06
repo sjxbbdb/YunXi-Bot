@@ -2967,6 +2967,71 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         return Ok(0);
     }
     if t.state == TaskState::AwaitingHuman {
+        // **先把人的答案落进台账，再把状态放回执行中。**
+        //
+        // 顺序不能反：状态一变成 running，引擎下一轮就会去看
+        // "这一步有没有人答过"。先放状态、后写答案的话，
+        // 那一次仍然会走到决策模型，又弃权一次。
+        //
+        // 而在此之前根本没有这一步——`resume` 只改状态，
+        // **没有地方接人的决定**，于是同一个 decide 步骤
+        // 反复问、反复弃权，**死循环**。
+        if let Some(answer) = flag(args, "--answer") {
+            // 答案要落到**具体哪一步**上。人可能是在回答任务里
+            // 第一个待决的决策步骤——把它找出来。
+            let target = t
+                .steps
+                .iter()
+                .find(|st| {
+                    st.state != yunxi_bot_core::task::StepState::Succeeded
+                        && st
+                            .instruction
+                            .trim_start()
+                            .starts_with(yunxi_bot_core::task::engine::DECIDE_PREFIX)
+                })
+                .map(|st| st.id.clone());
+            match target {
+                Some(step_id) => {
+                    store.write(
+                        id,
+                        EventKind::HumanAnswered,
+                        serde_json::json!({
+                            "task": id,
+                            "step": step_id,
+                            "answer": answer,
+                        }),
+                    )?;
+                    // **还要把这一步放回待执行。**
+                    //
+                    // 只记答案不够：这个步骤很可能已经因为"反复弃权"
+                    // 把尝试次数用光、成了 Failed——而引擎不会再选它。
+                    // 于是答案记下了，任务却仍然卡着。
+                    //
+                    // 人给了答案 = **这一步重新开始**，所以连重试次数一起重置。
+                    if let Some(st) = t.steps.iter().find(|x| x.id == step_id) {
+                        store.write(
+                            id,
+                            EventKind::StepPending,
+                            serde_json::json!({
+                                "task": id,
+                                "step": st.id,
+                                "instruction": st.instruction,
+                                "kind": st.kind,
+                                "depends_on": st.depends_on,
+                            }),
+                        )?;
+                    }
+                    println!("已记下你对步骤 {step_id} 的决定：{answer}");
+                }
+                None => {
+                    // **不静默丢弃。** 人以为答案交上去了，而系统没用它——
+                    // 那比报错更糟：他会等一个永远不会发生的结果。
+                    eprintln!("这个任务现在没有待决的决策步骤，--answer 没被用上。");
+                    eprintln!("用 `yunxi-bot tasks {id}` 看看它在等什么。");
+                    return Ok(2);
+                }
+            }
+        }
         // 人处理完了，把状态放回执行中，剩下的交给引擎
         store.write(
             id,
@@ -2977,6 +3042,9 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             "已把任务 {id} 从「{}」放回执行中。",
             TaskState::AwaitingHuman.label()
         );
+        if flag(args, "--answer").is_none() {
+            println!("（没给 --answer：如果它在等一个决策，会再问一次。）");
+        }
     }
 
     let budget = Budget {
