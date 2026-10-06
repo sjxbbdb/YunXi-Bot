@@ -132,6 +132,12 @@ def one_run(bin_path: str, real_home: Path, index: int) -> dict:
         # "40% 变 60%" 说明不了什么；"失败的**原因换了一种**"才是真信息：
         # 那说明上一个原因修掉了、而下面是另一个。
         failures = []
+        # **工具循环打转时要看得见它那 8 轮干了什么。**
+        #
+        # 报"跑了 8 轮仍未结束"只说了一个结论——而"每一轮调了什么工具、
+        # 拿到什么结果、为什么没收敛"才是能改的东西。
+        # 台账里有 `tool_called`，把它按步归拢起来。
+        tool_rounds: dict[str, list[str]] = {}
         ledger = home / "ledger.jsonl"
         if ledger.exists():
             for line in ledger.read_text(encoding="utf-8").splitlines():
@@ -141,6 +147,15 @@ def one_run(bin_path: str, real_home: Path, index: int) -> dict:
                 try:
                     e = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if e.get("kind") == "tool_called":
+                    d = e.get("data") or {}
+                    # **台账里没有 step 字段**——只有 tool / decision /
+                    # executed / outcome。所以按顺序收，不做"哪一步"的归类：
+                    # 对一个"原地打转"的问题，"它连续调了什么"就够了。
+                    tool_rounds.setdefault("all", []).append(
+                        f"{d.get('tool')}[{d.get('decision')}]"
+                    )
                     continue
                 if e.get("kind") != "step_failed":
                     continue
@@ -155,6 +170,7 @@ def one_run(bin_path: str, real_home: Path, index: int) -> dict:
             "rate_limited": "超出速率限制" in out,
             "lines": len(final.splitlines()),
             "failures": failures,
+            "tool_rounds": tool_rounds,
         }
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -181,6 +197,12 @@ def main() -> int:
         print(f"  第 {i} 次 {mark}  状态={r['state']}  文件 {r['lines']} 行{extra}{rate}")
         for f in r["failures"]:
             print(f"          ✗ {f}")
+            # 工具循环那类失败——把它调过什么打出来
+            if "工具循环" in f:
+                calls = r.get("tool_rounds", {}).get("all", [])
+                if calls:
+                    print(f"             这一轮共调工具 {len(calls)} 次，最后 12 次："
+                          f"{' -> '.join(calls[-12:])}")
 
     ok = sum(1 for r in results if r["fixed"])
     destroyed = sum(1 for r in results if r["destroyed"])
