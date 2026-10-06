@@ -92,8 +92,28 @@ def one_run(bin_path: str, real_home: Path, index: int) -> dict:
         out = (r.stdout or "") + (r.stderr or "")
 
         final = (work / "src" / "billing.py").read_text(encoding="utf-8")
-        fixed = ">= DISCOUNT_THRESHOLD" in final
-        destroyed = len(final.splitlines()) < 10
+        lines = len(final.splitlines())
+
+        # **"改对了"这个判据原来是松的：只看那个字符串在不在。**
+        #
+        # 松判据的代价在真机上出现过：有一次跑出 **24 行**（原本 19），
+        # 模型往 `billing.py` 里塞了别的东西，而判据照样报"✓"。
+        # **那等于把"它顺手改坏了别的"算成了成功。**
+        #
+        # 现在四道一起过：
+        #   1. 修复真的在（`>=` 那一处）
+        #   2. **结构没被破坏**——两个函数签名都还在
+        #   3. **没被塞进多余的东西**——行数不该比原来多
+        #   4. 也没被砍掉（行数不该少太多）
+        fixed = (
+            ">= DISCOUNT_THRESHOLD" in final
+            and "def subtotal(plan: str, seats: int) -> int:" in final
+            and "def total(plan: str, seats: int) -> int:" in final
+            and lines <= 21
+            and lines >= 15
+        )
+        # "毁掉"的判据也收紧：不只"变得很短"，**结构丢了**也算
+        destroyed = lines < 15 or "def total(" not in final
 
         # 状态：任务跑到终态了吗
         m = re.search(r"yunxi-bot resume ([^\s`]+)", out)
