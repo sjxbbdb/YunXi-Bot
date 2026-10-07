@@ -20,6 +20,10 @@ dist/
 
 # Python 虚拟环境（含 torch，约 1GB，绝不入库）
 .venv/
+# 便携盘上的 Python 环境。`安装Python环境.cmd` 建在盘里（`python\`），
+# 装上 CUDA 版 torch 之后约 4 GB。**它必须留在盘上、绝不能入库**——
+# 一次 `git add -A` 就会把 4 GB 推进 GitHub。
+python/
 __pycache__/
 *.pyc
 
