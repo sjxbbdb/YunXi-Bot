@@ -115,6 +115,17 @@ class Report:
 
 
 def main():
+    # **报告里有 ✓/✗，而 Windows 上 Python 默认按 GBK 编码 stdout。**
+    # 第一版没这一行，结果检查全跑完了、打印时才崩：
+    #   UnicodeEncodeError: 'gbk' codec can't encode character '\u2713'
+    # **一个连自己的报告都打不出来的工具，比没有工具更浪费时间**——
+    # 那些检查其实都做了，却一条也看不到。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
     rep = Report()
     home = Path(tempfile.mkdtemp(prefix="e2e-home-"))
     work = Path(tempfile.mkdtemp(prefix="e2e-proj-"))
