@@ -2391,7 +2391,123 @@ fn open_decider(args: &[String]) -> (Ledger, yunxi_bot_core::decide::LayaDecider
     (ledger, decider, alive)
 }
 
+/// 决策模型的默认端口。
+const DECIDER_PORT: u16 = 17870;
+
+/// **确保决策模型在跑；不在就拉起来。**
+///
+/// ## 为什么这件事要我们自己保证，而不是写进文档
+///
+/// 决策模型不在时，整条链路会**静默降级**，而降级之后看起来都像正常：
+///
+/// - 会话输入的分类退回"永远是闲聊"——走的还是免费端点，**看着没问题**
+/// - 任务中途的决策退回"总是升级人工"——**看着像它拿不准**
+///
+/// 两种都不报错。真机上撞过两次：D104 它线程耗尽死掉、
+/// D106 重启之后模型没加载起来。**两次都是"功能还在，但退化了"。**
+///
+/// 所以"记得先把它拉起来"这种话不该写在文档里——**该由代码保证。**
+///
+/// ## 起不来的时候要说出来
+///
+/// 拉不起来就**在 stderr 上明说**（D105 那条：让"它不在"能被看见）。
+/// 不说的话，使用者只会觉得"今天它怎么老是要我拍板"。
+fn ensure_decider_running() {
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, DECIDER_PORT));
+    // 已经在跑就别动它——**不重启一个健康的东西**（重启要重新加载
+    // 465 MB 权重，几十秒）。
+    if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+        return;
+    }
+
+    let Some(script) = sidecar_script() else {
+        eprintln!(
+            "  [决策模型] 端口 {DECIDER_PORT} 没人监听，而且找不到 sidecar/verdict_server.py。"
+        );
+        eprintln!("             分类会退回\"永远是闲聊\"，任务中途的决策会退回\"总是问人\"。");
+        return;
+    };
+    let Some(python) = sidecar_python(&script) else {
+        eprintln!("  [决策模型] 没找到可用的 Python，起不来。先跑一次：");
+        eprintln!("             scripts/setup.ps1   （或 安装Python环境.cmd）");
+        return;
+    };
+
+    eprintln!("  [决策模型] 不在跑，正在拉起……");
+    let mut cmd = std::process::Command::new(&python);
+    cmd.arg(&script)
+        .arg("--port")
+        .arg(DECIDER_PORT.to_string())
+        // **分离出去**：它的生命周期不该绑在这一条命令上，
+        // 否则跑完一次任务它就被带走了，下次还得再拉。
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NO_WINDOW：
+        // 不让它弹黑框，也不让它在父进程退出时被杀。
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+    if let Err(e) = cmd.spawn() {
+        eprintln!("  [决策模型] 启动失败：{e}");
+        return;
+    }
+
+    // 等它起来。**模型加载要几十秒**，所以这里只等"端口开始监听"——
+    // 那之后 /decide 可能还会 503 一阵，但那是它自己的事，
+    // 调用方拿不到答案时会按"弃权"处理，方向是安全的。
+    for _ in 0..40 {
+        std::thread::sleep(Duration::from_millis(250));
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+            eprintln!("  [决策模型] 已就绪（端口 {DECIDER_PORT}）。");
+            return;
+        }
+    }
+    eprintln!("  [决策模型] 拉起来了但端口一直没监听——它可能起失败了。");
+    eprintln!("             先跑一次 `yunxi-bot decide` 看它报什么。");
+}
+
+/// 找 `sidecar/verdict_server.py`。
+///
+/// **从可执行文件的位置往上找**，不读当前工作目录：
+/// 人在别的目录里跑 `yunxi-bot` 是常事，而 sidecar 永远在仓库里。
+fn sidecar_script() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // <repo>/target/<profile>/yunxi-bot.exe → 上两级是 <repo>
+    let repo = exe.parent()?.parent()?.parent()?;
+    let p = repo.join("sidecar").join("verdict_server.py");
+    p.is_file().then_some(p)
+}
+
+/// 找能跑 sidecar 的 Python。
+///
+/// 三种布局都试，顺序就是"最可能对的先试"：
+/// 1. 开发检出：`<repo>/.venv/Scripts/python.exe`
+/// 2. 便携版：`<repo>/python/Scripts/python.exe`
+/// 3. PATH 上的 `python`
+fn sidecar_python(script: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(repo) = script.parent()?.parent() {
+        for cand in [".venv", "python"] {
+            for exe in ["Scripts/python.exe", "bin/python"] {
+                let p = repo.join(cand).join(exe);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    Some(std::path::PathBuf::from("python"))
+}
+
 fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    // **每次跑之前先保证决策模型在跑**——它不在时整条链路会静默降级。
+    ensure_decider_running();
     use yunxi_bot_core::task::Budget;
     use yunxi_bot_core::task::engine::{Engine, LedgerTaskStore, create_task, summarize};
     use yunxi_bot_core::think::ModelRouter;
@@ -2596,6 +2712,8 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 /// 底下走的是同一个 `converse`：工具循环、审批门禁、台账留痕、
 /// 缓存前缀全都照旧。**另开一条的话，那条路迟早会绕开审批。**
 fn cmd_chat(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    // **每次跑之前先保证决策模型在跑**——它不在时整条链路会静默降级。
+    ensure_decider_running();
     use yunxi_bot_core::think::ReasoningEffort;
     use yunxi_bot_core::think::session::SessionStore;
 

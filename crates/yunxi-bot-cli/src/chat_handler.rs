@@ -788,19 +788,42 @@ impl ChatHandler {
     /// 给一轮对话路由。
     ///
     /// 和任务引擎那条的区别：**那条的路由是引擎按整条任务算的**，
-    /// 这里只能按这一句算。所以任务类型固定为 `Conversation`——
-    /// 一个对话轮次本身不做多步推理，复杂度体现在它要用几次工具上。
+    /// 这里只能按这一句算。
+    ///
+    /// ## 任务类型现在是**问出来的**，不是写死的
+    ///
+    /// 原来这里固定传 `TaskKind::Conversation`，理由是"一个对话轮次
+    /// 本身不做多步推理"。**那个理由不成立**——用户在对话里说
+    /// "帮我把这个文件改一下"就是一件事，而写死 `Conversation`
+    /// 会把它永远按闲聊处理、永远走免费的 Agnes，**而那件事根本办不成**。
+    ///
+    /// 现在：**每次输入问决策模型一次「这是任务还是闲聊」**（只问一次，
+    /// 结果用在整轮路由里），判成任务再走词表细化成具体类型。
+    ///
+    /// 决策模型不可用时**回落闲聊**：那是免费的一边，也最不容易误花钱。
+    /// 真想让它干活的人会用 `do`，那条路不受这里影响。
     pub fn route_for(&self, input: &str, effort: ReasoningEffort) -> Routing {
         use yunxi_bot_core::think::router::{TaskKind, profile_task};
         // 对话还没拆解，所以步骤数是 0——`profile_task` 会按长度粗估。
         let profile = profile_task(input, 0);
-        self.router.route(
-            input,
-            TaskKind::Conversation,
-            &profile,
-            effort,
-            self.decider.as_deref(),
-        )
+
+        // **问一次。** `route()` 自己不再问任何人（D118 之后它谁也不问），
+        // 所以不会出现"一次输入问两三次"。
+        let is_task = self
+            .decider
+            .as_deref()
+            .and_then(|d| self.router.classify_input(d, input))
+            .unwrap_or(false);
+        // 是任务就细化成具体类型；词表认不出来时按"生成"兜
+        // （**那仍然是任务**，只是不知道是哪一类）。
+        let kind = if is_task {
+            TaskKind::classify(input).unwrap_or(TaskKind::Generation)
+        } else {
+            TaskKind::Conversation
+        };
+
+        self.router
+            .route(input, kind, &profile, effort, self.decider.as_deref())
     }
 
     /// 丢掉对话历史，开一个新的。**不删任何落盘的东西。**

@@ -175,6 +175,28 @@ impl TaskKind {
         ]
     }
 
+    /// "任务还是闲聊"的判据。**和 [`Self::criteria`] 是两套不同的东西**：
+    /// 那套问"需要多少推理"（只在确定是任务之后才有意义），
+    /// 这套问"到底要不要办事"。
+    ///
+    /// 措辞刻意写得具体：**使用者不会说"请执行一个任务"**，
+    /// 他会说"帮我把这个改一下"、"查一下"、"跑一遍"。
+    /// 判据要认得出那些说法。
+    pub fn input_kind_criteria() -> [(&'static str, &'static str); 2] {
+        [
+            (
+                "task",
+                "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，\
+                 或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类",
+            ),
+            (
+                "chat",
+                "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。\
+                 不需要我动手做任何事，回一句话就够了",
+            ),
+        ]
+    }
+
     /// 从决策模型的选项还原类型。
     pub fn from_choice(choice: &str) -> Option<Self> {
         match choice {
@@ -835,6 +857,46 @@ impl ModelRouter {
         }
     }
 
+    /// 问决策模型一个**二元**问题：这句话是要我办事，还是随口聊聊。
+    ///
+    /// ## 为什么单开一个问题，而不是复用 `ask_kind`
+    ///
+    /// `ask_kind` 问的是"**需要多少推理**"（shallow / drafting / deep），
+    /// 它的选项里**根本没有"闲聊"**——所以它答不了这个问题。
+    /// 硬套的话，"闲聊"只会被归成"不用推理"，于是走到查找档，
+    /// **那还是当成了任务**。
+    ///
+    /// ## 这一步决定的是钱
+    ///
+    /// 判成任务 → DeepSeek（收费）；判成闲聊 → Agnes（免费）。
+    /// 而闲聊占了日常交互的绝大多数，所以**判错的代价是不对称的**：
+    /// 把闲聊判成任务，天天在花钱；把任务判成闲聊，那件事做不成。
+    /// 所以提示词里把"要我做点什么"写得很实——**用户不会说
+    /// "请执行一个任务"，他会说"帮我把这个改一下"**。
+    ///
+    /// ## 只问一次
+    ///
+    /// 调用方在一次输入的开头问一次，拿到结果后**在整轮里复用**。
+    /// 路由本身不再问（D118 之后它谁也不问了），所以不会重复。
+    /// 返回 `None` = 决策模型弃权或不可用，**调用方决定怎么兜**。
+    pub fn classify_input(&self, decider: &dyn Decider, text: &str) -> Option<bool> {
+        use crate::decide::{DecisionRequest, Question};
+
+        let question = Question::choice(
+            "input_kind",
+            "这句话是要我办事，还是随口聊聊？",
+            &TaskKind::input_kind_criteria(),
+        );
+        let req = DecisionRequest::new(serde_json::json!({ "input": text }), vec![question]);
+        let result = decider.decide(&req).ok()?;
+        match result.choice("input_kind") {
+            Some("task") => Some(true),
+            Some("chat") => Some(false),
+            // 弃权或给了不认识的选项——**不猜**，交给调用方兜
+            _ => None,
+        }
+    }
+
     /// 问本地决策模型：这个任务需要多少推理。
     ///
     /// 只在 [`TaskKind::classify`] 拿不准、且**真的需要区分**时才值得问：
@@ -1001,6 +1063,70 @@ mod tests {
         assert_eq!(r.tier, Tier::Standard, "陪伴类走免费档");
         assert_eq!(r.spec.provider, "agnes");
         assert_eq!(stub.calls(), 0, "寒暄也不该为了选档去问决策模型");
+    }
+
+    #[test]
+    fn the_decider_can_say_an_input_is_a_task() {
+        // **这是用户要的那条**：每次会话输入，问一次决策模型
+        // "这是任务还是闲聊"。
+        //
+        // 在这之前 chat 那条路把 `TaskKind::Conversation` **写死**了——
+        // 用户在对话里说"帮我把这个文件改一下"，它也被当闲聊，
+        // 永远走免费的 Agnes，**而那件事根本办不成**。
+        let router = ModelRouter::default();
+        let stub = StubDecider::succeeding().with_choice("input_kind", "task");
+        assert_eq!(
+            router.classify_input(&stub, "帮我把这个文件改一下"),
+            Some(true),
+            "要办事的话该判成任务"
+        );
+        assert_eq!(stub.calls(), 1, "**只问一次**");
+    }
+
+    #[test]
+    fn the_decider_can_say_an_input_is_just_chat() {
+        // 另一半：闲聊走免费的那边。**它占日常交互的绝大多数**，
+        // 判错这一边的代价是天天在花钱。
+        let router = ModelRouter::default();
+        let stub = StubDecider::succeeding().with_choice("input_kind", "chat");
+        assert_eq!(router.classify_input(&stub, "今天天气不错"), Some(false));
+        assert_eq!(stub.calls(), 1);
+    }
+
+    #[test]
+    fn an_unrecognised_choice_is_not_guessed() {
+        // **不猜。** 决策模型给了个不认识的选项，返回 None 让调用方兜——
+        // 猜错的方向要么是白花钱，要么是该办的事没办。
+        let router = ModelRouter::default();
+        let stub = StubDecider::succeeding().with_choice("input_kind", "nonsense");
+        assert_eq!(router.classify_input(&stub, "随便说点什么"), None);
+    }
+
+    #[test]
+    fn an_unavailable_decider_yields_no_opinion() {
+        // 决策模型挂了 → None。调用方（chat）会**回落闲聊**：
+        // 免费的一边，也最不容易误花钱。
+        let router = ModelRouter::default();
+        let stub = StubDecider::failing("连接被拒绝");
+        assert_eq!(router.classify_input(&stub, "帮我把这个改一下"), None);
+    }
+
+    #[test]
+    fn the_two_question_sets_are_different() {
+        // **这两套判据不能混。** `criteria()` 问"需要多少推理"，
+        // 它的选项里**根本没有"闲聊"**——硬套的话闲聊会被归成
+        // "不用推理"，于是走到查找档，**那还是当成了任务**。
+        let reasoning: Vec<&str> = TaskKind::criteria().iter().map(|(k, _)| *k).collect();
+        let input_kind: Vec<&str> = TaskKind::input_kind_criteria()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        assert!(reasoning.contains(&"deep"), "推理那套问的是深度");
+        assert!(
+            input_kind.contains(&"chat"),
+            "这一套必须能表达'闲聊'——那是它存在的理由"
+        );
+        assert_ne!(reasoning, input_kind, "两套判据不该是同一套");
     }
 
     #[test]
