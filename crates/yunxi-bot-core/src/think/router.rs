@@ -692,74 +692,55 @@ impl ModelRouter {
     /// **"任务类型是在任务执行层定的"** 这件事在类型上就成立。
     pub fn route(
         &self,
-        task_text: &str,
+        _task_text: &str,
         kind: TaskKind,
         profile: &TaskProfile,
         effort: ReasoningEffort,
-        decider: Option<&dyn Decider>,
+        _decider: Option<&dyn Decider>,
     ) -> Routing {
         let calls = profile.estimated_calls();
 
         // ---- 模型轴：三层，从便宜到贵 ----
         //
         // 这里先按**调用次数**定档，但后面还要被思考轴否决一次，见下。
-        let (tier, mut reason, used_decider) = if kind == TaskKind::Conversation {
-            // ---- 寒暄 / 陪伴：**不问决策模型，也不花钱** ----
-            //
-            // 这类输入没有可拆解的步骤，也不需要推理，走免费端点就够。
-            // 而且它占了日常交互的绝大多数——**每次多问一次本地模型
-            // 虽然不花钱，但没必要**：这里根本不存在"该不该花钱"的问题。
+        // ---- 模型轴：**按"这是任务还是陪伴"直接定档** ----
+        //
+        // 用户定的规则：**真实任务走 DeepSeek，陪伴聊天走 Agnes。**
+        //
+        // 在这之前这里要问一次决策模型"大概几次调用"，再按次数折算档位。
+        // **现在不需要了——分类那一步已经把答案说完了。**
+        // 档位到模型的映射是这样的（`ModelSpec::AGNES_FLASH` / `DEEPSEEK_FLASH`）：
+        //
+        // | 档位 | 挂的模型 | 说明 |
+        // |---|---|---|
+        // | `Tier::Standard` | `agnes-3.0-flash` | **免费**。名字叫"标准"，实际是免费档 |
+        // | `Tier::Deep` | `deepseek-flash` | 收费 |
+        //
+        // （命名确实容易读错：`Standard` 是免费的、`Cheap` 反而没有 spec、
+        //  于是回落到默认档也就是 Agnes。**看到 `Standard` 别当成"贵的那个"。**）
+        //
+        // ## 顺带解决了两个问题
+        //
+        // 1. 原来 `heuristic_tier()` 在确定性信号有把握时**跳过决策模型**，
+        //    真机上出现过整整一次任务里它完全没参与（`e2e_allmodules`
+        //    那条 ✗）。现在这条路上不再需要它——**分类才是它该管的**。
+        // 2. 原来一次会话输入会问它 2~3 次（拆解路由 + 步骤路由 + 决策点）。
+        //    **路由不再问之后，那两次直接消失了。**
+        let (tier, reason) = if kind == TaskKind::Conversation {
             (
-                Tier::Cheap,
-                "寒暄/陪伴类：固定走免费端点".to_string(),
-                false,
+                Tier::Standard,
+                "档位=免费：寒暄/陪伴类走 Agnes（agnes-3.0-flash）".to_string(),
             )
         } else {
-            // ---- 真实任务：**每次都问决策模型** ----
-            //
-            // 原来这里是 `match profile.heuristic_tier()`：
-            // **确定性信号有把握时直接给答案、跳过决策模型**。
-            // 后果是"有时问有时不问"——行为不可预测，而且真机上抓到过
-            // **整整一次任务里决策模型完全没参与**（e2e_allmodules 那条 ✗）。
-            //
-            // Verdict 跑在 `127.0.0.1`，**本地、无网络、无限流**
-            // （`decide/` 那一套里一个限流器都没有），一次几毫秒。
-            // 所以"每次都问"的成本可以忽略，换来的是**确定性**。
-            match decider.and_then(|d| self.ask_call_count(d, task_text)) {
-                Some(tier) => (tier, "档位由本地决策模型判定调用次数".to_string(), true),
-                None => {
-                    // **决策模型弃权或不可用时**，才回落到确定性信号——
-                    // 那时候它至少是个有依据的答案，比"默认档"强。
-                    //
-                    // 而且这条回落本身是有信息的：`used_decider=false`
-                    // 会让理由里看得出"这次决策模型没给答案"，
-                    // 而不是让人以为它参与了。
-                    match profile.heuristic_tier() {
-                        Some(tier) => (
-                            tier,
-                            format!(
-                                "决策模型没给档位，回落确定性信号：预计 {calls} 次调用（{} 字 / {} 步 / 多条={} / 代码={}）",
-                                profile.prompt_chars,
-                                profile.step_count,
-                                profile.explicit_multi,
-                                profile.has_code
-                            ),
-                            false,
-                        ),
-                        None => (
-                            self.default_tier,
-                            format!(
-                                "决策模型没给档位，且确定性信号也判不出来，回落默认档（免费端点 {}）",
-                                self.spec(self.default_tier)
-                                    .map(|s| s.model)
-                                    .unwrap_or("未知")
-                            ),
-                            false,
-                        ),
-                    }
-                }
-            }
+            (
+                Tier::Deep,
+                format!(
+                    "档位=深度：真实任务走 DeepSeek（deepseek-flash），预计 {calls} 次调用（{} 字 / {} 步）",
+                    profile.prompt_chars, profile.step_count
+                ),
+            )
         };
+        let mut reason = reason;
 
         let mut spec = self.spec(tier).cloned().unwrap_or(ModelSpec::AGNES_FLASH);
 
@@ -819,14 +800,24 @@ impl ModelRouter {
             thinking: think,
             reason,
             estimated_calls: calls,
-            used_decider,
+            // **路由不再问决策模型了**——分类那一步才是它该管的。
+            // 所以这个位恒为 false；留着是因为它对调用方仍有意义：
+            // "这次档位是不是决策模型定的"。答案是"不是，是分类定的"。
+            used_decider: false,
             estimate,
         }
     }
 
     /// 问本地决策模型：要几次调用。任何异常都返回 `None` 由调用方兜底——
     /// **路由失败不能把任务卡住**。
-    fn ask_call_count(&self, decider: &dyn Decider, task_text: &str) -> Option<Tier> {
+    /// 问决策模型"这个任务大概要几次调用"，用来折算档位。
+    ///
+    /// **路由现在不调它了**——档位由 `kind` 直接定（真实任务→DeepSeek，
+    /// 寒暄→Agnes）。留着是因为它仍然是"向本地决策模型问一个数值判断"
+    /// 的完整范例，删掉的话连它那套"弃权怎么处理"的测试也一起没了。
+    ///
+    /// 哪天要做"按任务复杂度动态选档"，从它接着写。
+    pub fn ask_call_count(&self, decider: &dyn Decider, task_text: &str) -> Option<Tier> {
         use crate::decide::{DecisionRequest, Question};
 
         let question = Question::choice(
@@ -947,25 +938,40 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_falls_through_to_local_decider() {
+    fn a_real_task_goes_to_deepseek_without_asking_the_decider() {
+        // **这是用户定的规则**：真实任务走 DeepSeek，陪伴聊天走 Agnes。
+        //
+        // 它取代了原来三条测试（`ambiguous_falls_through_to_local_decider`、
+        // `decider_failure_falls_back_to_the_free_tier`、
+        // `unknown_choice_is_treated_as_abstention`）——那三条测的是
+        // "决策模型决定档位"这个机制，而**路由现在根本不问它了**。
+        //
+        // **注意这条测试盯的两件事**：
+        // 1. 档位是 `Deep`（DeepSeek），不是 Standard（Agnes）
+        // 2. **决策模型一次都没被调用**——分类那一步才是它该管的
         let router = ModelRouter::default();
         let stub = StubDecider::succeeding().with_choice("call_count", "many");
-        let p = profile(500, 2);
-        assert_eq!(p.heuristic_tier(), None, "这个画像应判不出来");
         let r = router.route(
             "整理这周的邮件",
             TaskKind::Lookup,
-            &p,
+            &profile(500, 2),
             ReasoningEffort::Auto,
             Some(&stub),
         );
-        assert_eq!(r.tier, Tier::Deep);
-        assert!(r.used_decider);
-        assert_eq!(stub.calls(), 1);
+        assert_eq!(r.tier, Tier::Deep, "真实任务该走 DeepSeek");
+        assert_eq!(r.spec.provider, "deepseek");
+        assert!(
+            !r.used_decider,
+            "路由不该问决策模型——分类那一步已经说清是任务还是陪伴了"
+        );
+        assert_eq!(stub.calls(), 0, "一次都不该问");
     }
 
     #[test]
-    fn decider_failure_falls_back_to_the_free_tier() {
+    fn the_decider_being_down_does_not_change_task_routing() {
+        // 决策模型挂掉**不影响路由**——因为路由不问它。
+        // 这条取代了 `decider_failure_falls_back_to_the_free_tier`：
+        // 那个"回落"逻辑本身已经不存在了。
         let router = ModelRouter::default();
         let stub = StubDecider::failing("连接被拒绝");
         let r = router.route(
@@ -975,26 +981,26 @@ mod tests {
             ReasoningEffort::Auto,
             Some(&stub),
         );
-        assert_eq!(r.tier, Tier::Standard, "判断失败应回落免费档");
-        assert!(
-            r.reason.contains("免费端点") && r.reason.contains("agnes"),
-            "理由要说清回落到了哪一档、哪个模型: {}",
-            r.reason
-        );
+        assert_eq!(r.tier, Tier::Deep, "决策模型挂了，任务照样走 DeepSeek");
+        assert_eq!(stub.calls(), 0);
     }
 
     #[test]
-    fn unknown_choice_is_treated_as_abstention() {
+    fn conversation_goes_to_the_free_tier() {
+        // 另一半规则：**寒暄/陪伴走 Agnes（免费）**。
+        // 它占了日常交互的绝大多数，不该花钱。
         let router = ModelRouter::default();
-        let stub = StubDecider::succeeding().with_choice("call_count", "nonsense");
+        let stub = StubDecider::succeeding().with_choice("call_count", "many");
         let r = router.route(
-            "x",
-            TaskKind::Lookup,
-            &profile(500, 2),
+            "今天天气不错",
+            TaskKind::Conversation,
+            &profile(20, 1),
             ReasoningEffort::Auto,
             Some(&stub),
         );
-        assert_eq!(r.tier, Tier::Standard, "未知选项不该被当成某一档");
+        assert_eq!(r.tier, Tier::Standard, "陪伴类走免费档");
+        assert_eq!(r.spec.provider, "agnes");
+        assert_eq!(stub.calls(), 0, "寒暄也不该为了选档去问决策模型");
     }
 
     #[test]
@@ -1078,12 +1084,21 @@ mod tests {
     }
 
     #[test]
-    fn simple_tasks_go_to_agnes_without_thinking() {
+    fn a_simple_task_still_goes_to_deepseek() {
+        // **这条原来是 `simple_tasks_go_to_agnes_without_thinking`。**
+        //
+        // 旧规格：调用次数少就省钱，走免费的 Agnes。
+        // **新规格（用户定）：真实任务一律走 DeepSeek，省钱的判断让位给可靠性。**
+        // 动机有真机证据——Agnes 免费档 10 RPM，一次真实任务连着几步
+        // 必然撞限流（`e2e_allmodules` 那次就是连续 9 次"等 N ms 后重发"
+        // 之后任务卡住）。
+        //
+        // 代价要说明白：**这一步现在要花钱了**，哪怕它只是一次简单查找。
         let router = ModelRouter::default();
-        let task = "查一下明天几点开会";
-        let kind = TaskKind::classify(task).expect("查找类应能判出来");
-        assert_eq!(kind, TaskKind::Lookup);
-        assert!(!kind.needs_reasoning());
+        let task = "帮我看下今天几点开会";
+        let kind = TaskKind::classify(task).expect("这句话该有词表命中");
+        assert_eq!(kind, TaskKind::Lookup, "分类本身没变——它仍然是查找类");
+        assert!(!kind.needs_reasoning(), "查找类不需要推理");
 
         let r = router.route(
             task,
@@ -1092,10 +1107,11 @@ mod tests {
             ReasoningEffort::Auto,
             None,
         );
-        assert_eq!(r.spec.provider, "agnes");
-        assert!(!r.thinking, "查找类不该开思考");
-        // Agnes 不吃 thinking 字段
-        assert_eq!(r.thinking_field(), Thinking::ServerDefault);
+        assert_eq!(r.spec.provider, "deepseek", "真实任务走 DeepSeek");
+        assert_eq!(r.spec.model, "deepseek-flash");
+        assert_eq!(r.tier, Tier::Deep);
+        // 分类没变：它仍然被认成"不需要推理"的查找类
+        assert!(!r.thinking, "查找类不开思考——省的是思考的钱，不是模型的钱");
     }
 
     #[test]

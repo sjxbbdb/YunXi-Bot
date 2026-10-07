@@ -2544,9 +2544,15 @@ mod tests {
         // 第一次调用是拆解，之后依次是 s1、s2
         assert_eq!(handler.seen_kinds[1], TaskKind::Lookup);
         assert_eq!(handler.seen_kinds[2], TaskKind::Analysis);
+        // **原来是 `"agnes"`。** 用户改了规格：**真实任务一律走 DeepSeek**，
+        // 哪怕这一步只是简单查找。代价要说明白——这一步现在要花钱了。
+        //
+        // 动机有真机证据：Agnes 免费档 10 RPM，一次真实任务连着几步
+        // 必然撞限流（`e2e_allmodules` 那次连续 9 次"等 N ms 后重发"，
+        // 然后任务卡在 s10 推不动）。
         assert_eq!(
-            handler.seen_providers[1], "agnes",
-            "查找类应走 Agnes（{:?}）",
+            handler.seen_providers[1], "deepseek",
+            "真实任务一律走 DeepSeek（{:?}）",
             handler.seen_providers
         );
         assert!(!handler.seen_thinking[1], "查找类不该开思考");
