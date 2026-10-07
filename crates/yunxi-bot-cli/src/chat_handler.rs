@@ -208,6 +208,14 @@ pub struct ChatHandler {
     /// 路由。**对话要自己判断"这活复杂不复杂"**——
     /// 任务引擎那条路由是引擎给的，对话这条得自己算。
     router: yunxi_bot_core::think::ModelRouter,
+    /// 本地槽位的健康探测器：**探健康 + 催加载**。
+    ///
+    /// **默认真的去连 `127.0.0.1:17872`。** 不做成 `Option`：
+    /// `None` 意味着"这一层没接上"，而那种缺失和"本地一切正常"在行为上
+    /// 一模一样（都照路由走）——那正是 D128 的形状：功能还在，只是退化了。
+    /// 测试要换掉它只有一个正当理由：起一个真的 4B sidecar 要几十秒
+    /// 和几 GB 内存（见 `with_local_probe`）。
+    local_probe: yunxi_bot_core::think::local_health::Probe,
 }
 
 /// 拼"常驻记忆段"——从台账里读记忆，选出关于"使用者是谁"的那些。
@@ -310,6 +318,10 @@ impl ChatHandler {
             on_delta: None,
             policy: ToolPolicy::default(),
             router: yunxi_bot_core::think::ModelRouter::default(),
+            // **默认就是真的那一个。** 默认值给假的（比如"永远就绪"）
+            // 会让没接上的链路安静地退化成"本地永远可用"，
+            // 而那种退化看起来和正常一模一样——D128 就是这么来的。
+            local_probe: yunxi_bot_core::think::local_health::Probe::real(),
         }
     }
 
@@ -331,6 +343,26 @@ impl ChatHandler {
     /// 挂上本地决策模型（审批门禁第二层）。
     pub fn with_decider(mut self, decider: std::sync::Arc<dyn Decider>) -> Self {
         self.decider = Some(decider);
+        self
+    }
+
+    /// 换掉本地槽位那条 I/O 缝（探测 + 催热）。
+    ///
+    /// **只给测试用**（`#[cfg(test)]`）。生产那条路必须是真的去连端口——
+    /// 这条回落判据的全部意义就是"sidecar 到底在不在"，而一个假的探测器
+    /// 对这个问题的回答是零信息。真起 sidecar 的代价（几十秒 + 几 GB）
+    /// 决定了：不换掉它，"本地挂了会不会静默降级"就只能靠碰运气验证，
+    /// 那等于没验证。
+    ///
+    /// 两个动作一起换（见 `Probe` 的文档）：只换探测、留着真的催热，
+    /// 测试就会真的往 `127.0.0.1:17872` 发 POST——而那正是"测试打网络"
+    /// 这条禁令要挡的事，只是它藏在一个看起来无害的注入点后面。
+    ///
+    /// 不留成"生产也能调"的口子，是因为那样迟早有人把探测换成"永远就绪"——
+    /// 而那正是 D128 的形状：功能还在，只是退化了。
+    #[cfg(test)]
+    pub fn with_local_probe(mut self, probe: yunxi_bot_core::think::local_health::Probe) -> Self {
+        self.local_probe = probe;
         self
     }
 
@@ -809,6 +841,23 @@ impl ChatHandler {
     ///
     /// 决策模型不可用时**回落闲聊**：那是免费的一边，也最不容易误花钱。
     /// 真想让它干活的人会用 `do`，那条路不受这里影响。
+    ///
+    /// ## 选中本地槽位时还要过一道 `/health`
+    ///
+    /// 路由本身是纯的，它不知道 sidecar 在不在——而**没起来 / 还在加载 /
+    /// 加载失败过**这三种情况下，把这一轮发给 17872 是必然失败
+    /// （第三种尤其：`_load_once` 不会重试，它永远好不了）。
+    ///
+    /// 所以选中本地槽位时会探一次 `/health`（300 ms），不是"就绪"就改成 Agnes，
+    /// 并把原因打到 stderr、写进台账（见 [`Self::apply_local_fallback`]）。
+    /// **这一步只影响本地槽位**：别的槽位连探都不探。
+    /// `idle` / `loading` 还会顺手踢一脚 `/warmup`，好让下一轮回到本地。
+    ///
+    /// 注意范围：**任务引擎（`do` / `resume` / 守护那一轮）不经过这里**。
+    /// 它是在 `yunxi_bot_core::task::engine` 里自己调 `router.route` 的，
+    /// 走的是**同一份判据**（`local_health::apply_fallback`），
+    /// 但注入点在引擎上（`Engine::with_local_probe`）、由 CLI 挂上——
+    /// **两处都得挂**，漏一处那条链路就没有兜底。
     pub fn route_for(&self, input: &str, effort: ReasoningEffort) -> Routing {
         use yunxi_bot_core::think::router::{TaskKind, profile_task};
         // 对话还没拆解，所以步骤数是 0——`profile_task` 会按长度粗估。
@@ -862,8 +911,73 @@ impl ChatHandler {
             TaskKind::Conversation
         };
 
-        self.router
-            .route(input, kind, &profile, effort, self.decider.as_deref())
+        let mut routing = self
+            .router
+            .route(input, kind, &profile, effort, self.decider.as_deref());
+        // **路由本身是纯的**（它不知道 sidecar 在不在），所以"这一轮到底发给谁"
+        // 要在这里定下来——定下来之后还必须留痕，见下。
+        self.apply_local_fallback(&mut routing);
+        routing
+    }
+
+    /// 本地槽位用不了就改走 Agnes。**判定和改写都在 core 里
+    /// （`local_health::apply_fallback`），这一层只负责把结论说出来。**
+    ///
+    /// ## 为什么判据不在这一层
+    ///
+    /// 任务引擎（`do` / `resume` / 守护那一轮）也要做同一件事，而它是自己调
+    /// `router.route` 的、根本不经过这里。两份实现必然漂移，而漂移的方向是
+    /// **"有一条链路悄悄不回落了"**——那正是 D128 的形状：功能还在，
+    /// 只是退化成了一个看不出来的样子。所以判据和落地只在 core 里留一份，
+    /// 两个调用方各自只管"怎么把它说出来"。
+    ///
+    /// ## 三件事必须一起做，少做一件就是 D128 那种"看起来正常"
+    ///
+    /// 1. **换掉端点**——`spec` 和 `tier` 一起换。只换 `spec` 的话 `Routing`
+    ///    自己前后矛盾，而台账、终端标签、成本统计读的正是 `spec`
+    /// 2. **把理由接进 `routing.reason`**——那是"理由必须进台账"这条原则的落点，
+    ///    调 `route_line` 的人也就看到了为什么换了端点
+    /// 3. **stderr 上说一声 + 写台账**——静默的替换正是 D128 那一类：
+    ///    功能还在，只是悄悄换成了另一个模型
+    ///
+    /// 前两件在 [`yunxi_bot_core::think::local_health::apply_fallback`] 里，
+    /// 它顺手还会踢一脚 `/warmup`（`idle` / `loading` 时）——见那个函数的文档。
+    fn apply_local_fallback(&self, routing: &mut Routing) {
+        use yunxi_bot_core::think::local_health;
+
+        // **非本地槽位连探都不探。** 远端端点的健康和 17872 上那个进程
+        // 没有关系；白探一次不只是多花最多 300 ms——探失败时还会把
+        // "本地没起来"记到一次本来和它无关的路由上。
+        //
+        // 这条守卫现在在 core 里（`apply_fallback` 的第一行），
+        // 所以这里不用再写一遍——但**行为必须还是这样**，
+        // `a_remote_slot_is_never_probed` 钉着它。
+        let Some(reason) = local_health::apply_fallback(routing, &self.local_probe) else {
+            return;
+        };
+
+        // **先说出来再改。** 这一行是"回落必须看得见"的落点：使用者看到
+        // 下一行打的 `[agnes-3.0-flash]` 时，得能立刻知道为什么不是本地那个，
+        // 而不是事后去翻日志猜。
+        eprintln!("  [本地模型] {reason}。");
+
+        // 台账和上面分类那一处同一个写法（那段注释解释了为什么不常驻句柄）。
+        // **开不出来就算了**：留痕失败不该挡住对话。
+        if let Ok(mut ledger) = yunxi_bot_core::ledger::Ledger::open(self.home.join("ledger.jsonl"))
+        {
+            let _ = yunxi_bot_core::decide::record_decision(
+                &mut ledger,
+                yunxi_bot_core::decide::DecisionClass::Route,
+                // **这一条一定是降级**：路由本来选的是本地，而它用不了。
+                true,
+                "改走 Agnes（远端）",
+                &reason,
+                // 没有模型回答过这个问题——答话的是 sidecar 的 `/health`。
+                // 填一个模型名会把归因引到一条根本没发生过的调用上。
+                None,
+                &[],
+            );
+        }
     }
 
     /// 丢掉对话历史，开一个新的。**不删任何落盘的东西。**
@@ -1398,6 +1512,7 @@ pub fn route_line(routing: &Routing, effort: ReasoningEffort) -> String {
 #[cfg(test)]
 mod chat_session_tests {
     use super::*;
+    use yunxi_bot_core::think::local_health::LocalHealth;
 
     fn handler() -> ChatHandler {
         ChatHandler::new(
@@ -1406,6 +1521,63 @@ mod chat_session_tests {
             DEFAULT_PERSONA,
             default_rules(),
         )
+        // **本地槽位当成就绪。** 不注入的话 `route_for` 会真的去探
+        // `127.0.0.1:17872`，于是这些测试的结论取决于"本机有没有起 sidecar"——
+        // 同一份代码在两台机器上答案不同，那是最不该进断言的东西。
+        //
+        // 探测本身的六种状态在 core 的 `think::local_health` 测试里逐条钉死，
+        // 这里只需要"就绪"这一种，好让别的测试仍然测它们本来要测的东西。
+        .with_local_probe(local_probe_reporting(LocalHealth::Ready).0)
+    }
+
+    /// 一个假的本地探测器：不连端口，直接给结论，并数自己被调了几次。
+    ///
+    /// 计数是为了钉住"非本地槽位连探都不探"——那件事省的是每一轮最多 300 ms，
+    /// 而它只能靠"没被调用"来证明。
+    ///
+    /// 催热那一半给一个空的：这条助手只关心"探了几次"，
+    /// 需要看催热的测试用 [`local_probe_recording_warmups`]。
+    fn local_probe_reporting(
+        health: LocalHealth,
+    ) -> (
+        yunxi_bot_core::think::local_health::Probe,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&calls);
+        let probe = yunxi_bot_core::think::local_health::Probe::new(
+            move |_endpoint: &str| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                health.clone()
+            },
+            |_endpoint: &str| {},
+        );
+        (probe, calls)
+    }
+
+    /// 一个会**记下自己有没有被踢过**的假探测器。
+    ///
+    /// `/warmup` 那一下必须能被看见：不看见它，"idle 之后本地槽位还能不能
+    /// 回来"就只能靠在真机上等十分钟空闲回收再发一句话来验证——
+    /// 那种验证没人会做第二遍，于是它等于没验证。
+    fn local_probe_recording_warmups(
+        health: LocalHealth,
+    ) -> (
+        yunxi_bot_core::think::local_health::Probe,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let kicked: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&kicked);
+        let probe = yunxi_bot_core::think::local_health::Probe::new(
+            move |_endpoint: &str| health.clone(),
+            move |endpoint: &str| {
+                sink.lock()
+                    .expect("这把锁没有别人会持有到 panic")
+                    .push(endpoint.to_string())
+            },
+        );
+        (probe, kicked)
     }
 
     #[test]
@@ -1649,6 +1821,167 @@ mod chat_session_tests {
             "闲聊要压在最低档"
         );
         assert_eq!(r.spec.provider, "local", "闲聊走本地模型，不走收费端点");
+    }
+
+    // ---------- 本地槽位的兜底：挂了 / 没就绪 → 这一轮走 Agnes ----------
+
+    #[test]
+    fn a_degraded_local_sidecar_moves_the_turn_to_agnes() {
+        // **这是用户要的那件事。** `degraded` 是最该回落的一种：
+        // `_load_once` 见到 `_model_error` 就直接返回，也就是它**不会自愈**——
+        // 不回落就是每一轮都失败，而且失败得毫无线索。
+        let h = handler().with_local_probe(
+            local_probe_reporting(LocalHealth::Degraded(
+                "ModuleNotFoundError: No module named 'torch'".into(),
+            ))
+            .0,
+        );
+        let r = h.route_for("你好", ReasoningEffort::Auto);
+        assert_eq!(r.spec.provider, "agnes", "本地不可用，这一轮该走 Agnes");
+        assert_eq!(r.spec.model, "agnes-3.0-flash");
+        // 理由链里要能读出**为什么**这次不是本地那个——
+        // 否则使用者只看到模型换了，得自己去翻 sidecar 的 stderr
+        assert!(
+            r.reason.contains("ModuleNotFoundError"),
+            "理由里要有真正的原因: {}",
+            r.reason
+        );
+    }
+
+    #[test]
+    fn a_loading_local_sidecar_moves_the_turn_to_agnes() {
+        // 加载 8 GB 要几十秒，而那正是使用者刚打完第一句话的时候。
+        // **不等**：等它加载完，这一轮就是"打完字卡住几十秒"；
+        // 而换成 Agnes 这一轮立刻就有结果。
+        let h = handler().with_local_probe(local_probe_reporting(LocalHealth::Loading).0);
+        let r = h.route_for("你好", ReasoningEffort::Auto);
+        assert_eq!(r.spec.provider, "agnes", "还没就绪这一轮也该走 Agnes");
+        assert!(
+            r.reason.contains("还没就绪"),
+            "要说清是「没就绪」而不是别的: {}",
+            r.reason
+        );
+    }
+
+    #[test]
+    fn an_idle_sidecar_is_warmed_up_for_the_next_turn_but_a_degraded_one_is_not() {
+        // **这条断言就是这次修正的全部。**
+        //
+        // 空闲回收之后 `/health` 报 `idle`，而原来只有"回落"这一半：
+        // 这一轮走 Agnes —— 下一轮再探还是 `idle`，于是再回落……
+        // **本地槽位就这么静默地永远死了**：每一处显示都正常（免费端点照跑、
+        // 账照记、没有一处报错），只有那个本地模型再也不会被用到。
+        // 这正是 D128 那一类：功能还在，只是退化了。
+        //
+        // 另一半是 `POST /warmup`：sidecar 收到就答 202，权重在它自己的
+        // 后台线程里加载。**这一轮仍然走 Agnes**（不让人盯着光标等十几秒），
+        // 但下一轮探测就是 `ok` 了。
+        let (probe, kicked) = local_probe_recording_warmups(LocalHealth::Idle);
+        let h = handler().with_local_probe(probe);
+        let r = h.route_for("你好", ReasoningEffort::Auto);
+        assert_eq!(r.spec.provider, "agnes", "idle 这一轮走 Agnes，不等它加载");
+        let kicked = kicked.lock().expect("这把锁没有别人会持有到 panic").clone();
+        assert_eq!(
+            kicked.len(),
+            1,
+            "idle 必须催一次 /warmup——不催的话下一轮还是 idle，本地槽位永远回不来: {kicked:?}"
+        );
+        assert!(
+            kicked[0].ends_with("/warmup"),
+            "催的该是 /warmup: {kicked:?}"
+        );
+        assert!(
+            kicked[0].starts_with("http://127.0.0.1:17872"),
+            "地址要来自 LOCAL_QWEN.base_url，不能是第二份写死的端口: {kicked:?}"
+        );
+
+        // 反过来：`degraded` **不催**。sidecar 的 `_load_once` 见到
+        // `_model_error` 就立刻返回，它不会重试——踢一脚只是白等一次超时，
+        // 而且会在一条"永远好不了"的状态上反复花掉这 300 ms。
+        let (probe, kicked) =
+            local_probe_recording_warmups(LocalHealth::Degraded("torch 没了".into()));
+        let h = handler().with_local_probe(probe);
+        let r = h.route_for("你好", ReasoningEffort::Auto);
+        assert_eq!(r.spec.provider, "agnes", "degraded 当然也要回落");
+        assert!(
+            kicked
+                .lock()
+                .expect("这把锁没有别人会持有到 panic")
+                .is_empty(),
+            "degraded 不该被踢——它不会自愈，踢了只是白等一次超时"
+        );
+    }
+
+    #[test]
+    fn an_unknown_health_status_is_not_treated_as_available() {
+        // **不认识就回落，不猜"大概没事"。**
+        //
+        // 两边代价不对称：猜"没事"是这一轮必然失败（而且看不出为什么），
+        // 猜错只是多花几分钱——所以往能干活的那边倒。
+        let h = handler()
+            .with_local_probe(local_probe_reporting(LocalHealth::Unexpected("idle".into())).0);
+        let r = h.route_for("你好", ReasoningEffort::Auto);
+        assert_eq!(r.spec.provider, "agnes", "不认识的状态不能当成可用");
+        assert!(
+            r.reason.contains("不认识"),
+            "要说清是「不认识」: {}",
+            r.reason
+        );
+    }
+
+    #[test]
+    fn a_remote_slot_is_never_probed() {
+        // 探一次最多 300 ms，而远端端点的健康和 17872 上那个进程没有关系。
+        //
+        // 输入刻意选成"长文本 + 分析词"：那会判成深度档走 DeepSeek。
+        // 分类那一步要它先判成任务，所以挂一个说"task"的决策模型桩。
+        let (probe, calls) = local_probe_reporting(LocalHealth::Unreachable("不该被调到".into()));
+        let stub =
+            yunxi_bot_core::decide::StubDecider::succeeding().with_choice("input_kind", "task");
+        let h = handler()
+            .with_decider(std::sync::Arc::new(stub))
+            .with_local_probe(probe);
+        let long = format!("分析一下{}", "这段内容".repeat(80));
+        let r = h.route_for(&long, ReasoningEffort::Auto);
+        assert_eq!(r.spec.provider, "deepseek", "长文本分析该走 DeepSeek");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "非本地槽位连探都不该探"
+        );
+    }
+
+    #[test]
+    fn the_fallback_is_visible_in_the_ledger() {
+        // **静默的替换就是 D128 那一类 bug。** 台账里必须留下一条
+        // "路由降级"，否则事后翻记录只会看到一次普普通通的 Agnes 调用，
+        // 而"本地模型一次都没被调用过"这件事就是这么藏了一整轮开发周期的。
+        let dir = std::env::temp_dir().join(format!(
+            "yunxi-local-fallback-ledger-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let h = ChatHandler::new(dir.clone(), "云熙", DEFAULT_PERSONA, default_rules())
+            .with_local_probe(
+                local_probe_reporting(LocalHealth::Degraded(
+                    "ModuleNotFoundError: No module named 'torch'".into(),
+                ))
+                .0,
+            );
+        let _ = h.route_for("你好", ReasoningEffort::Auto);
+
+        let text = std::fs::read_to_string(dir.join("ledger.jsonl")).expect("台账该被写出来");
+        assert!(
+            text.contains(r#""class":"route""#),
+            "要记成路由这一类: {text}"
+        );
+        assert!(text.contains(r#""degraded":true"#), "要标成降级: {text}");
+        assert!(
+            text.contains("ModuleNotFoundError"),
+            "原因要进台账，否则事后查不出为什么换了模型: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

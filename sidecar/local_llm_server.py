@@ -54,6 +54,18 @@ _generate_lock = threading.Lock()
 # 而不是掉头就走——启动那几十秒正是使用者最可能说话的时候。
 _load_lock = threading.Lock()
 
+# ---- 按需加载 / 空闲释放。见 `unload()` 和 `_idle_watchdog()`。----
+#
+# 这个进程是**分离进程**（`DETACHED_PROCESS`，见
+# `crates/yunxi-bot-cli/src/main.rs`）：使用者关掉 `yunxi-bot chat` 之后
+# 它还活着，于是那 8 GB 显存一直占着，直到重启机器。而 `nvidia-smi` 上
+# 只看得到"卡被占着"，看不出是谁占的——**这不是"有点浪费"，是"卡用不了了
+# 还不知道为什么"**。所以权重必须能放掉，而且要**没人用的时候自己放掉**。
+_last_use = time.monotonic()   # **单调钟**，理由见 `_idle_watchdog()`
+_ever_loaded = False           # 曾经加载成功过——`/health` 报 `idle` 的前提
+_idle_unload_seconds = 600.0   # <=0 表示不自动释放（留着手动/基准测试用）
+_warmup_pending = False        # 后台已经在加载了，别为每次 /warmup 再开一个线程
+
 
 def resolve_model_dir(model: str) -> str:
     """找模型目录。
@@ -94,6 +106,7 @@ def load(model: str, device: str) -> None:
 def _load_once(model: str, device: str) -> None:
     """真正加载。**调用方必须已经持有 `_load_lock`。**"""
     global _model, _tokenizer, _model_name, _model_error, _loading
+    global _ever_loaded, _last_use
 
     with _lock:
         if _model is not None or _model_error is not None:
@@ -131,6 +144,11 @@ def _load_once(model: str, device: str) -> None:
         mdl.eval()
         with _lock:
             _tokenizer, _model = tok, mdl
+            _ever_loaded = True
+            # **加载完成也算一次"在用"。** 不然刚装好就被看门狗按"上次用的
+            # 时间"（可能已经是几分钟前，比如空闲释放之后隔了很久才重新加载）
+            # 误判成空闲，白装一次——而那一次是十几秒。
+            _last_use = time.monotonic()
         sys.stderr.write(f"[local-llm] 加载完成，用了 {time.time() - t0:.1f} 秒\n")
     except Exception as e:  # noqa: BLE001
         # **留住原因。** D106 那次"模型没加载"查了很久，
@@ -141,6 +159,156 @@ def _load_once(model: str, device: str) -> None:
     finally:
         with _lock:
             _loading = False
+
+
+def _flush_cuda_cache() -> None:
+    """把分配器缓存的显存还给驱动。**要看着它真的降下去，不能只叫一次。**
+
+    ## 为什么一次 `empty_cache()` 不够（这是实测出来的）
+
+    卸载是**和请求线程赛跑**的。生成锁放开的那一瞬间，`stream_generate()`
+    那个生成器才开始拆自己的栈帧，而权重正好挂在它的局部变量上
+    （`tok, mdl, inputs`）——也就是说"锁已经放了"和"权重真的没人要了"
+    之间**有一条缝**，流式响应最后那一小段正好落在这条缝里。
+
+    实测：在缝里叫 `empty_cache()` **一点都回收不到**（权重还活着，
+    分配器眼里那些块是"在用"不是"缓存"）；等权重真放手时，块已经静静地
+    躺回分配器的缓存里，**而没有人会再叫一次**。表现就是 `/health` 说
+    `idle`、`nvidia-smi` 纹丝不动——和"这个功能根本没做"长得一模一样。
+
+    所以这里循环几轮：每轮先 `gc.collect()` 再 `empty_cache()`，然后看
+    `memory_reserved()` 归零没有。第一轮扑空不要紧，等 0.25 秒那条缝就合上了，
+    第二轮通常就归零。**上限四轮**：抓不到的引用等多久都抓不到，
+    有界才不会把卸载挂死。
+
+    （调用方保证此刻没有生成在跑，所以这零点几秒没人等。）
+    """
+    try:
+        import gc
+
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        for _ in range(4):
+            gc.collect()
+            torch.cuda.empty_cache()
+            if int(torch.cuda.memory_reserved()) == 0:
+                return
+            time.sleep(0.25)
+    except Exception as e:  # noqa: BLE001
+        # 引用已经掉了，权重迟早会还；这里只是没还干净。
+        # **不要把异常吞掉不说**——那正是"卸载看起来成功了但显存没降"的来源。
+        sys.stderr.write(f"[local-llm] 释放显存缓存失败：{type(e).__name__}: {e}\n")
+
+
+def _drop_weights() -> bool:
+    """把权重真的放掉。返回"是否放掉了东西"。
+
+    **调用方必须已经持有 `_generate_lock`**（`unload()` 和 `_idle_watchdog()`
+    都是这么进来的）。
+
+    ## 为什么光掉引用不够
+
+    掉 Python 引用只是让模型对象**可回收**；torch 的缓存分配器仍然把显存
+    攥在自己手里，`nvidia-smi` **一点变化都不会有**——看起来和"这次卸载
+    根本没生效"一模一样。所以必须把缓存**还**给驱动，见 `_flush_cuda_cache()`。
+
+    `gc.collect()` 是同一个道理的补刀：模型对象偶尔处在引用环里，
+    光把全局引用置空不一定立刻析构，先收一遍垃圾才有东西可以还。
+    """
+    global _model, _tokenizer
+
+    with _lock:
+        had = _model is not None or _tokenizer is not None
+        _model = None
+        _tokenizer = None
+        ever = _ever_loaded
+    if not had and not ever:
+        # 这个进程从来没装过模型：**连 torch 都不用碰**——为一个空操作
+        # 去把几百兆的 torch 拖进内存没有意义。
+        return False
+    # `had` 为假也要冲一次：上一次卸载可能正好落在上面那条缝里，
+    # 缓存还攥着那几 GB，而重复的 /unload 是唯一会再来看一眼的人。
+    _flush_cuda_cache()
+    return had
+
+
+def unload() -> bool:
+    """释放权重，**进程留着**。返回是否真的释放了。
+
+    ## 为什么必须先拿生成锁
+
+    卸载和生成是**对同一份权重**的两件事。不拿锁就卸，等于把权重从一次
+    正在跑的推理脚下抽走；而且 `generate()` / `stream_generate()` 各自拿着
+    `_model` 的一个局部引用，权重那时其实还活着——表现就是"卸载了，
+    但显存没降"，然后下一句话再撞一句"模型未加载"。
+
+    先拿 `_generate_lock`，卸载就变成"**等这一轮说完再卸**"：这正是想要的，
+    而且这时候 `empty_cache()` 才真的能还出一大块。
+
+    （`empty_cache()` 也留在锁里：它会短暂卡一下，但反正此刻没有生成在跑。）
+    """
+    with _generate_lock:
+        return _drop_weights()
+
+
+def _warmup_background(model: str, device: str) -> None:
+    """后台加载。`/warmup` **不等它**——理由见 `Handler._warmup()`。
+
+    `load()` 自己会排队（`_load_lock`）、自己会把失败原因留在 `_model_error`，
+    所以这里不需要再包一层错误处理。
+    """
+    global _warmup_pending
+
+    try:
+        load(model, device)
+    finally:
+        # **无论成败都要清标记**，否则一次失败的加载会把 `/warmup` 永久
+        # 锁死在"warming"，而 `/health` 那边其实早就说出原因了。
+        with _lock:
+            _warmup_pending = False
+
+
+def _idle_watchdog() -> None:
+    """空闲到点就把权重放掉。**这才是真正堵住那 8 GB 的东西。**
+
+    ## 为什么轮询，而不是算一个精确的 `sleep(剩余时间)`
+
+    "上一次用是什么时候"是外部事件改的（一个请求进来就变了），睡一个
+    长觉就必然错过"刚好又有人说话"。所以按固定间隔醒来看一眼，
+    间隔取 `min(5, 窗口/4)`：默认 600 秒时每 5 秒看一眼，
+    到点后几秒内就能发现；窗口很短（测试用）时也不会太钝。
+
+    **这不是忙等**：每次醒来只做几次赋值就接着睡，不烧 CPU——
+    这个特性的全部意义就是省资源，自己先烧一个核就说不过去了。
+
+    ## 为什么用单调钟
+
+    `time.time()` 会被对时、夏令时、休眠唤醒改掉，量出来的"空闲了多久"
+    可以是负数或者几小时。`time.monotonic()` 只会往前走。
+    """
+    while True:
+        window = _idle_unload_seconds
+        time.sleep(max(1.0, min(5.0, window / 4.0)))
+        with _lock:
+            if _model is None:
+                continue  # 没加载：没有可放的，也没必要看时间
+            idle_for = time.monotonic() - _last_use
+        if idle_for < window:
+            continue
+        # 到点了。**拿生成锁之后再确认一次**：生成开始和结束都会更新
+        # `_last_use`，而生成也必须先拿到这把锁——所以锁里看到的空闲时长
+        # 是准的，不会出现"人家刚开口就把它卸了"。生成在跑的时候这里会**等**，
+        # 等它跑完再看时间（那时 `_last_use` 已经是新的，于是这轮就跳过）。
+        with _generate_lock:
+            with _lock:
+                stale = _model is not None and time.monotonic() - _last_use >= window
+            if stale and _drop_weights():
+                sys.stderr.write(
+                    f"[local-llm] 空闲 {window:.0f} 秒没有请求，已释放显存"
+                    f"（进程还在，下一个请求会重新加载）\n"
+                )
 
 
 def _encode(tok, mdl, messages: list[dict]):
@@ -177,11 +345,16 @@ def _sample_kwargs(tok, inputs, max_tokens: int, temperature: float) -> dict:
 
 def generate(messages: list[dict], max_tokens: int, temperature: float) -> dict:
     """跑一次生成。**全局串行**——一块 GPU 本来同时只能跑一个。"""
+    global _last_use
     import torch
 
     with _generate_lock:
         with _lock:
             tok, mdl = _tokenizer, _model
+            # **进门就记一次"在用"。** 看门狗只看这个时间戳，所以它必须在
+            # 拿到生成锁之后、真正开跑之前更新——否则一次很长的生成会被
+            # 误判成"早就没人用了"。
+            _last_use = time.monotonic()
         if tok is None or mdl is None:
             raise RuntimeError(_model_error or "模型未加载")
 
@@ -190,6 +363,9 @@ def generate(messages: list[dict], max_tokens: int, temperature: float) -> dict:
             out = mdl.generate(**_sample_kwargs(tok, inputs, max_tokens, temperature))
         gen = out[0][inputs["input_ids"].shape[1]:]
         content = tok.decode(gen, skip_special_tokens=True).strip()
+        with _lock:
+            # 生成**结束**也记一次，理由见 `stream_generate()` 里那段。
+            _last_use = time.monotonic()
         return {
             "content": content,
             "prompt_tokens": int(inputs["input_ids"].shape[1]),
@@ -218,12 +394,18 @@ def stream_generate(messages: list[dict], max_tokens: int, temperature: float):
     错误若发生在**第一个片段之前**，调用方还没发响应头，
     就能正常回一个 500——所以调用方必须先取第一个片段再发头。
     """
+    # **必须声明 global。** 这个函数体里给 `_last_use` 赋值，不声明的话
+    # Python 会把它当成本函数的局部变量：赋值照做，模块全局那个纹丝不动，
+    # 而看门狗看的就是全局那个——表现是"流式走完照样被当成空闲"。
+    global _last_use
     import torch
     from transformers import TextIteratorStreamer
 
     with _generate_lock:
         with _lock:
             tok, mdl = _tokenizer, _model
+            # 同 `generate()`：**开跑之间**就记时间，理由见看门狗那段。
+            _last_use = time.monotonic()
         if tok is None or mdl is None:
             raise RuntimeError(_model_error or "模型未加载")
 
@@ -256,6 +438,14 @@ def stream_generate(messages: list[dict], max_tokens: int, temperature: float):
                 yield "delta", piece
         if err_box:
             raise err_box[0]
+        # **生成结束也要记一次。** 只记开始那一下是不够的："空闲 N 秒"会被一次
+        # 比 N 还长的生成整个吃掉——看门狗睡醒时窗口早就过了，它会等在生成锁上，
+        # 等生成一结束就把权重卸掉：**说完话的下一瞬间**模型就没了，而使用者还在
+        # 同一个对话里，下一个问题又得等十几秒装回来。
+        # 这不是推测，是实测：一次 24 秒的生成，`--idle-unload 20` 下
+        # 释放发生在生成结束后 0.0 秒。
+        with _lock:
+            _last_use = time.monotonic()
         # **生成量自己数，不问 `generate` 的返回值要。**
         #
         # 这是实测出来的：传了 `streamer` 之后，`generate` 返回的张量长度
@@ -376,6 +566,42 @@ class Handler(BaseHTTPRequestHandler):
             # 更不该在这里刷一段栈——那只会让人以为服务坏了。
             gen.close()
 
+    def _warmup(self) -> None:
+        """`/warmup`：**立刻返回**，加载扔给后台线程。
+
+        Rust 侧是 fire-and-forget 地叫这一下的（"我要说话了，你去把模型热上"），
+        不是在这里等十几秒。所以**不能等 `load()` 返回**——等的话就等于把
+        "加载慢"从后台搬到了对话的第一句话上，而那正是 D106 那条要躲的东西。
+        """
+        global _warmup_pending
+
+        with _lock:
+            loaded = _model is not None
+            err = _model_error
+            pending = _warmup_pending
+            if not loaded and not err and not pending:
+                # **在锁里就占坑**：两次 /warmup 前后脚进来时，
+                # 第二个看到 pending 就不会再开一个线程（那个线程只会堵在
+                # `_load_lock` 上，然后什么都不干地退出）。
+                _warmup_pending = True
+        if loaded:
+            self._send(200, {"status": "ok"})
+            return
+        if err:
+            # **失败过就不再试**，和 `load()` 里那条规矩一致：一次加载几十秒，
+            # 原因已经留在 `_model_error` 里（`/health` 报得出来），
+            # 每个请求都重试只会让每一次都白等，还把真正的原因埋掉。
+            self._send(200, {"status": "degraded", "detail": err})
+            return
+        if not pending:
+            threading.Thread(
+                target=_warmup_background,
+                args=(_model_name, self.server.device),  # type: ignore[attr-defined]
+                daemon=True,
+            ).start()
+        # **202**：接下了，但还没做完。客户端不该在这里等。
+        self._send(202, {"status": "warming"})
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path.startswith("/health"):
             with _lock:
@@ -383,8 +609,22 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, {"status": "ok", "model": _model_name})
                 elif _model_error:
                     # **把原因报出来**，不要只说 unloaded。
+                    #
+                    # **`degraded` 必须压过 `idle`**：加载失败过的模型不能被
+                    # 说成"只是闲着"——那是把一个真故障藏在一个看着很乖的
+                    # 状态后面，而 D106 那次就是因为状态太乖才查了很久。
                     self._send(200, {"status": "degraded", "model": "unloaded",
                                      "detail": _model_error})
+                elif _loading:
+                    # 正在往显存里搬权重。**这一条要排在 `idle` 前面**：
+                    # 空闲释放之后被重新叫醒时还报 `idle`，会让人以为
+                    # 不用等——而那时候它恰恰正在等。
+                    self._send(200, {"status": "loading", "model": _model_name})
+                elif _ever_loaded:
+                    # 曾经加载好、现在权重被空闲释放了。**这不是错误，
+                    # 也不是"在加载"**：下一个请求会自己把它拉回来，
+                    # 使用者什么都不用做。
+                    self._send(200, {"status": "idle", "model": _model_name})
                 else:
                     self._send(200, {"status": "loading", "model": _model_name})
             return
@@ -394,6 +634,16 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        # `/warmup`：叫一声就走，不等加载（理由见 `_warmup()`）。
+        if self.path.startswith("/warmup"):
+            self._warmup()
+            return
+        # `/unload`：放掉权重、进程留着——关掉 `yunxi-bot chat` 之后
+        # 还占着的那 8 GB 就是从这里还回去的。
+        if self.path.startswith("/unload"):
+            freed = unload()
+            self._send(200, {"status": "unloaded" if freed else "already_unloaded"})
+            return
         if not self.path.startswith("/v1/chat/completions"):
             self._send(404, {"error": "not found"})
             return
@@ -442,7 +692,7 @@ def main() -> int:
     # **必须声明 global。** 少了这一行，`_model_name = args.model` 会建一个
     # 局部变量，模块全局那个一直是 ""——表现就是 /health 和 /v1/models
     # 都报空模型名，而服务看起来一切正常。
-    global _model_name
+    global _model_name, _idle_unload_seconds
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen3-1.7B")
@@ -451,6 +701,8 @@ def main() -> int:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--warmup", action="store_true",
                     help="启动时就加载（默认是第一个请求才加载）")
+    ap.add_argument("--idle-unload", type=float, default=600.0, metavar="SECONDS",
+                    help="空闲这么多秒之后释放显存（默认 600；0 = 关掉）")
     args = ap.parse_args()
 
     if args.host not in ("127.0.0.1", "localhost", "::1"):
@@ -461,10 +713,23 @@ def main() -> int:
     srv.device = args.device  # type: ignore[attr-defined]
     with _lock:
         _model_name = args.model
+        _idle_unload_seconds = args.idle_unload
     sys.stderr.write(
         f"[local-llm] 监听 http://{args.host}:{args.port}  "
-        f"/v1/chat/completions  /health\n"
+        f"/v1/chat/completions  /health  /warmup  /unload\n"
     )
+    if args.idle_unload > 0:
+        # **看门狗是 daemon 线程**：主线程一退（Ctrl-C、被关掉），它跟着走，
+        # 不会变成第二个"进程还在、显存还占着"的东西。
+        threading.Thread(target=_idle_watchdog, daemon=True).start()
+        sys.stderr.write(
+            f"[local-llm] 空闲 {args.idle_unload:.0f} 秒没有请求就释放显存"
+            f"（--idle-unload 0 可关掉）\n"
+        )
+    else:
+        # **关掉的时候要说出来。** 不说的话，"空闲了显存却一直不降"
+        # 会看起来像这个特性坏了，而不是被人为关了。
+        sys.stderr.write("[local-llm] 空闲释放已关闭（--idle-unload 0）\n")
     if args.warmup:
         load(args.model, args.device)
     try:

@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use crate::costlog::CallRecord;
 use crate::decide::Decider;
 use crate::ledger::{EventKind, Ledger, LedgerError, task_from_events};
+use crate::think::local_health::{self, Probe};
 use crate::think::{ModelRouter, ReasoningEffort, Routing, TaskKind, TaskProfile};
 
 use super::decide::{TaskDecision, parse_options};
@@ -344,6 +345,25 @@ pub struct Engine<'a, H: TaskHandler, S: TaskStore> {
     pub store: &'a mut S,
     pub effort: ReasoningEffort,
     budget: Budget,
+    /// 本地槽位的健康探测器（探测 + 催热）。`None` = **不探，什么也不做**。
+    ///
+    /// ## 为什么默认是"不探"，而对话那边默认是"真探"
+    ///
+    /// 对话那条链路（`ChatHandler::route_for`）只有一个跑法：使用者敲下的
+    /// 那一句，而它**一定**在能起 sidecar 的那台机器上。
+    ///
+    /// 引擎不一样：它是 core 里的东西，被近千条测试、干跑、端到端脚本
+    /// 反复构造。默认去连 `127.0.0.1:17872` 的话，**测试的结论会取决于
+    /// 开发机上有没有起 sidecar**——同一份代码在两台机器上答案不同，
+    /// 那是最不该进断言的东西。所以默认"什么也不做"，
+    /// 由真正知道自己在哪跑的调用方显式挂上 [`Probe::real`]。
+    ///
+    /// 代价要写明白：**没挂 = 没有兜底**，和加这一层之前一模一样。
+    /// 所以 CLI 那几条真会发请求的路（`do` / `resume` / 守护的任务回合）
+    /// **每一处都必须挂**；漏挂一处，那条路上的简单步骤就又会直直打到
+    /// 一个可能没人监听的 17872 上——那正是这次要堵的洞。
+    /// `a_degraded_local_sidecar_moves_a_task_step_to_agnes` 钉着这件事。
+    local_probe: Option<Probe>,
 }
 
 impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
@@ -361,12 +381,46 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             store,
             effort: ReasoningEffort::Auto,
             budget,
+            // **不挂就是不探。** 默认值给一个"永远就绪"的假探测器会更坏：
+            // 它看起来像"这一层接上了"，而行为和没接一模一样。
+            local_probe: None,
         }
     }
 
     pub fn with_effort(mut self, effort: ReasoningEffort) -> Self {
         self.effort = effort;
         self
+    }
+
+    /// 挂上本地槽位探测器：路由落在 `127.0.0.1:17872` 上时先探一次
+    /// `/health`，不是"就绪"就改走 Agnes（判定见 [`local_health::decide`]）。
+    ///
+    /// **不挂 = 没有这一层**，行为与加它之前逐字节相同。
+    /// CLI 那几条真的会发请求的路必须挂 [`Probe::real`]——理由见
+    /// [`Self::local_probe`] 的字段文档。
+    pub fn with_local_probe(mut self, probe: Probe) -> Self {
+        self.local_probe = Some(probe);
+        self
+    }
+
+    /// 把一条路由过一道本地槽位的健康：**没挂探测器就立刻返回**。
+    ///
+    /// 判据、催热、改写全在 [`local_health::apply_fallback`] 里——
+    /// **这里不重新实现一遍**。两份判据必然漂移，而漂移的方向是
+    /// "有一条链路悄悄不回落了"（D128 的形状：功能还在，只是退化了）。
+    fn apply_local_fallback(&self, routing: &mut Routing) {
+        let Some(probe) = self.local_probe.as_ref() else {
+            return;
+        };
+        if let Some(reason) = local_health::apply_fallback(routing, probe) {
+            // **回落必须看得见。** 终端上这一行是使用者唯一会主动看的地方，
+            // 而"这一轮其实没走本地那个模型"只有这里说得清。
+            //
+            // 留痕的另一半在任务台账里：理由已经被接进 `routing.reason`，
+            // 而调用方紧接着写的 `TaskPlanned` / `StepRouted` 记的正是
+            // 这份 `RoutingRecord`（含 `reason`）。
+            eprintln!("  [本地模型] {reason}。");
+        }
     }
 
     /// 推进一个任务直到完成 / 等人 / 预算用尽。
@@ -598,9 +652,13 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             explicit_multi: crate::think::detect_explicit_multi(&task.goal),
             has_code: crate::think::detect_code(&task.goal),
         };
-        let routing =
+        let mut routing =
             self.router
                 .route(&task.goal, kind, &profile, self.effort, Some(self.decider));
+        // 本地槽位不可用就改走 Agnes。**引擎不走 `ChatHandler::route_for`**，
+        // 它自己调 `router.route`，所以这一层兜底要在这里补上——
+        // 否则 `do` 里的简单步骤还是会直直打到 17872 上。
+        self.apply_local_fallback(&mut routing);
         ledger.try_charge()?;
         let req = PlanRequest {
             task_id: task.id.clone(),
@@ -733,13 +791,18 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             explicit_multi: crate::think::detect_explicit_multi(&step.instruction),
             has_code: crate::think::detect_code(&step.instruction),
         };
-        let routing = self.router.route(
+        let mut routing = self.router.route(
             &step.instruction,
             step.kind,
             &profile,
             self.effort,
             Some(decider),
         );
+        // **这一步自己判出来的路由，也要过一道本地槽位的健康。**
+        // 它就是这次要堵的那个洞：`do` 里的简单步骤判成轻量、落在本地槽位上，
+        // 而 sidecar 没起来时这一跳必然失败——对话那条链路接上了兜底，
+        // 这条没有。
+        self.apply_local_fallback(&mut routing);
         self.store.write(
             task_id,
             EventKind::StepRouted,
@@ -912,9 +975,14 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             explicit_multi: false,
             has_code: false,
         };
-        let routing = self
-            .router
-            .route(question, TaskKind::Analysis, &profile, self.effort, None);
+        let mut routing =
+            self.router
+                .route(question, TaskKind::Analysis, &profile, self.effort, None);
+        // 决策点这里按现规格**落不到本地槽位**（分析类要推理 → DeepSeek），
+        // 所以这一行今天不改变任何行为。写上是因为它便宜：`apply_fallback`
+        // 对非本地槽位连探都不探，而少了它，将来档位规则一改，
+        // 这条路上就会悄没声地多出一个"直连 17872"的口子。
+        self.apply_local_fallback(&mut routing);
 
         ledger.try_charge()?;
         let raw = self.handler.observe(
@@ -2564,6 +2632,131 @@ mod tests {
             handler.seen_providers
         );
         assert!(handler.seen_thinking[2], "分析类必须开思考");
+    }
+
+    #[test]
+    fn an_engine_without_a_probe_keeps_todays_behaviour() {
+        // **默认必须是"不探"。**
+        //
+        // 这条钉的是一个硬要求：引擎是 core 里的东西，被近千条测试反复构造。
+        // 默认去连 `127.0.0.1:17872` 的话，**测试的结论会取决于开发机上
+        // 有没有起 sidecar**——同一份代码在两台机器上答案不同，
+        // 那是最不该进断言的东西。
+        //
+        // 而且它坏起来很阴：sidecar 健康时，"探了"和"没探"的结论一模一样，
+        // 只有在没起 sidecar 的那台机器上才会突然红——那时人已经在查别的东西了。
+        //
+        // 所以这里直接断言"没挂"（字段是私有的，测试模块看得到），
+        // 再跑一遍确认路由仍然落在本地槽位上——也就是加这一层之前的样子。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let plan = serde_json::json!({
+            "steps": [
+                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "lookup" }
+            ]
+        })
+        .to_string();
+        let mut handler = ScriptedHandler::with_plan(&plan);
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "查一下今天的日程").unwrap();
+        let mut eng = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        );
+        assert!(
+            eng.local_probe.is_none(),
+            "默认必须不探：探了的话这些测试就开始依赖本机有没有起 sidecar"
+        );
+        eng.run("t1").unwrap();
+        assert_eq!(
+            handler.seen_providers[1], "local",
+            "没挂探测器时路由一个字节都不该变（{:?}）",
+            handler.seen_providers
+        );
+    }
+
+    #[test]
+    fn a_degraded_local_sidecar_moves_a_task_step_to_agnes() {
+        // **这是"任务那条路也接了兜底"的唯一钉子。**
+        //
+        // 任务引擎不走 `ChatHandler::route_for`——它自己调 `router.route`，
+        // 把 `Routing` 交给 handler。所以对话那条接上了兜底，`do` 这条还是
+        // 直直打到 `127.0.0.1:17872` 上：sidecar 没起来时，一个简单步骤
+        // 必然失败，而失败的理由（连接被拒绝）和执行本身毫无关系。
+        //
+        // 用假探测器（**不连端口**）：真起一个 4B sidecar 要几十秒和几 GB 内存，
+        // 那种测试没人会跑第二遍——于是接线断掉也没人知道。
+        //
+        // **引擎默认不挂探测器**（`None` = 和加这一层之前逐字节相同），
+        // 所以哪天有人把 `.with_local_probe` 漏掉，这条测试就会红：
+        // s1 会重新落回 `"local"`。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        // 和 `simple_steps_go_to_the_local_model_complex_steps_go_to_deepseek`
+        // 里同一个指令：查找类、判得出轻量，也就是**会落在本地槽位上**的那一种。
+        let plan = serde_json::json!({
+            "steps": [
+                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "lookup" }
+            ]
+        })
+        .to_string();
+        let mut handler = ScriptedHandler::with_plan(&plan);
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "查一下今天的日程").unwrap();
+
+        let probed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&probed);
+        let probe = Probe::new(
+            move |_endpoint: &str| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::think::local_health::LocalHealth::Degraded(
+                    "ModuleNotFoundError: No module named 'torch'".into(),
+                )
+            },
+            |_endpoint: &str| {},
+        );
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .with_local_probe(probe)
+        .run("t1")
+        .unwrap();
+
+        // 拆解走 DeepSeek（不是本地槽位），所以**只有 s1 那一次该被探**——
+        // 顺带钉住"非本地槽位连探都不探"这条在引擎里也成立。
+        assert_eq!(
+            probed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "只该为那个落在本地槽位上的步骤探一次（{:?}）",
+            handler.seen_providers
+        );
+        assert_eq!(
+            handler.seen_providers[1], "agnes",
+            "本地槽位 degraded 时，简单步骤该改走 Agnes（{:?}）",
+            handler.seen_providers
+        );
+        assert_ne!(handler.seen_providers[1], "local");
+
+        // 这次替换还得**能查出来**：`StepRouted` 记的那份路由要带着理由。
+        // 静默的替换就是 D128 那一类——事后翻台账只会看到一次普普通通的
+        // Agnes 调用，看不出本地那个模型其实一次也没被用到。
+        let routed = store
+            .events()
+            .iter()
+            .find(|e| e.kind == EventKind::StepRouted)
+            .expect("该留下一条 StepRouted");
+        let reason = routed.data["routing"]["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("ModuleNotFoundError"),
+            "回落理由要进台账，否则事后查不出为什么换了模型: {reason}"
+        );
     }
 
     #[test]

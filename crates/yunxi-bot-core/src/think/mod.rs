@@ -20,6 +20,7 @@
 pub mod agnes;
 pub mod context;
 pub mod cost;
+pub mod local_health;
 pub mod prompt;
 pub mod router;
 pub mod session;

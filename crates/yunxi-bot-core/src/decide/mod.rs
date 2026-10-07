@@ -171,6 +171,14 @@ pub enum DecisionClass {
     Urgency,
     /// 异常识别。
     Anomaly,
+    /// 路由 / 选端点。**"这一轮该发给谁"的判定就是这一类。**
+    ///
+    /// 单独一类而不是借 [`DecisionClass::Classify`]：那一类记的是
+    /// "这句话属于哪一类"，而这里的判定是"原来选的那个端点用不了"。
+    /// 两者在台账上混在一起的话，事后按类别翻记录的人
+    /// 会把**端点替换**读成**分类结果**——D128 的教训正是
+    /// "台账说了什么，就得是什么"。
+    Route,
 }
 
 /// 降级方向。
@@ -203,6 +211,12 @@ impl DecisionClass {
             DecisionClass::Urgency => DegradationDirection::FailClosed,
             // 安全侧倾向
             DecisionClass::Anomaly => DegradationDirection::FailOpen,
+            // **路由回落到能干活的那一边。**
+            //
+            // 方向是 fail-open：本地模型没就绪时**不拦这一轮**，只是换个端点把它办完。
+            // 两边的代价不对称——错判成远端多花几分钱，错判成本地则这一轮必然失败。
+            // 和 `ModelRouter` 里"拿不准就往远端倒"是同一条判据。
+            DecisionClass::Route => DegradationDirection::FailOpen,
         }
     }
 
@@ -215,6 +229,7 @@ impl DecisionClass {
             DecisionClass::Classify => "归入待分类队列，不猜",
             DecisionClass::Urgency => "按普通处理",
             DecisionClass::Anomaly => "按可疑处理并记日志",
+            DecisionClass::Route => "改走远端（Agnes），这一轮照常办",
         }
     }
 
@@ -227,6 +242,7 @@ impl DecisionClass {
             DecisionClass::Classify => "分类/归档",
             DecisionClass::Urgency => "紧急度",
             DecisionClass::Anomaly => "异常识别",
+            DecisionClass::Route => "路由/选端点",
         }
     }
 }
@@ -467,6 +483,25 @@ mod tests {
         assert_eq!(
             DecisionClass::Irreversible.direction(),
             DegradationDirection::NotApplicable
+        );
+    }
+
+    #[test]
+    fn a_route_degradation_falls_open_to_the_working_endpoint() {
+        // 本地模型没就绪时**不拦这一轮**，只是换个端点把它办完。
+        // 两边代价不对称：错判成远端多花几分钱，错判成本地则这一轮必然失败。
+        assert_eq!(
+            DecisionClass::Route.direction(),
+            DegradationDirection::FailOpen,
+            "本地槽位用不了时该往能干活的那边倒"
+        );
+        let action = DecisionClass::Route.degraded_action();
+        assert!(action.contains("远端"), "要说清落到了哪边: {action}");
+        // 它必须和"分类"分得开：混在一起的话，事后按类别翻台账的人
+        // 会把端点替换读成分类结果
+        assert_ne!(
+            DecisionClass::Route.label(),
+            DecisionClass::Classify.label()
         );
     }
 

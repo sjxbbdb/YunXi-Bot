@@ -559,7 +559,11 @@ fn run_task_round<D: yunxi_bot_core::decide::Decider>(
         // 每个任务单独跑一轮。**一个失败不影响下一个**——
         // 一个坏任务不该让整批停摆。
         let out = {
-            let mut engine = Engine::new(router, decider, handler, &mut store, budget);
+            let mut engine = Engine::new(router, decider, handler, &mut store, budget)
+                // **守护这条也要挂。** 它同样是自己调 `router.route` 的——
+                // 引擎默认不探（见 `Engine::local_probe` 的字段文档），
+                // 漏挂这一处的表现是"半夜里简单步骤全失败，而理由和任务无关"。
+                .with_local_probe(yunxi_bot_core::think::local_health::Probe::real());
             engine.run(&id)
         };
         match out {
@@ -2717,8 +2721,12 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 
     let outcome = if dry_run {
         let mut handler = chat_handler::DryRunHandler::default();
+        // **干跑也挂。** 干跑存在的意义就是"先把会怎么走说清楚"，
+        // 而它要是算出一条真跑时走不通的路由，那是**预览在骗人**——
+        // 比没有预览更糟（上面那行注释就是这个意思）。
         let out = Engine::new(&router, &decider, &mut handler, &mut store, budget)
             .with_effort(effort)
+            .with_local_probe(yunxi_bot_core::think::local_health::Probe::real())
             .run(&task_id)?;
         println!("—— 干跑推演 ——");
         for line in &handler.seen {
@@ -2756,6 +2764,11 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         println!();
         Engine::new(&router, &decider, &mut handler, &mut store, budget)
             .with_effort(effort)
+            // **本地槽位的健康要真的探。** 引擎默认不探（见
+            // `Engine::local_probe` 的字段文档），而这一条路真的会花钱：
+            // 不挂的话，一个判成轻量的步骤会直直打到 `127.0.0.1:17872` 上，
+            // 而 sidecar 没起来时那一跳必然失败，失败理由和执行毫无关系。
+            .with_local_probe(yunxi_bot_core::think::local_health::Probe::real())
             .run(&task_id)?
     };
 
@@ -3829,9 +3842,12 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             ),
         ));
     let outcome = {
-        let mut e =
-            Engine::new(&router, &decider, &mut handler, &mut store, budget).with_effort(effort);
-        e.run(id)?
+        Engine::new(&router, &decider, &mut handler, &mut store, budget)
+            .with_effort(effort)
+            // 续跑和 `do` 是**同一个任务的同一批步骤**，所以兜底也得一模一样：
+            // 少了它，"这一步在哪条命令下跑"会决定它走不走本地槽位。
+            .with_local_probe(yunxi_bot_core::think::local_health::Probe::real())
+            .run(id)?
     };
     print!("{}", summarize(&outcome.task));
     println!("\n本次模型调用 : {} 次", outcome.used_model_calls);
