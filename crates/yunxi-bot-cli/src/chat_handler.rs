@@ -809,11 +809,44 @@ impl ChatHandler {
 
         // **问一次。** `route()` 自己不再问任何人（D118 之后它谁也不问），
         // 所以不会出现"一次输入问两三次"。
-        let is_task = self
+        let verdict = self
             .decider
             .as_deref()
-            .and_then(|d| self.router.classify_input(d, input))
-            .unwrap_or(false);
+            .and_then(|d| self.router.classify_input(d, input));
+        let is_task = verdict.unwrap_or(false);
+
+        // **分类要留痕。**
+        //
+        // 这是项目自己的原则——`Routing` 的文档原话是"**理由必须进台账**，
+        // 否则事后无法解释为什么花了钱"。而分类恰恰是决定"花钱还是免费"
+        // 的那一步：判成任务走 DeepSeek（收费），判成闲聊走 Agnes（免费）。
+        //
+        // 不留痕的话，事后翻台账查不出三件事：
+        // 1. 某一句被判成了哪一类
+        // 2. 它是不是因为**决策模型挂了**才回的"闲聊"
+        //    （`verdict == None` 就是那个信号，`degraded` 记的就是它）
+        // 3. 分类一共让它多花了多少钱
+        //
+        // **第 2 条最要紧**：D104/D106 两次静默降级都是这个形状——
+        // 功能还在，只是退化了，而退化之后看起来和正常一模一样。
+        //
+        // 台账**按需开**，和上面 `with_recalled_memory` 同一个写法——
+        // `ChatHandler` 不常驻一个台账句柄（那会让它的生命周期
+        // 和调用方纠缠在一起）。开不出来就算了：**留痕失败不该挡住对话。**
+        if let Ok(mut ledger) = yunxi_bot_core::ledger::Ledger::open(self.home.join("ledger.jsonl"))
+        {
+            let _ = yunxi_bot_core::decide::record_decision(
+                &mut ledger,
+                yunxi_bot_core::decide::DecisionClass::Classify,
+                // **拿不到答案就是降级**——不是"它说是闲聊"。
+                // 这两件事在行为上一样（都走免费端点），但在台账上必须分得开。
+                verdict.is_none(),
+                if is_task { "task" } else { "chat" },
+                "问决策模型：这句话是要我办事，还是随口聊聊",
+                Some("verdict-small"),
+                &["input_kind".to_string()],
+            );
+        }
         // 是任务就细化成具体类型；词表认不出来时按"生成"兜
         // （**那仍然是任务**，只是不知道是哪一类）。
         let kind = if is_task {
