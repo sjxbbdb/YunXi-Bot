@@ -27,6 +27,7 @@
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -34,6 +35,23 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+
+# **自己把 home 定下来，不指望继承。**
+#
+# 踩过的坑：用 `[Environment]::SetEnvironmentVariable(..., "User")` 设的
+# 变量，**只有之后新起的进程才看得到**。而当前这个终端（以及它拉起的
+# 一切）是在设之前启动的——于是子进程读不到 YUNXI_BOT_HOME，
+# 回落到 `%LOCALAPPDATA%\YunXiBot`，而那个位置已经搬空了。
+# 表现是"模型加载不了"，看着像模型的错，其实是环境没传下去。
+#
+# 所以这里**显式读一次用户级的值**：进程环境里没有就用它兜。
+if not os.environ.get("YUNXI_BOT_HOME"):
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
+            os.environ["YUNXI_BOT_HOME"] = winreg.QueryValueEx(k, "YUNXI_BOT_HOME")[0]
+    except Exception:  # noqa: BLE001 —— 读不到就算了，还能用默认位置
+        pass
 PY = REPO / ".venv" / "Scripts" / "python.exe"
 SERVER = REPO / "sidecar" / "local_llm_server.py"
 PORT = 17875
@@ -74,8 +92,9 @@ def wait_health(timeout: float) -> bool:
     return False
 
 
-def ask(messages, max_tokens=300, temperature=0.7):
-    body = json.dumps({"messages": messages, "max_tokens": max_tokens,
+def ask(messages, max_tokens=300, temperature=0.7, persona=None):
+    msgs = ([{"role": "system", "content": persona}] if persona else []) + messages
+    body = json.dumps({"messages": msgs, "max_tokens": max_tokens,
                        "temperature": temperature}).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions",
                                  data=body, headers={"Content-Type": "application/json"})
@@ -87,7 +106,7 @@ def ask(messages, max_tokens=300, temperature=0.7):
     return d["choices"][0]["message"]["content"], dt, u["completion_tokens"]
 
 
-def run_model(model: str, repeat: int) -> dict:
+def run_model(model: str, repeat: int, persona: str | None = None) -> dict:
     """跑一个模型，返回 {场景: [(text, dt, tokens), ...]}"""
     proc = subprocess.Popen(
         [str(PY), "-u", str(SERVER), "--model", model, "--port", str(PORT),
@@ -100,7 +119,7 @@ def run_model(model: str, repeat: int) -> dict:
             print(f"  ✗ {model} 没能就绪")
             return res
         try:
-            ask([{"role": "user", "content": "你好"}], max_tokens=8)
+            ask([{"role": "user", "content": "你好"}], max_tokens=8, persona=persona)
         except Exception:  # noqa: BLE001
             pass  # 首调热身，失败不影响后面
         for name, tone, msgs in CASES:
@@ -108,7 +127,7 @@ def run_model(model: str, repeat: int) -> dict:
             res[key] = []
             for i in range(repeat):
                 try:
-                    text, dt, n = ask(msgs)
+                    text, dt, n = ask(msgs, persona=persona)
                     res[key].append((text, dt, n))
                 except Exception as e:  # noqa: BLE001
                     res[key].append((f"<失败 {e}>", 0.0, 0))
@@ -132,13 +151,19 @@ def main() -> int:
     ap.add_argument("--models", nargs="+",
                     default=["MiniCPM5-2B", "Qwen3-4B-Instruct-2507"])
     ap.add_argument("--repeat", type=int, default=3)
+    ap.add_argument("--persona", default=None,
+                    help="人格文件路径。会作为 system 消息插到最前面")
     args = ap.parse_args()
 
+    persona = None
+    if args.persona:
+        persona = Path(args.persona).read_text(encoding="utf-8")
+        print(f"人格：{args.persona}（{len(persona)} 字）")
     OUT.mkdir(parents=True, exist_ok=True)
     allres = {}
     for m in args.models:
         print(f"\n=== {m} ===")
-        allres[m] = run_model(m, args.repeat)
+        allres[m] = run_model(m, args.repeat, persona)
 
     md = ["# 本地模型对比：多场景 × 多语气 × 多次采样", "",
           f"每格 {args.repeat} 次采样，temperature=0.7，max_tokens=300。", ""]
@@ -152,7 +177,8 @@ def main() -> int:
             for i, (text, dt, n) in enumerate(runs, 1):
                 md.append(f"**第 {i} 次**（{dt:.1f}s / {n} tok）\n")
                 md.append(f"> {text}\n")
-    report = OUT / "对比报告.md"
+    tag = Path(args.persona).stem if args.persona else "无人格"
+    report = OUT / f"对比报告-{tag}.md"
     report.write_text("\n".join(md), encoding="utf-8")
     print(f"\n全文报告：{report}")
     print(f"（{len(CASES)} 个用例 × {args.repeat} 次 × {len(args.models)} 个模型"
