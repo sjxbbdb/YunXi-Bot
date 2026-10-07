@@ -515,8 +515,32 @@ impl ChatHandler {
     ///
     /// **认不出就说认不出**，不硬猜：硬猜一个比不猜更坏，
     /// 因为它看起来像有依据，事后没法归因。
+    ///
+    /// ## 这一处也要留痕，而且四件事一件都不能少
+    ///
+    /// 门控决定的是一件很贵的事：判成"要召回"就去翻记忆、往提示词里塞
+    /// （白占 token，还可能把回答带偏）；判成"不用"就直接跳过。
+    /// 而它**只在关键词判不准时才跑**——所以频率天然很低，
+    /// 每一条都值得写下来。
+    ///
+    /// 要能回答的是四件事：
+    ///
+    /// 1. **这一步到底问没问过模型**（`decision_asked` 在不在）
+    /// 2. 它判成了哪一类（`action`）
+    /// 3. **它是不是没答出来**（`degraded`）——这是最要紧的一条：
+    ///    弃权之后行为上和"它说是闲聊"一样（都退回关键词），
+    ///    但一个是判断、一个是故障，事后必须分得开（D104/D106 两次
+    ///    静默降级都是这个形状）
+    /// 4. 是谁答的（`model`）
+    ///
+    /// 类别是 `Classify`：这一问的实质是"这句话属于哪一类"
+    /// （问世界 / 问使用者本人 / 问经历过的事…），和 `route_for` 里
+    /// 那个"这句话是要我办事，还是随口聊聊"是同一类判断。
+    /// 不借 `Route`：那一类记的是"原来选的端点用不了"，这里根本没有端点。
     fn gate_with_model(&self, input: &str) -> Option<yunxi_bot_core::recall_gate::MemoryNeed> {
         use yunxi_bot_core::decide::DecisionRequest;
+        // **没挂决策器 = 这一步没问过模型**，不是"问了没答"。
+        // 所以这一条路连一句 `decision_asked` 都不写——记了就是假账。
         let d = self.decider.as_deref()?;
         // **只喂判断所需的证据。** 把整段上下文倒进去既浪费调用，
         // 也让"它凭什么这么判"变得不可复核。
@@ -524,9 +548,101 @@ impl ChatHandler {
             serde_json::json!({ "使用者这一句": input }),
             yunxi_bot_core::recall_gate::gate_questions(),
         );
-        let res = d.decide(&req).ok()?;
-        let answer = res.answer(yunxi_bot_core::recall_gate::GATE_QUESTION)?;
-        yunxi_bot_core::recall_gate::need_from_choice(answer.choice.as_deref())
+        let qid = yunxi_bot_core::recall_gate::GATE_QUESTION.to_string();
+
+        // 三条出口各自是什么，全部在这里定下来（`need` / `degraded` / 理由），
+        // 然后**只写一次台账**：分支里各写一遍的话，迟早有一条忘了写，
+        // 而"忘了写"的表现恰好就是"看起来一切正常，只是查不出来"。
+        let (need, action, degraded, reason, model) = match d.decide(&req) {
+            Ok(res) => {
+                let choice = res
+                    .answer(yunxi_bot_core::recall_gate::GATE_QUESTION)
+                    .and_then(|a| a.choice.clone());
+                match yunxi_bot_core::recall_gate::need_from_choice(choice.as_deref()) {
+                    Some(n) => {
+                        let reason = format!("决策模型判定这一句需要「{}」", n.label());
+                        (
+                            Some(n),
+                            choice.unwrap_or_default(),
+                            false,
+                            reason,
+                            Some(res.model),
+                        )
+                    }
+                    // 选项认不出 = 弃权。**退回关键词判断，但如实记成降级**：
+                    // 行为上和"模型说不用召回"可能一样，性质完全不同。
+                    None => (
+                        None,
+                        "退回关键词判断".to_string(),
+                        true,
+                        "决策模型没有给出可识别的选项（弃权），退回关键词判断".to_string(),
+                        Some(res.model),
+                    ),
+                }
+            }
+            Err(e) => (
+                None,
+                "退回关键词判断".to_string(),
+                true,
+                format!("决策模型不可用（{e}），退回关键词判断"),
+                // 没有模型回答过这一问——填一个模型名会把归因引到
+                // 一次根本没发生过的调用上（D128 就是被这种假账骗过去的）。
+                None,
+            ),
+        };
+
+        // 台账**按需开**，和上面 `route_for` / `apply_local_fallback` 同一个写法
+        // （`ChatHandler` 不常驻一个台账句柄——那会让它的生命周期和调用方
+        // 纠缠在一起）。开不出来就算了：**留痕失败不该挡住对话。**
+        if let Ok(mut ledger) = yunxi_bot_core::ledger::Ledger::open(self.home.join("ledger.jsonl"))
+        {
+            let _ = yunxi_bot_core::decide::record_decision(
+                &mut ledger,
+                yunxi_bot_core::decide::DecisionClass::Classify,
+                degraded,
+                &action,
+                &reason,
+                model.as_deref(),
+                &[qid],
+            );
+        }
+
+        need
+    }
+
+    /// 工具审批那一层的决策台账：**按需开一本**，没挂决策器就不开。
+    ///
+    /// ## 为什么是"按需开"而不是常驻一个句柄
+    ///
+    /// 和 `route_for` / `apply_local_fallback` 同一个写法：`ChatHandler`
+    /// 被 CLI、任务引擎、守护三条路复用，常驻一个台账句柄会让它的生命周期
+    /// 和调用方纠缠在一起；而开一本台账的代价是读一遍现有事件——
+    /// 一轮一次，和它已经做的那几次读取同一个量级。
+    ///
+    /// ## 为什么"没挂决策器就不开"
+    ///
+    /// 门禁的第二层根本不会发生（没有决策器就没有模型访问），
+    /// 开出来的只会是一本永远空着的台账：多一次建文件、多一个文件。
+    /// **留痕的对象是"模型做过的判断"，不是"一轮对话"**——
+    /// 没有判断就不该有痕。
+    ///
+    /// 开不出来就返回 `None`（目录不可写、台账损坏…）：**留痕失败不该
+    /// 挡住对话**，这一层和 `route_for` 里那句 `if let Ok(...)` 同一条判据。
+    ///
+    /// ## 为什么是关联函数而不是 `&self` 方法
+    ///
+    /// 调它的地方（`convey`）此刻已经可变借着 `self.sessions` 了，
+    /// 再从 `self` 上借一次会被借用检查器拦下。这个函数只需要两个字段，
+    /// 那就只传那两个——**把借用关系摆在签名上**，和
+    /// `task::engine::run_decision` 收 `decider` 参数是同一条理由。
+    fn open_tool_decision_ledger(
+        home: &std::path::Path,
+        has_decider: bool,
+    ) -> Option<yunxi_bot_core::ledger::Ledger> {
+        if !has_decider {
+            return None;
+        }
+        yunxi_bot_core::ledger::Ledger::open(home.join("ledger.jsonl")).ok()
     }
 
     /// 给这一句话配上相关的往事，拼成易变尾。
@@ -1093,6 +1209,14 @@ impl ChatHandler {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             yunxi_bot_core::policy::SandboxMode::WorkspaceWrite,
         );
+
+        // **工具审批那一层的决策台账：按需开。**
+        //
+        // 和 `route_for` / `apply_local_fallback` 同一个写法——`ChatHandler`
+        // 不常驻一个台账句柄（那会让它的生命周期和调用方纠缠在一起），
+        // 而工具门禁是在这一层深层发生的，拿不到调用方手里那本。
+        let mut tool_decision_ledger =
+            Self::open_tool_decision_ledger(&self.home, self.decider.is_some());
         // **纯生成型的意图不给工具。**
         //
         // 判据是"这一步的产出是文本，还是动作"：
@@ -1122,6 +1246,12 @@ impl ChatHandler {
             });
         if let Some(d) = &self.decider {
             runner = runner.with_decider(&**d);
+        }
+        // **审批那一层的判断也要留痕。** 挂的是上面那本按需开的台账：
+        // 漏挂的表现是"审批照样工作、终端照样有提示，而'这个动作是谁批准的'
+        // 在台账里查不出来"——D133 那种形状。
+        if let Some(l) = tool_decision_ledger.as_mut() {
+            runner = runner.with_decision_ledger(l);
         }
         if let Some(f) = &self.on_delta {
             runner = runner.with_on_delta(f.clone());
@@ -1986,6 +2116,137 @@ mod chat_session_tests {
         assert!(
             text.contains("ModuleNotFoundError"),
             "原因要进台账，否则事后查不出为什么换了模型: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 召回门控：问过模型没有、它是不是弃权，必须能查出来 ----
+
+    /// **关键词拿不准时问过模型 → 台账里必须有一条 `Classify` 决策事件。**
+    ///
+    /// 这一处在此之前只有终端上那句 `memory_decision:`。终端那一行活在
+    /// 这一次运行里，而"这一句为什么去翻了记忆 / 为什么没翻"是要事后查的
+    /// （D76 / D82 两次都是靠行为反推的）。
+    #[test]
+    fn the_recall_gate_decision_is_visible_in_the_ledger() {
+        let dir =
+            std::env::temp_dir().join(format!("yunxi-recall-gate-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+
+        let stub = yunxi_bot_core::decide::StubDecider::succeeding()
+            .with_choice(yunxi_bot_core::recall_gate::GATE_QUESTION, "profile");
+        let h = ChatHandler::new(dir.clone(), "云熙", DEFAULT_PERSONA, default_rules())
+            .with_decider(std::sync::Arc::new(stub));
+
+        // 「量子色动力学的重整化群方程」是文档里那个例子：
+        // 没有疑问句式、也没有个人指代，关键词只能判成 Mixed。
+        let need = h.gate_with_model("量子色动力学的重整化群方程");
+        assert_eq!(
+            need,
+            Some(yunxi_bot_core::recall_gate::MemoryNeed::Profile),
+            "留痕不该改变门控结论"
+        );
+
+        let text = std::fs::read_to_string(dir.join("ledger.jsonl")).expect("台账该被写出来");
+        assert!(
+            text.contains(r#""class":"classify""#),
+            "这一问的实质是分类（这句话属于哪一类），不是路由: {text}"
+        );
+        assert!(
+            text.contains(r#""degraded":false"#),
+            "模型答了就不是降级: {text}"
+        );
+        assert!(
+            text.contains(r#""memory_need""#),
+            "问句 id 要进台账——它同时是'哪个环节问的'的唯一标识: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **模型答不出来时同样是 `Classify`，但 `degraded` 必须是 true。**
+    ///
+    /// 这是这一处留痕的全部意义：弃权之后行为上和"它说不用召回"一样
+    /// （都退回关键词），事后只有 `degraded` 能把两者分开。
+    #[test]
+    fn an_unanswerable_recall_gate_is_recorded_as_degraded() {
+        let dir =
+            std::env::temp_dir().join(format!("yunxi-recall-gate-degraded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+
+        let stub = yunxi_bot_core::decide::StubDecider::failing("sidecar 没起来");
+        let h = ChatHandler::new(dir.clone(), "云熙", DEFAULT_PERSONA, default_rules())
+            .with_decider(std::sync::Arc::new(stub));
+
+        assert!(
+            h.gate_with_model("量子色动力学的重整化群方程").is_none(),
+            "问不出来就该退回关键词"
+        );
+
+        let text = std::fs::read_to_string(dir.join("ledger.jsonl")).expect("台账该被写出来");
+        assert!(text.contains(r#""class":"classify""#), "{text}");
+        assert!(
+            text.contains(r#""degraded":true"#),
+            "问过但答不出来 = 降级，不能记成一次正常判断: {text}"
+        );
+        assert!(
+            text.contains("sidecar 没起来"),
+            "故障原文要留下——'门控为什么一直没生效'的答案在这句里: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **没挂决策器 = 这一步没问过模型**：一条决策事件都不许写。
+    #[test]
+    fn without_a_decider_the_recall_gate_writes_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("yunxi-recall-gate-nosink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+
+        let h = ChatHandler::new(dir.clone(), "云熙", DEFAULT_PERSONA, default_rules());
+        assert!(
+            h.gate_with_model("量子色动力学的重整化群方程").is_none(),
+            "没决策器就问不出来"
+        );
+        // 台账文件是 `ChatHandler::new` 读常驻记忆时**本来就会建**的
+        // （`resident_memory_block` 要打开它）。所以这里不能断言"文件不存在"，
+        // 要断言的是**里面没有那条不该有的决策事件**——那才是假账。
+        let text = std::fs::read_to_string(dir.join("ledger.jsonl")).unwrap_or_default();
+        assert!(
+            !text.contains(r#""kind":"decision_asked""#)
+                && !text.contains(r#""kind":"decision_decided""#),
+            "没问过模型却写了一条决策事件——那就是假账: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **工具审批那一层的台账：没挂决策器就不开。**
+    ///
+    /// 那一层的模型访问根本不会发生，开出来的只会是一本永远空着的台账。
+    #[test]
+    fn the_tool_decision_ledger_is_only_opened_when_a_decider_exists() {
+        let dir =
+            std::env::temp_dir().join(format!("yunxi-tool-decision-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+
+        assert!(
+            ChatHandler::open_tool_decision_ledger(&dir, false).is_none(),
+            "没挂决策器就不该开——那本台账会是空的"
+        );
+
+        let opened = ChatHandler::open_tool_decision_ledger(&dir, true);
+        assert!(
+            opened.is_some(),
+            "挂了决策器就必须开——否则审批那一层的判断一条痕都留不下"
+        );
+        // 而且开出来的就是**这一本**（同一个 home），不是别处。
+        assert_eq!(
+            opened.as_ref().map(|l| l.path().to_path_buf()),
+            Some(dir.join("ledger.jsonl")),
+            "台账要落在 home 下那一本上，否则查的时候要分几个地方找"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

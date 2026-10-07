@@ -203,6 +203,25 @@ fn parse_action(choice: Option<&str>) -> Intervention {
 ///
 /// 流程：`state` 构造 → 模型判断 → 约束修正。
 /// 模型不可用时按 `Interrupt` 类别降级，方向 fail-closed（不打扰）。
+///
+/// 这一条是**不留痕**的旧签名，等价于 [`decide_intervention_with_ledger`]
+/// 传一个空口子。
+///
+/// ## 为什么旧签名还要留着，而不是让所有调用方都传台账
+///
+/// 这一处和别处不同的地方在于：**两个真的调用它的地方本来就已经在记账**
+/// （[`crate::agent::run_cycle`] 和 `cmd_companion` 各自写一对
+/// `DecisionClass::Interrupt` 决策事件，字段就是下面算出来的
+/// action / reason / degraded）。
+///
+/// 所以这里**不能**再记一遍：一次介入会变成两条 `decision_decided`，
+/// 而 `agent::derive_situation` 正是按 `DecisionDecided` 数
+/// "今天打扰了几次""距上次互动多久"的——重复记会让约束层以为
+/// 自己刚打扰过两次，**主动开口于是被自己压下去**。
+///
+/// 留着这个空口子是为了另一个场景：将来多一个调用方（比如别的前端),
+/// 它手里有台账、又不走 `run_cycle` 那条路，就直接用带台账的那个版本，
+/// 不必照抄一遍 `record_decision` 的字段。
 pub fn decide_intervention<D: Decider>(
     engine: &mut DecisionEngine<D>,
     memory: &Memory,
@@ -211,13 +230,52 @@ pub fn decide_intervention<D: Decider>(
     local_hour: u8,
     now_ms: u64,
 ) -> InterventionDecision {
+    decide_intervention_with_ledger(engine, memory, ctx, policy, local_hour, now_ms, None)
+}
+
+/// 同 [`decide_intervention`]，但把这次判断**记进台账**。
+///
+/// ## 记的是"最终动作"，不是"模型建议"
+///
+/// 台账里的 `action` 是**约束收紧之后**的那个动作（`Speak/Hold/Quiet`），
+/// 和 `InterventionDecision.action` 是同一个值——这样"台账说延后、
+/// 终端说延后、实际也延后"三处才是同一份数据（D128 的教训）。
+/// 模型原本建议什么在 `reason` 里（"模型建议「主动开口」，被约束收紧为…"）。
+///
+/// ## `degraded` 如实来
+///
+/// 模型正常答了是 `false`（哪怕它的建议随后被约束压下去了——**被约束压住
+/// 不是降级**，那是设计好的第二层），模型不可用才是 `true`。
+/// 把这两件事混起来正是早先版本犯过的错：调用方为了省事一律构造 `Degraded`，
+/// 台账于是把成功的判断也标成降级。
+///
+/// ## 只记"真的问了模型"的那条路
+///
+/// 这个函数一定会去问（`DecisionEngine::decide` 永不返回 Err，
+/// 熔断打开时会给出降级结论——那也是"问过了、引擎说它不可用"）。
+/// 所以这里只有一条路径：留痕。
+#[allow(clippy::too_many_arguments)]
+pub fn decide_intervention_with_ledger<D: Decider>(
+    engine: &mut DecisionEngine<D>,
+    memory: &Memory,
+    ctx: &Situation,
+    policy: &CompanionPolicy,
+    local_hour: u8,
+    now_ms: u64,
+    decision_sink: crate::decide::DecisionSink<'_>,
+) -> InterventionDecision {
     let state = memory.build_decision_state(ctx, now_ms, 5);
-    let req = crate::decide::DecisionRequest::new(state, intervention_questions());
+    let questions = intervention_questions();
+    // **问句 id 从真正发出去的那一份问题集里取**，不在这里手抄一遍：
+    // 手抄的那份迟早会和 `intervention_questions()` 漂开，而漂开的表现是
+    // 台账说"我问了 X"，实际问的是 Y——D128 的形状。
+    let question_ids: Vec<String> = questions.iter().map(|q| q.id.clone()).collect();
+    let req = crate::decide::DecisionRequest::new(state, questions);
     let outcome = engine.decide(&req);
 
     let verdict = constraint_ceiling(ctx, policy, local_hour);
 
-    match outcome {
+    let (decision, model) = match outcome {
         DecisionOutcome::Decided(result) => {
             let model_action = parse_action(result.choice("intervention"));
             let final_action = model_action.more_conservative(verdict.ceiling);
@@ -233,25 +291,51 @@ pub fn decide_intervention<D: Decider>(
                 )
             };
 
-            InterventionDecision {
-                action: final_action,
-                reason,
-                degraded: false,
-                model_suggested_speak: model_action == Intervention::Speak,
-            }
+            (
+                InterventionDecision {
+                    action: final_action,
+                    reason,
+                    degraded: false,
+                    model_suggested_speak: model_action == Intervention::Speak,
+                },
+                // 回答的模型名要进台账：归因是这一层留痕的意义所在。
+                Some(result.model),
+            )
         }
         DecisionOutcome::Degraded { action, reason, .. } => {
             // 降级方向由类别决定：Interrupt 是 fail-closed。
             // 约束仍然生效——降级不等于绕过使用者的设定。
             let degraded_action = Intervention::Hold.more_conservative(verdict.ceiling);
-            InterventionDecision {
-                action: degraded_action,
-                reason: format!("决策模型不可用，按 Interrupt 类别降级（{action}）：{reason}"),
-                degraded: true,
-                model_suggested_speak: false,
-            }
+            (
+                InterventionDecision {
+                    action: degraded_action,
+                    reason: format!("决策模型不可用，按 Interrupt 类别降级（{action}）：{reason}"),
+                    degraded: true,
+                    model_suggested_speak: false,
+                },
+                // 没有模型答过这一问——别把归因引到一次没发生过的调用上。
+                None,
+            )
         }
+    };
+
+    if let Err(e) = crate::decide::record_decision_optional(
+        decision_sink,
+        // **类别就是 `Interrupt`**，和 `companion_engine` 建引擎时用的是同一个：
+        // 陪伴介入属于"打扰/通知"，降级方向 fail-closed（不确定就不打扰）。
+        // 这和 `InterventionDecision.degraded` 是两件事，不要合并。
+        DecisionClass::Interrupt,
+        decision.degraded,
+        decision.action.label(),
+        &decision.reason,
+        model.as_deref(),
+        &question_ids,
+    ) {
+        // 写失败只报不中断：留痕失败不该让人错过一次本来就该发生的开口。
+        eprintln!("⚠ 陪伴介入留痕写入失败（不影响判断）: {e}");
     }
+
+    decision
 }
 
 /// 把一条信息写进记忆的事件载荷。供调用方 append 到台账。
@@ -437,5 +521,185 @@ mod tests {
         );
         assert_eq!(d.action, Intervention::Hold);
         assert!(d.degraded);
+    }
+
+    // ---- 留痕：这一处"问过模型没有、它是不是弃权"必须查得出来 ----
+
+    /// 一个临时台账。文件名带 tag，避免并行跑的测试互相踩。
+    fn tmp_ledger(tag: &str) -> (std::path::PathBuf, crate::ledger::Ledger) {
+        let p = std::env::temp_dir().join(format!(
+            "yunxi-companion-{}-{tag}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        let l = crate::ledger::Ledger::open(&p).expect("开台账");
+        (p, l)
+    }
+
+    fn decided_event(ledger: &crate::ledger::Ledger) -> &crate::ledger::Event {
+        ledger
+            .events()
+            .iter()
+            .find(|e| e.kind == crate::ledger::EventKind::DecisionDecided)
+            .expect("应有一条 decision_decided")
+    }
+
+    /// **模型正常判断 → 记一条 `Interrupt`、`degraded = false`。**
+    ///
+    /// 用真台账（临时文件）：要验的四条（类别 / degraded / 动作 / 问句 id）
+    /// 全在 `record_decision` 那一层，换掉器件就等于把要验的那层换掉了。
+    #[test]
+    fn a_companion_judgment_is_recorded_when_a_ledger_is_attached() {
+        let (path, mut ledger) = tmp_ledger("judged");
+        let stub = StubDecider::succeeding()
+            .with_choice("intervention", "speak")
+            .with_noul("needs_support", 0.2)
+            .with_noul("is_anomaly", 0.1);
+        let mut engine = companion_engine(stub);
+        let d = decide_intervention_with_ledger(
+            &mut engine,
+            &memory_with_facts(),
+            &ctx(),
+            &CompanionPolicy::default(),
+            14,
+            1_000_000,
+            Some(&mut ledger),
+        );
+        assert_eq!(d.action, Intervention::Speak, "留痕不该改变结论");
+
+        let decided = decided_event(&ledger);
+        assert_eq!(
+            decided.data["class"],
+            serde_json::json!("interrupt"),
+            "陪伴介入是打扰类——它的降级方向是不打扰: {}",
+            decided.data
+        );
+        assert_eq!(
+            decided.data["degraded"],
+            serde_json::json!(false),
+            "模型答了不是降级: {}",
+            decided.data
+        );
+        assert_eq!(
+            decided.data["action"],
+            serde_json::json!(Intervention::Speak.label()),
+            "台账里的动作必须和真正执行的那个是同一个值（D128）: {}",
+            decided.data
+        );
+        assert_eq!(decided.data["model"], serde_json::json!("stub"));
+
+        // 问句 id 从真正发出去的问题集里取：三个一个都不能少、也不能编。
+        let asked = ledger
+            .events()
+            .iter()
+            .find(|e| e.kind == crate::ledger::EventKind::DecisionAsked)
+            .expect("应有一条 decision_asked");
+        assert_eq!(
+            asked.data["questions"],
+            serde_json::json!(["intervention", "needs_support", "is_anomaly"]),
+            "台账里记的问句必须是真正问出去的那几个: {}",
+            asked.data
+        );
+        assert_eq!(asked.span, decided.span, "审计对要落在同一个边界里");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **模型不可用 → `degraded = true`，而且理由里带故障原文。**
+    ///
+    /// 这一条和"模型答了 hold"在外部行为上几乎一样（都不打扰），
+    /// 在台账上必须分得开：一个是判断，一个是故障。
+    #[test]
+    fn a_degraded_companion_judgment_says_so_in_the_ledger() {
+        let (path, mut ledger) = tmp_ledger("degraded");
+        let mut engine = companion_engine(StubDecider::failing("连接被拒绝"));
+        let d = decide_intervention_with_ledger(
+            &mut engine,
+            &memory_with_facts(),
+            &ctx(),
+            &CompanionPolicy::default(),
+            14,
+            1_000_000,
+            Some(&mut ledger),
+        );
+        assert!(d.degraded);
+
+        let decided = decided_event(&ledger);
+        assert_eq!(decided.data["class"], serde_json::json!("interrupt"));
+        assert_eq!(
+            decided.data["degraded"],
+            serde_json::json!(true),
+            "模型不可用必须如实记成降级: {}",
+            decided.data
+        );
+        assert_eq!(
+            decided.data["model"],
+            serde_json::json!(null),
+            "没有模型答过这一问，别把归因引到一次没发生过的调用上: {}",
+            decided.data
+        );
+        let reason = decided.data["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("连接被拒绝"),
+            "故障原文要留下——'它为什么不说话了'的答案在这句里: {reason}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 约束把模型压下去的那一种**不是降级**：模型答了，只是被设计好的
+    /// 第二层收紧了。混起来会让台账把正常判断说成故障。
+    #[test]
+    fn being_pressed_down_by_the_constraint_is_not_a_degradation() {
+        let (path, mut ledger) = tmp_ledger("pressed");
+        let stub = StubDecider::succeeding().with_choice("intervention", "speak");
+        let mut engine = companion_engine(stub);
+        // 凌晨 3 点：模型想说，但约束不允许。
+        let d = decide_intervention_with_ledger(
+            &mut engine,
+            &memory_with_facts(),
+            &ctx(),
+            &CompanionPolicy::default(),
+            3,
+            1_000_000,
+            Some(&mut ledger),
+        );
+        assert_eq!(d.action, Intervention::Hold);
+
+        let decided = decided_event(&ledger);
+        assert_eq!(
+            decided.data["degraded"],
+            serde_json::json!(false),
+            "被约束收紧不是降级——那是设计好的第二层: {}",
+            decided.data
+        );
+        assert_eq!(
+            decided.data["action"],
+            serde_json::json!(Intervention::Hold.label()),
+            "记的是收紧之后的最终动作: {}",
+            decided.data
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **不挂台账 = 与从前逐字节相同**：没有那一对事件，判断一个字都不变。
+    #[test]
+    fn a_companion_judgment_without_a_ledger_keeps_todays_behaviour() {
+        let (path, ledger) = tmp_ledger("no-sink");
+        let stub = StubDecider::succeeding().with_choice("intervention", "speak");
+        let mut engine = companion_engine(stub);
+        let d = decide_intervention(
+            &mut engine,
+            &memory_with_facts(),
+            &ctx(),
+            &CompanionPolicy::default(),
+            14,
+            1_000_000,
+        );
+        assert_eq!(d.action, Intervention::Speak);
+        assert!(
+            ledger.events().is_empty(),
+            "没挂台账却写了东西: {:?}",
+            ledger.events()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -194,11 +194,58 @@ pub fn parse_options(raw: &str) -> Result<(String, Vec<String>), TaskError> {
 /// 返回 `Ok(TaskDecision::NeedsHuman)` 与 `Err(TaskError::NeedsHuman)` 的区别是
 /// "问过了，模型弃权"与"压根不该问"（判据本身不合法）。调用方对两者的处置一样：
 /// 停下等人。
+///
+/// 这一条是**不留痕**的旧签名，等价于 [`decision_point_with_ledger`] 传一个空口子。
 pub fn decision_point(
     decider: &dyn Decider,
     key: &str,
     question: &str,
     criteria: &[(&str, &str)],
+) -> Result<TaskDecision, TaskError> {
+    decision_point_with_ledger(decider, key, question, criteria, None)
+}
+
+/// 同 [`decision_point`]，但把这次判断记进台账。
+///
+/// ## 为什么这一处是六处里最该留痕的一处
+///
+/// 决策点是**"人从回路里退出去"的那个位置**：以前每个 `decide:` 都问人，
+/// 人看到问题本身就是一道检查；现在本地决策模型自己拍板。
+/// 于是"它拍了什么、凭什么、有没有不敢定"只能靠台账回答。
+///
+/// 在此之前只有**拍板那条路**留下了痕（`StepSucceeded` 的 result 里有
+/// choice / rationale），**弃权那条路只写进 `TaskDecision` 的返回值**——
+/// 谁没接住就没了。而弃权恰恰是最需要解释的那一种：
+/// "它为什么不敢定"直接说明那一类问题它判不了，那正是该去调提示词
+/// 或补样本的地方（D78 / D104 两次都是这个缺口）。
+///
+/// ## 类别是 `Escalate`，判据是"弃权之后干什么"
+///
+/// 这个函数**所有**不确定路径的出口都是同一个 [`escalate`]——停下等人。
+/// 那正是 [`DecisionClass::Escalate`] 的语义（"升级 / 人工介入"），
+/// 它的降级方向是 fail-open（"不确定就叫人"）、降级动作原文是"升级给人"。
+///
+/// - 不借 `Classify`：那一类的降级动作是"归入待分类队列，不猜"，
+///   而这里弃权**不是不猜，是不敢猜** —— 处置是叫人，不是搁着。
+///   （注意 `Classify` 恰好也是 fail-closed，方向对不上就更不能借。）
+/// - 不借 `Irreversible`：那一类的前提是"模型判断不参与"，
+///   而这一整条路就是模型的判断。
+/// - 不借 `Interrupt`：那是打扰/通知，方向与我们**相反**
+///   （不打扰 vs 叫人），借它会把降级方向记反。
+///
+/// ## 只记"真的问过模型"的那条路
+///
+/// 判据不合法时在下面直接返回 `Err`，**一个字都没发出去**——
+/// 那种情况不记，理由和 [`crate::tool::gate_with_ledger`] 一样：
+/// `record_decision` 写的第一条就叫 `decision_asked`，记了就是假账。
+/// （这一条也是原注释里的话："问出来的答案没有意义，却会被当成一次
+/// 真实判断记进台账"。）
+pub fn decision_point_with_ledger(
+    decider: &dyn Decider,
+    key: &str,
+    question: &str,
+    criteria: &[(&str, &str)],
+    decision_sink: crate::decide::DecisionSink<'_>,
 ) -> Result<TaskDecision, TaskError> {
     // 判据不合法就不该问模型：问出来的答案没有意义，却会被当成一次真实判断记进台账。
     if criteria.len() < MIN_OPTIONS {
@@ -244,46 +291,117 @@ pub fn decision_point(
     });
     let req = DecisionRequest::new(state, vec![Question::choice(key, question, criteria)]);
 
-    let Ok(result) = decider.decide(&req) else {
+    // 问过模型之后**全部**出口都收在这里，然后一次性留痕。
+    //
+    // 不在每个分支里各写一遍 `record`：那迟早会有一条分支忘了写，
+    // 而"忘了一条"恰恰是最难发现的那种——功能全对、终端全对，
+    // 只是台账里少一条（D78 的弃权缺口就是这么来的）。
+    let settled = settle_decision(decider, &req, key, question, &options, criteria);
+
+    if let Err(e) = crate::decide::record_decision_optional(
+        decision_sink,
+        // 类别见 `decision_point_with_ledger` 的文档：这一处所有不确定
+        // 路径的出口都是"停下等人"，那正是 Escalate 的语义。
+        crate::decide::DecisionClass::Escalate,
+        settled.degraded,
+        &settled.action,
+        &settled.why,
+        settled.model.as_deref(),
+        &[key.to_string()],
+    ) {
+        // 写失败只报不中断，和引擎那条回落留痕同一个判据：
+        // **留痕失败不该把一步本来能做完的事变成失败。**
+        eprintln!("⚠ 决策点留痕写入失败（不影响这一步）: {e}");
+    }
+
+    Ok(settled.outcome)
+}
+
+/// 一次决策点判断的收口：结论 + 留痕要用的四件事。
+///
+/// 抽出来是为了让"留痕"只有一个写入点（见 [`decision_point_with_ledger`]）。
+/// 每个字段都由判断本身**如实**填——`degraded` 不是常量：
+/// 模型正常选了一个是 `false`；弃权、故障、响应非法都是 `true`。
+struct Settled {
+    outcome: TaskDecision,
+    /// 结论的理由，同时是台账里的 `reason`。
+    why: String,
+    degraded: bool,
+    /// 回答的模型名。**没有模型回答过就是 `None`**——
+    /// 那几条路上填一个模型名会把归因引到一次没发生过的调用上（D128 的教训）。
+    model: Option<String>,
+    /// 台账里的 `action`：真的选了就写选项原文，弃权就写"升级给人"。
+    action: String,
+}
+
+impl Settled {
+    /// 停下等人那一条路。**一定是降级**——弃权与故障都算。
+    fn escalated(question: &str, options: &[String], why: &str) -> Self {
+        Self {
+            outcome: escalate(question, options, why),
+            why: why.to_string(),
+            degraded: true,
+            model: None,
+            // 用类别自己的降级动作原文，而不是在这里另编一句：
+            // 同一类降级在台账里必须是同一句话，否则"按类别翻记录"
+            // 这件事又得按调用点分一遍。
+            action: crate::decide::DecisionClass::Escalate
+                .degraded_action()
+                .to_string(),
+        }
+    }
+}
+
+/// 问一次模型，把它变成"要么选了一个、要么停下等人"。
+///
+/// 每一条不确定路径都汇到 [`escalate`]，并把原因**原样**带回给调用方——
+/// 留痕要用的就是它。这里的注释解释的是为什么这样分流，不是留痕：
+/// 留痕那件事只在 [`decision_point_with_ledger`] 里发生一次。
+fn settle_decision(
+    decider: &dyn Decider,
+    req: &DecisionRequest,
+    key: &str,
+    question: &str,
+    options: &[String],
+    criteria: &[(&str, &str)],
+) -> Settled {
+    let Ok(result) = decider.decide(req) else {
         // 服务未启动 / 超时 / 响应非法，都归到"不执行"。方向是对的：
         // 宁可多问一次人，也不执行一个没被确认过的选择。
         // 这里也不重试——在没有阈值校准之前，重试只是把同一个不确定再摇一遍。
         //
         // **但必须说清这是"模型不可用"，不是"模型弃权"。**
-        // 原来的注释写着"失败原因在这一层没有落点"——那个落点现在补上了。
-        return Ok(escalate(
+        // 原来的注释写着"失败原因在这一层没有落点"——那个落点现在补上了
+        // （`Settled.why` 同时进结论和台账）。
+        return Settled::escalated(
             question,
-            &options,
+            options,
             "决策模型不可用（服务未启动、超时，或响应非法）——这是故障，不是它在弃权",
-        ));
+        );
     };
 
     // 直接调 [`Decider`] 时，`DecisionEngine` 里那层无条件校验不在这条路径上，
     // 必须自己补：未声明的选项、越界的概率都是"不能将就"的响应。
-    if crate::decide::laya::validate(&req, &result).is_err() {
-        return Ok(escalate(
+    if crate::decide::laya::validate(req, &result).is_err() {
+        return Settled::escalated(
             question,
-            &options,
+            options,
             "决策模型的响应不合法（未声明的选项或越界的概率）",
-        ));
+        );
     }
 
     // 下面三步在 validate 之后其实已经成立，仍然写成 let-else：安全代码里不留 unwrap，
     // 万一哪天校验被放宽，这里的失败方向依旧是"不执行"。
     let Some(answer) = result.answer(key) else {
-        return Ok(escalate(question, &options, "决策模型没有回应这个问题"));
+        return Settled::escalated(question, options, "决策模型没有回应这个问题");
     };
     let Some(choice) = answer.choice.as_deref() else {
-        return Ok(escalate(
-            question,
-            &options,
-            "决策模型弃权——它没有选任何一项",
-        ));
+        return Settled::escalated(question, options, "决策模型弃权——它没有选任何一项");
     };
     // 选项名必须逐字对上。不做 trim、不忽略大小写：宽容匹配等于替模型猜它想说什么，
     // 而这里猜错的代价是执行了另一种做法。
     let Some(picked) = criteria.iter().position(|(name, _)| *name == choice) else {
-        return Ok(escalate(question, &options, "决策模型选了一个不存在的选项"));
+        return Settled::escalated(question, options, "决策模型选了一个不存在的选项");
     };
 
     let alternatives = criteria
@@ -308,14 +426,28 @@ pub fn decision_point(
         format!("（{judgement}）")
     };
 
-    Ok(TaskDecision::Chosen {
-        choice: choice.to_string(),
-        rationale: format!(
-            "本地决策模型 {} 选择「{choice}」{label}；{confidence}",
-            result.model
-        ),
-        alternatives,
-    })
+    // 先把模型名拷出来：下面那句 rationale 借了它，而 `Settled` 要把它
+    // 一起带走（`result` 在函数返回时就没了）。
+    let model = result.model.clone();
+    let rationale = format!("本地决策模型 {model} 选择「{choice}」{label}；{confidence}");
+
+    Settled {
+        outcome: TaskDecision::Chosen {
+            choice: choice.to_string(),
+            rationale: rationale.clone(),
+            alternatives,
+        },
+        why: rationale,
+        degraded: false,
+        model: Some(model),
+        // 台账里的 `action` 写**选项原文**而不是 `opt1` 这种占位符：
+        // 键是给程序对表用的，台账是给人复核用的。判据为空时退回键。
+        action: if judgement.is_empty() {
+            choice.to_string()
+        } else {
+            judgement.to_string()
+        },
+    }
 }
 
 /// 决策点的失败去处：**停下等人**。
@@ -886,6 +1018,211 @@ mod tests {
             }
             other => panic!("决策点只该问 choice，实际 {other:?}"),
         }
+    }
+
+    // ---- 留痕：拍板和弃权**都要**留下痕 ----
+
+    /// 一个临时台账。文件名带 tag，避免并行跑的测试互相踩。
+    fn tmp_ledger(tag: &str) -> (std::path::PathBuf, crate::ledger::Ledger) {
+        let p = std::env::temp_dir().join(format!(
+            "yunxi-decision-point-{}-{tag}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        let l = crate::ledger::Ledger::open(&p).expect("开台账");
+        (p, l)
+    }
+
+    fn decided_event(ledger: &crate::ledger::Ledger) -> &crate::ledger::Event {
+        ledger
+            .events()
+            .iter()
+            .find(|e| e.kind == crate::ledger::EventKind::DecisionDecided)
+            .expect("应有一条 decision_decided")
+    }
+
+    /// **模型拍板了——这条判断必须能查出来。**
+    ///
+    /// 用真台账（临时文件）：要验的四条（类别 / degraded / 动作 / 理由）
+    /// 全在 `record_decision` 那一层，换掉器件就等于把要验的那层换掉了。
+    #[test]
+    fn a_chosen_decision_is_recorded() {
+        let (path, mut ledger) = tmp_ledger("chosen");
+        let decider = StubDecider::succeeding().with_choice("pick", "回滚");
+        let got = decision_point_with_ledger(
+            &decider,
+            "pick",
+            "这一步怎么处理？",
+            &criteria(),
+            Some(&mut ledger),
+        )
+        .expect("应成功");
+        assert!(matches!(got, TaskDecision::Chosen { .. }), "{got:?}");
+
+        let d = decided_event(&ledger);
+        assert_eq!(
+            d.data["class"],
+            serde_json::json!("escalate"),
+            "这一处所有不确定路径的出口都是'停下等人'——那是 Escalate: {}",
+            d.data
+        );
+        assert_eq!(
+            d.data["degraded"],
+            serde_json::json!(false),
+            "拍板不是降级: {}",
+            d.data
+        );
+        assert_eq!(
+            d.data["action"],
+            serde_json::json!("回到上一个可用版本，代价是丢掉本轮改动"),
+            "台账里要写选项**原文**，不是 opt1 这种占位符——写占位符等于没留痕: {}",
+            d.data
+        );
+        assert_eq!(d.data["model"], serde_json::json!("stub"));
+        let reason = d.data["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("回滚"), "理由要带上选了什么: {reason}");
+        assert!(d.span.is_some(), "决策事件必须被边界包住");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **弃权才是最该被看见的那一种。**
+    ///
+    /// 在这之前它只写进 `TaskDecision` 的返回值（`escalate` 把原因塞进
+    /// question 文本里），谁没接住就没了。而"它为什么不敢定"正是该去调
+    /// 提示词或补样本的信号（D78）。
+    #[test]
+    fn an_escalation_is_recorded_as_a_degradation() {
+        for (tag, decider) in [
+            ("failing", StubDecider::failing("sidecar 没起来")),
+            (
+                "abstain",
+                StubDecider::succeeding().with_choice("pick", "不在选项里"),
+            ),
+        ] {
+            let (path, mut ledger) = tmp_ledger(tag);
+            let got = decision_point_with_ledger(
+                &decider,
+                "pick",
+                "这一步怎么处理？",
+                &criteria(),
+                Some(&mut ledger),
+            )
+            .expect("升级人工也是 Ok");
+
+            assert!(matches!(got, TaskDecision::NeedsHuman { .. }), "{got:?}");
+
+            let d = decided_event(&ledger);
+            assert_eq!(d.data["class"], serde_json::json!("escalate"), "{tag}");
+            assert_eq!(
+                d.data["degraded"],
+                serde_json::json!(true),
+                "{tag}: 弃权与故障都必须记成降级（{}）",
+                d.data
+            );
+            assert_eq!(
+                d.data["action"],
+                serde_json::json!(crate::decide::DecisionClass::Escalate.degraded_action()),
+                "{tag}: 降级动作要用类别自己那句，不能各写一套: {}",
+                d.data
+            );
+            let reason = d.data["reason"].as_str().unwrap_or("");
+            assert!(!reason.is_empty(), "{tag}: 理由不能空——事后就靠它解释");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// 模型不可用与模型弃权，在台账里必须分得开。
+    #[test]
+    fn the_ledger_tells_unavailable_apart_from_abstention() {
+        let (p1, mut down) = tmp_ledger("down");
+        let (p2, mut abstained) = tmp_ledger("abstained");
+
+        let _ = decision_point_with_ledger(
+            &StubDecider::failing("连接被拒绝"),
+            "pick",
+            "怎么处理？",
+            &criteria(),
+            Some(&mut down),
+        );
+        let _ = decision_point_with_ledger(
+            &AbstainDecider,
+            "pick",
+            "怎么处理？",
+            &criteria(),
+            Some(&mut abstained),
+        );
+
+        let down_reason = decided_event(&down).data["reason"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let abstain_reason = decided_event(&abstained).data["reason"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        // 故障那一条只说"模型不可用"，**不带底层错误原文**——
+        // 那是这条路径本来的行为（`decision_point` 在这里丢掉了 `e`），
+        // 这一轮没有改它。台账要能回答的是"问过没有、是不是弃权"，
+        // 这两条断言钉住的就是那件事。
+        assert!(
+            down_reason.contains("不可用") && down_reason.contains("故障"),
+            "故障要如实标成故障: {down_reason}"
+        );
+        assert!(
+            !abstain_reason.contains("不可用"),
+            "弃权不能说成故障——那会让人去修一个没坏的服务: {abstain_reason}"
+        );
+        // 弃权在这一层是**以"响应不合法"的面目出现的**（`laya::validate`
+        // 先拦下"没选任何一项"），所以这里钉的是"不合法"而不是"弃权"。
+        // 这一条和 `an_abstention_does_not_claim_the_model_is_down` 同源——
+        // 那条测试也记了同一件事："我第一版把场景想错了"。
+        assert!(
+            abstain_reason.contains("不合法"),
+            "要说清它到底做了什么（它确实是弃权，只是先被校验拦下）: {abstain_reason}"
+        );
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    /// **判据不合法时一个字都没发出去，所以一条痕都不能留。**
+    ///
+    /// 原注释的话："问出来的答案没有意义，却会被当成一次真实判断记进台账。"
+    #[test]
+    fn an_unaskable_decision_point_records_nothing() {
+        let (path, mut ledger) = tmp_ledger("unaskable");
+        let err = decision_point_with_ledger(
+            &StubDecider::succeeding(),
+            "pick",
+            "怎么处理？",
+            &[("重试", "只有一条判据")],
+            Some(&mut ledger),
+        )
+        .unwrap_err();
+        assert!(matches!(err, TaskError::NeedsHuman { .. }), "{err:?}");
+        assert!(
+            ledger.events().is_empty(),
+            "没问过模型却写了 asked——那是假账: {:?}",
+            ledger.events()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **不挂台账 = 与从前逐字节相同**（结论一样、一条痕都不多）。
+    #[test]
+    fn a_decision_point_without_a_ledger_keeps_todays_behaviour() {
+        let decider = StubDecider::succeeding().with_choice("pick", "回滚");
+        let with_sink =
+            decision_point_with_ledger(&decider, "pick", "这一步怎么处理？", &criteria(), None)
+                .expect("应成功");
+        let old =
+            decision_point(&decider, "pick", "这一步怎么处理？", &criteria()).expect("应成功");
+        assert_eq!(with_sink, old, "空留痕口不该改变结论");
+
+        // 判据不合法那条路同样不变
+        assert!(
+            decision_point_with_ledger(&decider, "pick", "怎么处理？", &[("只有一条", "a")], None)
+                .is_err()
+        );
     }
 }
 

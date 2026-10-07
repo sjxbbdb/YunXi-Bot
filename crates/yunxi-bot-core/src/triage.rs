@@ -441,6 +441,9 @@ fn build_state(item: &InfoItem, now_ms: u64, hour: u8) -> serde_json::Value {
 ///
 /// `engine` 是决策引擎（带熔断与降级），`ctx` 是当前情境
 /// （今天已经打扰过几次、是不是安静时段标记）。
+///
+/// 这一条是**不留痕**的旧签名，等价于 [`triage_item_with_ledger`]
+/// 传一个空口子。
 pub fn triage_item<D: Decider>(
     engine: &mut DecisionEngine<D>,
     item: &InfoItem,
@@ -450,12 +453,57 @@ pub fn triage_item<D: Decider>(
     local_hour: u8,
     now_ms: u64,
 ) -> TriageDecision {
+    triage_item_with_ledger(
+        engine, item, policy, companion, ctx, local_hour, now_ms, None,
+    )
+}
+
+/// 同 [`triage_item`]，但把**决定了这一封命运的那次判断**记进台账。
+///
+/// ## 为什么这一处要留痕
+///
+/// 这一层和陪伴层**共用同一个决策引擎**（都是 `Interrupt` 类、降级方向
+/// 都是不打扰），但两者的输入完全不同：那边看的是内部状态与记忆，
+/// 这边看的是外面进来的一封邮件。它们问的问题也不同
+/// （`triage` vs `intervention`）。
+///
+/// 在此之前这一处只写一条 `InfoTriaged`——它记的是**结论**
+/// （action / rule / reason / used_model / degraded），而且写得很全。
+/// 但它和陪伴层的决策事件在台账上**长得不一样**：按 `DecisionClass`
+/// 翻记录的人只看得到陪伴那一半，于是"通知分流这一步到底有没有问过模型"
+/// 只能靠 `used_model` 这个布尔反推——而那个布尔回答不了
+/// "它答了什么、是不是弃权"。
+///
+/// ## 只有走到模型那一层才记
+///
+/// 确定性规则（黑名单 / 白名单 / 验证码 / 群发 / 机器发件人）在上面就
+/// `return` 了，**一个字都没问过模型**。那几条路上记一条 `decision_asked`
+/// 就是假账（D128）。所以留痕写在下面那一层里，不是写在函数出口。
+///
+/// ## 类别是 `Interrupt`，和共用引擎的那一类一致
+///
+/// 这一问的实质就是"要不要打扰使用者"：模型答 `speak` 就是打扰提醒，
+/// 弃权时兜底是 `Hold`（攒着不打扰）——正好是 `Interrupt` 的降级方向
+/// fail-closed。借 `Classify`（归档）会把"要不要吵你"记成"归到哪一类"，
+/// 而那一类的降级动作是"归入待分类队列"，不是"攒着"。
+#[allow(clippy::too_many_arguments)]
+pub fn triage_item_with_ledger<D: Decider>(
+    engine: &mut DecisionEngine<D>,
+    item: &InfoItem,
+    policy: &TriagePolicy,
+    companion: &CompanionPolicy,
+    ctx: &Situation,
+    local_hour: u8,
+    now_ms: u64,
+    decision_sink: crate::decide::DecisionSink<'_>,
+) -> TriageDecision {
     // 约束层先算好：**任何路径都要过它**，包括确定性规则。
     // 使用者说"现在别打扰我"时，一条确定性规则也不能绕过去。
     let verdict = constraint_ceiling(ctx, companion, local_hour);
 
     // ---- 第一层：确定性规则 ----
     if let Some((action, rule, reason)) = deterministic_triage(item, policy) {
+        // **这一条不留痕**：规则判定没有问过模型，也永远不会问。
         return apply_ceiling(
             action,
             reason,
@@ -469,8 +517,11 @@ pub fn triage_item<D: Decider>(
 
     // ---- 第二层：本地决策模型 ----
     let state = build_state(item, now_ms, local_hour);
-    let req = crate::decide::DecisionRequest::new(state, triage_questions());
-    match engine.decide(&req) {
+    let questions = triage_questions();
+    let req = crate::decide::DecisionRequest::new(state, questions);
+    let outcome = engine.decide(&req);
+
+    let (decision, model, degraded) = match outcome {
         DecisionOutcome::Decided(result) => {
             let model_action = parse_triage(result.choice("triage"));
             let suggested_speak = model_action == Intervention::Speak;
@@ -487,7 +538,8 @@ pub fn triage_item<D: Decider>(
             if let Some(c) = result.answer("triage").and_then(|a| a.confidence()) {
                 d.reason.push_str(&format!("，置信度 {c:.2}"));
             }
-            d
+            let model = result.model;
+            (d, Some(model), false)
         }
         DecisionOutcome::Degraded { action, reason, .. } => {
             // **兜底是 Hold 而不是 Speak。** 失败方向朝"不打扰"——
@@ -496,7 +548,7 @@ pub fn triage_item<D: Decider>(
             // 但也不是 Quiet：那等于**把信息丢了**。Hold 保住了它，
             // 使用者主动看的时候还在。这是"不打扰"和"不丢失"之间
             // 唯一同时成立的那个选择。
-            apply_ceiling(
+            let d = apply_ceiling(
                 Intervention::Hold,
                 format!("决策模型不可用（{action}）：{reason}；按保守方向攒着不打扰"),
                 None,
@@ -504,9 +556,28 @@ pub fn triage_item<D: Decider>(
                 true,
                 false,
                 &verdict,
-            )
+            );
+            // 没有模型答过这一问。
+            (d, None, true)
         }
+    };
+
+    // 留痕写在**决策之后、返回之前**，`action` 用的是过了约束层的最终动作：
+    // 台账、`InfoTriaged` 的 `action`、`TriageDecision.action` 三处必须是
+    // 同一个值，否则"台账说通知了、实际只是攒着"这种漂就又会发生。
+    if let Err(e) = crate::decide::record_decision_optional(
+        decision_sink,
+        crate::decide::DecisionClass::Interrupt,
+        degraded,
+        decision.action.label(),
+        &decision.reason,
+        model.as_deref(),
+        &["triage".to_string(), "needs_action".to_string()],
+    ) {
+        eprintln!("⚠ 通知分流留痕写入失败（不影响判定）: {e}");
     }
+
+    decision
 }
 
 /// 把约束层套到一个动作上。**所有路径都必须经过这里。**
@@ -1101,6 +1172,207 @@ mod tests {
         assert!(d.model_suggested_speak, "模型确实建议过开口");
         assert_eq!(d.action, Intervention::Hold, "但被安静时段压住了");
         assert!(d.constrained);
+    }
+
+    // ---- 留痕：分流这一步"问过模型没有、它是不是弃权"必须查得出来 ----
+
+    /// 一个临时台账。文件名带 tag，避免并行跑的测试互相踩。
+    fn tmp_ledger(tag: &str) -> (std::path::PathBuf, crate::ledger::Ledger) {
+        let p =
+            std::env::temp_dir().join(format!("yunxi-triage-{}-{tag}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let l = crate::ledger::Ledger::open(&p).expect("开台账");
+        (p, l)
+    }
+
+    fn decided_event(ledger: &crate::ledger::Ledger) -> &crate::ledger::Event {
+        ledger
+            .events()
+            .iter()
+            .find(|e| e.kind == crate::ledger::EventKind::DecisionDecided)
+            .expect("应有一条 decision_decided")
+    }
+
+    /// **模型判过了 → 记一条 `Interrupt`。**
+    ///
+    /// `InfoTriaged` 记的是结论（而且记得很全），但它回答不了
+    /// "这一步到底有没有问过决策模型"——那正是按 `DecisionClass`
+    /// 翻台账的人要问的第一个问题。
+    #[test]
+    fn a_model_triage_judgment_is_recorded() {
+        let (path, mut ledger) = tmp_ledger("judged");
+        let stub = StubDecider::succeeding().with_choice("triage", "speak");
+        let mut engine =
+            crate::decide::DecisionEngine::new(stub, crate::decide::DecisionClass::Interrupt);
+        let it = item("zhangsan@example.com", "下午的会改到三点");
+        let d = triage_item_with_ledger(
+            &mut engine,
+            &it,
+            &TriagePolicy::default(),
+            &CompanionPolicy::default(),
+            &day_ctx(),
+            14,
+            1_000,
+            Some(&mut ledger),
+        );
+        assert!(d.used_model, "留痕不该改变判定");
+
+        let decided = decided_event(&ledger);
+        assert_eq!(
+            decided.data["class"],
+            serde_json::json!("interrupt"),
+            "这一问的实质是'要不要打扰使用者'——和共用引擎的那一类一致: {}",
+            decided.data
+        );
+        assert_eq!(
+            decided.data["degraded"],
+            serde_json::json!(false),
+            "模型答了不是降级: {}",
+            decided.data
+        );
+        assert_eq!(
+            decided.data["action"],
+            serde_json::json!(Intervention::Speak.label()),
+            "台账里的动作必须和 `InfoTriaged`/实际通知是同一个值: {}",
+            decided.data
+        );
+        assert_eq!(decided.data["model"], serde_json::json!("stub"));
+        let reason = decided.data["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("本地决策模型"), "{reason}");
+
+        let asked = ledger
+            .events()
+            .iter()
+            .find(|e| e.kind == crate::ledger::EventKind::DecisionAsked)
+            .expect("应有一条 decision_asked");
+        assert_eq!(
+            asked.data["questions"],
+            serde_json::json!(["triage", "needs_action"]),
+            "问句 id 要进台账：它同时是'哪个环节问的'的唯一标识: {}",
+            asked.data
+        );
+        assert_eq!(asked.span, decided.span, "审计对要落在同一个边界里");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **弃权/故障也要记，而且是降级。**
+    ///
+    /// 这一条在外部行为上和"模型答了 hold"几乎一样（都攒着不打扰），
+    /// 在台账上必须分得开：前者是判断，后者是"这一层根本没工作"。
+    #[test]
+    fn a_degraded_triage_judgment_says_so_in_the_ledger() {
+        let (path, mut ledger) = tmp_ledger("degraded");
+        let stub = StubDecider::failing("sidecar 没起来");
+        let mut engine =
+            crate::decide::DecisionEngine::new(stub, crate::decide::DecisionClass::Interrupt);
+        let it = item("zhangsan@example.com", "下午的会改到三点");
+        let d = triage_item_with_ledger(
+            &mut engine,
+            &it,
+            &TriagePolicy::default(),
+            &CompanionPolicy::default(),
+            &day_ctx(),
+            14,
+            1_000,
+            Some(&mut ledger),
+        );
+        assert!(d.degraded);
+
+        let decided = decided_event(&ledger);
+        assert_eq!(decided.data["class"], serde_json::json!("interrupt"));
+        assert_eq!(
+            decided.data["degraded"],
+            serde_json::json!(true),
+            "模型不可用必须如实记成降级: {}",
+            decided.data
+        );
+        assert_eq!(
+            decided.data["model"],
+            serde_json::json!(null),
+            "没有模型答过这一问: {}",
+            decided.data
+        );
+        let reason = decided.data["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("sidecar 没起来"),
+            "故障原文要留下——'判定器坏多久了'只能靠它回答: {reason}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **确定性规则判出来的那一条不留痕**：它没有问过模型，也永远不会问。
+    ///
+    /// 这也是这一处的降噪闸门：收件箱里绝大多数信件（验证码、群发、
+    /// 机器发件人、黑名单）在第一层就定了，一条决策事件都不会写。
+    #[test]
+    fn a_rule_judged_item_leaves_no_decision_trace() {
+        let (path, mut ledger) = tmp_ledger("rule");
+        // 黑名单直接判 Quiet，走不到模型那一层。
+        let stub = StubDecider::succeeding().with_choice("triage", "speak");
+        let mut engine =
+            crate::decide::DecisionEngine::new(stub, crate::decide::DecisionClass::Interrupt);
+        let it = item("b@spam.com", "促销");
+        let policy = TriagePolicy {
+            block_senders: vec!["@spam.com".into()],
+            ..Default::default()
+        };
+        let d = triage_item_with_ledger(
+            &mut engine,
+            &it,
+            &policy,
+            &CompanionPolicy::default(),
+            &day_ctx(),
+            14,
+            1_000,
+            Some(&mut ledger),
+        );
+        assert!(!d.used_model, "这一条该由规则判定");
+        assert!(
+            ledger.events().is_empty(),
+            "规则判定没问过模型，写 asked 就是假账: {:?}",
+            ledger.events()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **不挂台账 = 与从前逐字节相同。**
+    #[test]
+    fn triage_without_a_ledger_keeps_todays_behaviour() {
+        let (path, ledger) = tmp_ledger("no-sink");
+        let stub = StubDecider::succeeding().with_choice("triage", "speak");
+        let mut engine =
+            crate::decide::DecisionEngine::new(stub, crate::decide::DecisionClass::Interrupt);
+        let it = item("zhangsan@example.com", "下午的会改到三点");
+        let without = triage_item(
+            &mut engine,
+            &it,
+            &TriagePolicy::default(),
+            &CompanionPolicy::default(),
+            &day_ctx(),
+            14,
+            1_000,
+        );
+        assert_eq!(without.action, Intervention::Speak);
+        assert_eq!(
+            without,
+            triage_item_with_ledger(
+                &mut engine,
+                &it,
+                &TriagePolicy::default(),
+                &CompanionPolicy::default(),
+                &day_ctx(),
+                14,
+                1_000,
+                None,
+            ),
+            "空留痕口不该改变任何一项判定"
+        );
+        assert!(
+            ledger.events().is_empty(),
+            "没挂台账却写了东西: {:?}",
+            ledger.events()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---- state 构造 ----

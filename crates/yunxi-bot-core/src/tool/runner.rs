@@ -37,7 +37,7 @@
 
 use serde_json::Value;
 
-use crate::decide::Decider;
+use crate::decide::{Decider, DecisionSink};
 use crate::think::prompt::PromptLayout;
 use crate::think::{Message, ThinkError, ThinkRequest, Thinker};
 
@@ -46,7 +46,7 @@ use std::path::PathBuf;
 
 use super::{
     Capability, GateDecision, Rule, Tool, ToolContext, ToolError, ToolOutput, ToolPolicy,
-    ToolRegistry, gate,
+    ToolRegistry, gate_with_ledger,
 };
 
 /// 审批请求。给前端（CLI / 守护进程 / 未来的语音或微信）看的东西。
@@ -233,6 +233,20 @@ pub struct ToolRunner<'a> {
     /// **它只收正文，不收工具调用。** 工具调用的增量是参数 JSON 的碎片，
     /// 打出来是噪声，而且它们本来就不是给人读的。
     on_delta: Option<DeltaSink>,
+    /// **本地决策模型判断的去处。** `None` 表示不记——默认值，见
+    /// [`ToolRunner::with_decision_ledger`]。
+    ///
+    /// 记的是 [`super::gate_with_ledger`] 里第二层那个判断（"这个动作
+    /// 该不该问人"），不是工具调用的记录——那一份走 [`Self::sink`]，
+    /// 两份回答的是两个不同的问题：
+    ///
+    /// - `sink`：**发生了什么**（谁被调用、批准了没有、跑出什么结果）
+    /// - 这一本：**那个判断是怎么来的**（模型说的、弃权了、还是压根没问）
+    ///
+    /// 分开而不是合并：`sink` 是给使用者看的调用流水，而这一本是决策台账，
+    /// 两者的类别、边界和读者都不一样。合并会让"这一步问没问过模型"
+    /// 这个问题重新变成一个需要从别的字段反推的问题。
+    decision_ledger: DecisionSink<'a>,
     /// 一轮对话最多几次工具往返。
     pub max_rounds: u32,
 }
@@ -353,6 +367,10 @@ impl<'a> ToolRunner<'a> {
             thinking: None,
             sink: None,
             on_delta: None,
+            // **不挂就是不记。** 默认塞一本"丢掉一切"的假台账会更坏：
+            // 那会让"留痕接上了"和"留痕没接"在代码上长得一样——
+            // 正是 D128 那种"看起来正常"。
+            decision_ledger: None,
             max_rounds: DEFAULT_MAX_ROUNDS,
         }
     }
@@ -384,6 +402,23 @@ impl<'a> ToolRunner<'a> {
 
     pub fn with_decider(mut self, decider: &'a dyn Decider) -> Self {
         self.decider = Some(decider);
+        self
+    }
+
+    /// 挂上决策台账：本地决策模型对工具审批的判断会写成一对
+    /// `decision_asked` / `decision_decided`（类别 `Escalate`，
+    /// 理由见 [`super::gate_with_ledger`] 的文档）。
+    ///
+    /// **不挂 = 不记**，行为与加它之前逐字节相同：判断照旧发生、
+    /// 放行/问人的结论一个字都不变，只是台账里没有那条决策事件。
+    /// 这也是默认值——core 里构造 `ToolRunner` 的地方有几十处，
+    /// 默认真去开一本台账会让每条测试都凭空多出一批审计事件。
+    ///
+    /// CLI 那几条真会发请求的路必须挂（对话 / `do` / `resume` / 守护的任务回合）：
+    /// 漏挂的表现和 D133 一样——审批照样工作、终端照样有提示，
+    /// 而"这个动作是谁批准的"在台账里查不出来。
+    pub fn with_decision_ledger(mut self, ledger: &'a mut crate::ledger::Ledger) -> Self {
+        self.decision_ledger = Some(ledger);
         self
     }
 
@@ -559,7 +594,17 @@ impl<'a> ToolRunner<'a> {
 
         let cap = tool.capability();
         let spec = tool.specifier(&tr.arguments, &self.ctx);
-        let decision = gate(tool, &tr.arguments, &self.policy, &self.ctx, self.decider);
+        // 留痕口一路传到底：**判断和"记下这个判断"必须是同一次调用**。
+        // 分开写（比如在外面再判一次）就会漂，而漂的方向是
+        // "台账记的和实际执行的不是同一个结论"。
+        let decision = gate_with_ledger(
+            tool,
+            &tr.arguments,
+            &self.policy,
+            &self.ctx,
+            self.decider,
+            self.decision_ledger.as_deref_mut(),
+        );
 
         match decision {
             GateDecision::Deny { .. } => Decided::Settled(ToolCallRecord {
@@ -2489,5 +2534,164 @@ mod repeat_tests {
             call("write_file", "{\"path\":\"c\"}"),
         ];
         assert_eq!(detect_repeat(&seen, REPEAT_LIMIT), None);
+    }
+}
+
+#[cfg(test)]
+mod decision_ledger_tests {
+    use super::*;
+    use crate::decide::StubDecider;
+    use crate::ledger::{EventKind, Ledger};
+    use crate::policy::SandboxMode;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// 一个会改变系统状态的工具：**它一定会走到门禁第二层**。
+    ///
+    /// 只读工具在工作区内免问（第一层就返回了），走不到"问模型"那一步，
+    /// 而这一组测试要验的正是那一步的留痕。
+    struct WriteTool;
+
+    impl Tool for WriteTool {
+        fn name(&self) -> &str {
+            "write_file"
+        }
+        fn description(&self) -> &str {
+            "写入"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn capability(&self) -> Capability {
+            Capability::Write
+        }
+        fn call(
+            &self,
+            _a: &serde_json::Value,
+            _c: &mut ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::changed("写完了"))
+        }
+    }
+
+    struct AlwaysAllow;
+    impl Approver for AlwaysAllow {
+        fn approve(&mut self, _req: &ApprovalRequest) -> Approval {
+            Approval::Once
+        }
+    }
+
+    fn registry() -> ToolRegistry {
+        let mut r = ToolRegistry::new();
+        r.register(Arc::new(WriteTool)).unwrap();
+        r
+    }
+
+    fn pcall() -> ParsedCall {
+        ParsedCall {
+            id: "c1".into(),
+            name: "write_file".into(),
+            arguments: json!({ "path": "a.md" }),
+        }
+    }
+
+    fn tmp_ledger(tag: &str) -> (std::path::PathBuf, Ledger) {
+        let p = std::env::temp_dir().join(format!(
+            "yunxi-runner-decision-{}-{tag}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        let l = Ledger::open(&p).expect("开台账");
+        (p, l)
+    }
+
+    /// **挂了台账，审批那一层的判断就必须留下痕。**
+    ///
+    /// 用真台账（临时文件）而不是假 sink：要验的是
+    /// "类别 / degraded / 理由 / 审计对落在边界里"这四条，
+    /// 它们全在 `record_decision` 那一层——换掉器件就等于把要验的那层换掉了。
+    #[test]
+    fn a_tool_gate_decision_is_recorded_when_a_ledger_is_attached() {
+        let (path, mut ledger) = tmp_ledger("attached");
+        let reg = registry();
+        let mut approver = AlwaysAllow;
+        let stub = StubDecider::succeeding().with_choice("needs_human", "auto");
+        let mut runner = ToolRunner::new(
+            &reg,
+            ToolPolicy::default(),
+            &mut approver,
+            ToolContext::new(std::env::temp_dir(), SandboxMode::WorkspaceWrite),
+        )
+        .with_decider(&stub)
+        .with_decision_ledger(&mut ledger);
+
+        let _ = runner.decide_one(&pcall());
+
+        let decided = ledger
+            .events()
+            .iter()
+            .find(|e| e.kind == EventKind::DecisionDecided)
+            .expect("挂了台账就必须留下那条决策事件——否则'这个动作是谁批准的'查不出来");
+        assert_eq!(decided.data["class"], json!("escalate"));
+        assert_eq!(
+            decided.data["degraded"],
+            json!(false),
+            "模型答了不是降级: {}",
+            decided.data
+        );
+        assert_eq!(decided.data["model"], json!("stub"));
+        assert!(
+            decided.span.is_some(),
+            "决策事件必须被边界包住，否则 reload 时会被当崩溃残尾丢掉"
+        );
+        assert_eq!(
+            ledger
+                .events()
+                .iter()
+                .filter(|e| e.kind == EventKind::DecisionAsked)
+                .count(),
+            1,
+            "一次判定恰好一条 asked"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **默认（不挂台账）= 与从前逐字节相同。**
+    ///
+    /// 这条测试能证明的和不能证明的，写清楚：
+    ///
+    /// - **能证明**：默认字段就是 `None`（于是 `gate_with_ledger` 收到空口子，
+    ///   `record_decision_optional` 第一行就返回）；判定与执行两步的结论
+    ///   和从前一样
+    /// - **不能证明**："一个字节的 I/O 都没有"这件事本身——这里没有第三个
+    ///   可观测的东西能证明它。那一半由 `gate` 那一条
+    ///   （`a_gate_without_a_ledger_keeps_todays_behaviour`）加
+    ///   `record_decision_optional` 在 `None` 上的直接返回一起钉住
+    #[test]
+    fn without_a_decision_ledger_the_runner_records_nothing() {
+        let reg = registry();
+        let mut approver = AlwaysAllow;
+        let stub = StubDecider::succeeding().with_choice("needs_human", "auto");
+        let mut runner = ToolRunner::new(
+            &reg,
+            ToolPolicy::default(),
+            &mut approver,
+            ToolContext::new(std::env::temp_dir(), SandboxMode::WorkspaceWrite),
+        )
+        .with_decider(&stub);
+
+        assert!(
+            runner.decision_ledger.is_none(),
+            "默认必须不挂：core 里构造 runner 的地方有几十处，默认真去写台账会让它们全都开始写"
+        );
+
+        let decided = runner.decide_one(&pcall());
+        assert!(
+            matches!(decided, Decided::Run { .. }),
+            "没挂台账不影响判断本身"
+        );
+        let rec = runner.finish_one(decided);
+        assert!(rec.executed(), "该执行的还是要执行");
+        assert!(rec.decision.is_allow(), "{:?}", rec.decision);
     }
 }

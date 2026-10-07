@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::decide::Decider;
+use crate::decide::{Decider, DecisionClass, DecisionSink, record_decision_optional};
 use crate::policy::SandboxMode;
 
 pub mod files;
@@ -625,12 +625,48 @@ impl GateDecision {
 ///
 /// `decider` 为 `None` 表示本地决策模型不可用——此时只会走第一层和兜底，
 /// **不会因此变宽松**。
+///
+/// 这一条是**不留痕**的旧签名，等价于 [`gate_with_ledger`] 传一个空口子。
+/// 门禁被 core 里几十条测试直接调用，它们要的是"放行还是问人"这个结论；
+/// 真要留痕的调用方（[`ToolRunner`]）走下面那一条。
 pub fn gate(
     tool: &dyn Tool,
     args: &serde_json::Value,
     policy: &ToolPolicy,
     ctx: &ToolContext,
     decider: Option<&dyn Decider>,
+) -> GateDecision {
+    gate_with_ledger(tool, args, policy, ctx, decider, None)
+}
+
+/// 同 [`gate`]，但把**本地决策模型那一层**的判断记进台账。
+///
+/// ## 为什么这一处必须留痕
+///
+/// 工具审批是六处决策调用点里唯一一处"决定机器能不能动你的东西"的：
+/// 模型说 `auto` 就放行、说 `ask` 就弹框、弃权就退回问人。
+/// 而这三件事在此之前**只有一个终端提示**——事后翻台账，
+/// "这个动作是谁批准的"（模型？预授权规则？人？）根本查不出来。
+///
+/// 形状和 D133 一样：HTTP 200、功能正常、每一步都"看起来对"，
+/// **而没有任何一处说得清这一步到底有没有经过判断**。
+///
+/// ## 只有"真的问了模型"的那条路才记
+///
+/// 第一层（黑名单 / 显式预批准 / 只读免问 / 不可逆硬约束）全部在上面
+/// 直接返回，**根本不会走到这里**——那几条路上的"批准者"是规则或人，
+/// 不是模型。走到下面这一行的，才是真的把问题发出去了。
+///
+/// 这个区分不是洁癖：`record_decision` 写的第一条事件就叫
+/// `decision_asked`，**记一条 asked 而其实一个字都没发出去，那就是假账**
+/// （D128：台账说了什么，就得是什么）。
+pub fn gate_with_ledger(
+    tool: &dyn Tool,
+    args: &serde_json::Value,
+    policy: &ToolPolicy,
+    ctx: &ToolContext,
+    decider: Option<&dyn Decider>,
+    decision_sink: DecisionSink<'_>,
 ) -> GateDecision {
     let name = tool.name();
     let spec = tool.specifier(args, ctx);
@@ -714,7 +750,7 @@ pub fn gate(
     }
 
     // ---- 第二层：本地决策模型。免费、离线、约 15ms ----
-    if let Some(decision) = ask_local(decider, tool, args, spec.as_deref(), ctx) {
+    if let Some(decision) = ask_local(decider, tool, args, spec.as_deref(), ctx, decision_sink) {
         return decision;
     }
 
@@ -735,18 +771,43 @@ pub fn gate(
 ///
 /// 任何异常（连不上、弃权、返回未知选项）都返回 `None` 由调用方兜底。
 /// **兜底是"问人"，不是"放行"**——这一层失败只会让事情更保守。
+///
+/// ## 留痕：四条出口里三条都要记
+///
+/// 判据是**"模型到底有没有被问过"**，不是"结论好不好看"：
+///
+/// - **没挂决策器** → 一句话都没发出去 → 不记（记了就是一条假 `asked`）
+/// - **问了但调用失败** → 记，`degraded = true`
+/// - **问了、答了、但答案认不出**（弃权）→ 记，`degraded = true`
+/// - **问了、答了、认得** → 记，`degraded = false`
+///
+/// **弃权那一条最要紧。** 它的外部表现和"模型说 ask"几乎一样（都弹框），
+/// 但一个是判断、一个是故障：前者说明模型认为该问人，后者说明这一层
+/// 根本没工作、退回最保守的兜底。两种情况的下一步完全不同
+/// （前者该调提示词/补样本，后者该去看 17870 起没起），
+/// 而在这之前它们在台账上**完全分不开**。
 fn ask_local(
     decider: Option<&dyn Decider>,
     tool: &dyn Tool,
     args: &serde_json::Value,
     spec: Option<&str>,
     ctx: &ToolContext,
+    decision_sink: DecisionSink<'_>,
 ) -> Option<GateDecision> {
-    let decider = decider?;
+    let Some(decider) = decider else {
+        // **没挂决策器 ≠ 弃权。** 前者是"这一步没有问过模型"，
+        // 后者是"问过了，它没答"。台账要能分辨这两件事，
+        // 所以这里连一条 `decision_asked` 都不写。
+        return None;
+    };
     use crate::decide::{DecisionRequest, Question};
 
+    // 问题 id 同时也是留痕里的 `questions`——两处必须是同一个串，
+    // 否则事后按问句翻台账会对不上。
+    const QUESTION_ID: &str = "needs_human";
+
     let question = Question::choice(
-        "needs_human",
+        QUESTION_ID,
         "这个动作该不该先问过使用者？",
         &[
             ("auto", "无需询问：它没有副作用，或者副作用完全在预期范围内"),
@@ -766,16 +827,83 @@ fn ask_local(
     });
 
     let req = DecisionRequest::new(state, vec![question]);
-    let result = decider.decide(&req).ok()?;
-    match result.choice("needs_human") {
-        Some("auto") => Some(GateDecision::Allow {
-            reason: format!("本地决策模型判定无需询问（{}）", result.model),
-        }),
-        Some("ask") => Some(GateDecision::Ask {
-            reason: format!("本地决策模型判定需要询问（{}）", result.model),
-        }),
-        // 未知选项、缺答案 —— 都算弃权，交给兜底
-        _ => None,
+    let question_ids = [QUESTION_ID.to_string()];
+
+    // **类别是 `Escalate`，不是 `Interrupt`。** 这两类在本项目里方向相反，
+    // 而这一处问的是"要不要升级给人"：模型答 `ask` 就是叫人、
+    // 弃权时兜底也是叫人（`Escalate` 的降级动作原文："升级给人"）。
+    // 借 `Interrupt`（打扰/通知）会把"该不该动你的东西"记成"该不该吵你"，
+    // 而那一类的降级方向是不打扰——**刚好相反，正好是这里最不该有的方向**。
+    //
+    // 也不是 `Irreversible`：那一类的前提是"模型不参与判定"，
+    // 而不可逆动作在上一层的硬约束里就被挡下了，根本走不到这里。
+    let class = DecisionClass::Escalate;
+
+    let result = match decider.decide(&req) {
+        Ok(r) => r,
+        Err(e) => {
+            let reason = format!("本地决策模型不可用（{e}）；退回问人");
+            let _ = record_decision_optional(
+                decision_sink,
+                class,
+                true,
+                class.degraded_action(),
+                &reason,
+                // 没有模型回答过这个问题。填一个模型名会把归因引到
+                // 一条根本没发生过的调用上（D128 就是被这种假账骗过去的）。
+                None,
+                &question_ids,
+            );
+            return None;
+        }
+    };
+
+    match result.choice(QUESTION_ID) {
+        Some("auto") => {
+            let _ = record_decision_optional(
+                decision_sink,
+                class,
+                false,
+                "放行（不问人）",
+                &format!("本地决策模型判定无需询问（{}）", result.model),
+                Some(&result.model),
+                &question_ids,
+            );
+            Some(GateDecision::Allow {
+                reason: format!("本地决策模型判定无需询问（{}）", result.model),
+            })
+        }
+        Some("ask") => {
+            let _ = record_decision_optional(
+                decision_sink,
+                class,
+                false,
+                "问人",
+                &format!("本地决策模型判定需要询问（{}）", result.model),
+                Some(&result.model),
+                &question_ids,
+            );
+            Some(GateDecision::Ask {
+                reason: format!("本地决策模型判定需要询问（{}）", result.model),
+            })
+        }
+        // 未知选项、缺答案 —— 都算弃权，交给兜底。
+        //
+        // **这一条也必须留痕**（而且是 `degraded = true`）：它和上一支
+        // 在行为上只差一句 reason，在台账上却是"判断"与"故障"的区别。
+        _ => {
+            let reason = "本地决策模型没有给出可识别的选项（弃权）；退回问人";
+            let _ = record_decision_optional(
+                decision_sink,
+                class,
+                true,
+                class.degraded_action(),
+                reason,
+                Some(&result.model),
+                &question_ids,
+            );
+            None
+        }
     }
 }
 
@@ -1228,7 +1356,6 @@ mod tests {
     }
 
     // ---- 审批门禁：第二、三层 ----
-
     #[test]
     fn local_decider_can_auto_approve() {
         use crate::decide::StubDecider;
@@ -1306,6 +1433,256 @@ mod tests {
             let d = gate(&t, &json!({}), &policy, &ctx(), None);
             assert!(!d.reason().is_empty(), "{d:?}");
         }
+    }
+
+    // ---- 审批门禁：留痕（这一层"问过模型没有"必须查得出来） ----
+
+    /// 一个临时台账。文件名带 tag，避免并行跑的几个测试互相踩。
+    fn tmp_ledger(tag: &str) -> (std::path::PathBuf, crate::ledger::Ledger) {
+        let p =
+            std::env::temp_dir().join(format!("yunxi-toolgate-{}-{tag}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let l = crate::ledger::Ledger::open(&p).expect("开台账");
+        (p, l)
+    }
+
+    /// 台账里那一对审计事件（asked / decided）。
+    fn decision_pair(
+        ledger: &crate::ledger::Ledger,
+    ) -> (&crate::ledger::Event, &crate::ledger::Event) {
+        use crate::ledger::EventKind;
+        let asked = ledger
+            .events()
+            .iter()
+            .find(|e| e.kind == EventKind::DecisionAsked)
+            .expect("应有一条 decision_asked");
+        let decided = ledger
+            .events()
+            .iter()
+            .find(|e| e.kind == EventKind::DecisionDecided)
+            .expect("应有一条 decision_decided");
+        (asked, decided)
+    }
+
+    /// **模型答了"要问人"——这条判断必须留痕。**
+    ///
+    /// 用**真台账**（临时文件）而不是一个假 sink：要验的四条
+    /// （类别、degraded、理由、审计对落在边界里）全在 `record_decision`
+    /// 那一层，**换掉器件就等于把要验的那一层换掉了**（D90/D93 两次栽的
+    /// 都是"测试和生产用了两套器件"）。
+    #[test]
+    fn a_tool_approval_answered_by_the_model_is_recorded() {
+        use crate::decide::StubDecider;
+
+        let (path, mut ledger) = tmp_ledger("answered");
+        let t = FakeTool::new("run_command", Capability::Execute);
+        let stub = StubDecider::succeeding().with_choice("needs_human", "ask");
+        let d = gate_with_ledger(
+            &t,
+            &json!({}),
+            &ToolPolicy::default(),
+            &ctx(),
+            Some(&stub),
+            Some(&mut ledger),
+        );
+        assert!(
+            matches!(d, GateDecision::Ask { .. }),
+            "留痕不该改变结论: {d:?}"
+        );
+
+        let (asked, decided) = decision_pair(&ledger);
+        assert_eq!(
+            decided.data["class"],
+            json!("escalate"),
+            "这一问的实质是「要不要升级给人」——借 Interrupt 会把降级方向记反: {}",
+            decided.data
+        );
+        assert_eq!(
+            decided.data["degraded"],
+            json!(false),
+            "模型答了就是答了，不是降级: {}",
+            decided.data
+        );
+        assert_eq!(
+            decided.data["model"],
+            json!("stub"),
+            "要说清是谁答的，否则归因无从谈起: {}",
+            decided.data
+        );
+        let reason = decided.data["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("需要询问"), "理由要留下判断原文: {reason}");
+        assert_eq!(
+            asked.data["questions"],
+            json!(["needs_human"]),
+            "问句 id 要进 asked，否则事后按问句翻台账会对不上: {}",
+            asked.data
+        );
+        assert_eq!(
+            asked.span, decided.span,
+            "审计对必须落在同一个边界里，否则 reload 时会被当崩溃残尾丢掉"
+        );
+        assert!(asked.span.is_some(), "决策事件必须被边界包住");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 模型答"不必问"那一支同样要留痕——**"放行"才是更需要解释的那个结论**。
+    #[test]
+    fn a_tool_approval_allowed_by_the_model_is_recorded() {
+        use crate::decide::StubDecider;
+
+        let (path, mut ledger) = tmp_ledger("allowed");
+        let t = FakeTool::new("run_command", Capability::Execute);
+        let stub = StubDecider::succeeding().with_choice("needs_human", "auto");
+        let d = gate_with_ledger(
+            &t,
+            &json!({}),
+            &ToolPolicy::default(),
+            &ctx(),
+            Some(&stub),
+            Some(&mut ledger),
+        );
+        assert!(d.is_allow(), "留痕不该改变结论: {d:?}");
+
+        let (_, decided) = decision_pair(&ledger);
+        assert_eq!(decided.data["class"], json!("escalate"));
+        assert_eq!(decided.data["degraded"], json!(false));
+        assert_eq!(
+            decided.data["action"],
+            json!("放行（不问人）"),
+            "放行这个动作本身要在台账里写明白: {}",
+            decided.data
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **弃权是最需要暴露的那一种。** 它和"模型说 ask"在行为上只差一句
+    /// reason，在台账上却是"判断"与"故障"的区别——混起来之后，
+    /// sidecar 死掉会表现成"模型一直在要求人工确认"（D104 真机上就是这样）。
+    #[test]
+    fn an_abstention_is_recorded_as_a_degradation() {
+        use crate::decide::StubDecider;
+
+        let (path, mut ledger) = tmp_ledger("abstain");
+        let t = FakeTool::new("run_command", Capability::Execute);
+        // 服务不可用：这一层问过了，但它答不出来。
+        let stub = StubDecider::failing("sidecar 没起来");
+        let d = gate_with_ledger(
+            &t,
+            &json!({}),
+            &ToolPolicy::default(),
+            &ctx(),
+            Some(&stub),
+            Some(&mut ledger),
+        );
+        assert!(matches!(d, GateDecision::Ask { .. }), "{d:?}");
+
+        let (_, decided) = decision_pair(&ledger);
+        assert_eq!(
+            decided.data["degraded"],
+            json!(true),
+            "问过但答不出来 = 降级，不能记成一次正常判断: {}",
+            decided.data
+        );
+        assert_eq!(
+            decided.data["model"],
+            json!(null),
+            "没有模型答过这一问，别把归因引到一次没发生过的调用上: {}",
+            decided.data
+        );
+        let reason = decided.data["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("sidecar 没起来"),
+            "故障原文要留下——'为什么一直没人查'的答案就在这句里: {reason}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 模型给出一个听不懂的选项，同样算弃权，同样要如实记成降级。
+    #[test]
+    fn an_unrecognised_choice_is_recorded_as_a_degradation() {
+        use crate::decide::StubDecider;
+
+        let (path, mut ledger) = tmp_ledger("unknown-choice");
+        let t = FakeTool::new("run_command", Capability::Execute);
+        let stub = StubDecider::succeeding().with_choice("needs_human", "nonsense");
+        let _ = gate_with_ledger(
+            &t,
+            &json!({}),
+            &ToolPolicy::default(),
+            &ctx(),
+            Some(&stub),
+            Some(&mut ledger),
+        );
+
+        let (_, decided) = decision_pair(&ledger);
+        assert_eq!(
+            decided.data["degraded"],
+            json!(true),
+            "认不出的选项算弃权: {}",
+            decided.data
+        );
+        assert_eq!(decided.data["model"], json!("stub"), "答是它答的");
+        let reason = decided.data["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("弃权"), "{reason}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **没问过模型的那几条路一条痕都不能留。**
+    ///
+    /// 预批准命中时批准者是**规则**，不是模型。这时若写一条
+    /// `decision_asked`，台账就会说"这一步问过决策模型"——那是假账，
+    /// 而 D128 正是被假账骗过去的（每一处显示都说本地模型被调用了）。
+    /// 判据是"有没有真的发出去"，不是"结论好不好看"。
+    #[test]
+    fn a_rule_approved_tool_is_not_recorded_as_a_decision() {
+        let (path, mut ledger) = tmp_ledger("rule-approved");
+        let t = FakeTool::new("run_command", Capability::Execute);
+        let policy = ToolPolicy {
+            allow: vec![Rule::tool("run_command")],
+            ..Default::default()
+        };
+        // 就算挂了决策器、挂了台账，规则命中也不该去问模型、更不该留痕。
+        let stub = crate::decide::StubDecider::succeeding().with_choice("needs_human", "ask");
+        let d = gate_with_ledger(
+            &t,
+            &json!({}),
+            &policy,
+            &ctx(),
+            Some(&stub),
+            Some(&mut ledger),
+        );
+        assert!(d.is_allow(), "预批准应生效: {d:?}");
+        assert_eq!(stub.calls(), 0, "命中规则就不该去问模型");
+        assert!(
+            ledger.events().is_empty(),
+            "没问过模型却写了一条 asked——那是假账: {:?}",
+            ledger.events()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **不挂台账 = 与从前逐字节相同。**
+    #[test]
+    fn a_gate_without_a_ledger_keeps_todays_behaviour() {
+        use crate::decide::StubDecider;
+
+        let t = FakeTool::new("run_command", Capability::Execute);
+        let stub = StubDecider::succeeding().with_choice("needs_human", "ask");
+        let old = gate(&t, &json!({}), &ToolPolicy::default(), &ctx(), Some(&stub));
+        let new = gate_with_ledger(
+            &t,
+            &json!({}),
+            &ToolPolicy::default(),
+            &ctx(),
+            Some(&stub),
+            None,
+        );
+        assert_eq!(old, new, "空留痕口不该改变任何结论");
+        assert_eq!(
+            stub.calls(),
+            2,
+            "两次都要真的问过模型——不能因为没挂台账就跳过判断"
+        );
     }
 
     // ---- 路径边界 ----

@@ -29,7 +29,7 @@ use crate::feedback;
 use crate::info::InfoSource;
 use crate::memory::Situation;
 use crate::notify::{Delivery, Notification, Notifier, Urgency};
-use crate::triage::{TriagePolicy, triage_item};
+use crate::triage::{TriagePolicy, triage_item_with_ledger};
 
 /// 一轮巡览的结果。
 ///
@@ -168,7 +168,7 @@ pub fn run_pass<D: Decider, N: Notifier + ?Sized>(
             continue;
         }
 
-        let d = triage_item(
+        let d = triage_item_with_ledger(
             input.engine,
             it,
             &input.policy,
@@ -176,6 +176,11 @@ pub fn run_pass<D: Decider, N: Notifier + ?Sized>(
             &input.ctx,
             input.local_hour,
             input.now_ms,
+            // **这一轮手里就有台账，所以必须挂上。** 走到这里的每一条都是
+            // 确定性规则没判出来的那些——问过模型的那一种。
+            // 漏挂的表现和 D133 一样：通知照样发、`InfoTriaged` 照样全，
+            // 而"这一步问没问过模型、它是不是弃权"在决策台账里查不出来。
+            Some(&mut *ledger),
         );
 
         // **每条判定都落台账，包括"决定不通知"的那些。**
@@ -466,6 +471,93 @@ mod tests {
         let r = run_pass(&mut l, &mut input).unwrap();
         assert_eq!(r.held, 1);
         assert!(n.sent().is_empty(), "攒着的不该弹通知");
+    }
+
+    // ---- 留痕：这一轮问过模型没有，必须能从台账回答 ----
+
+    /// **`run_pass` 手里就有台账，所以走上模型那一层的每一条都必须留痕。**
+    ///
+    /// 缺了它，事后只能靠 `InfoTriaged.used_model` 这个布尔反推
+    /// "这一步问没问过模型"——而那个布尔回答不了"它答了什么、
+    /// 是不是弃权"。弃权那一种在行为上和"模型说 hold"几乎一样。
+    #[test]
+    fn a_model_judged_item_records_a_decision_in_the_pass_ledger() {
+        let (mut l, _d) = ledger();
+        let src = FakeSource::with(vec![item("1", "zhangsan@example.com", "下午的会改到三点")]);
+        let n = SpyNotifier::new();
+        let stub = StubDecider::succeeding().with_choice("triage", "speak");
+        let mut engine = DecisionEngine::new(stub, crate::decide::DecisionClass::Interrupt);
+        let mut input = PassInput {
+            source: &src,
+            engine: &mut engine,
+            notifier: &n,
+            policy: TriagePolicy::default(),
+            companion: CompanionPolicy::default(),
+            ctx: ctx(),
+            local_hour: 14,
+            now_ms: 1_000,
+            limit: 20,
+            dry_run: false,
+        };
+        run_pass(&mut l, &mut input).unwrap();
+
+        let decided = l
+            .events()
+            .iter()
+            .find(|e| e.kind == EventKind::DecisionDecided)
+            .expect("问过模型就必须留下那条决策事件");
+        assert_eq!(
+            decided.data["class"],
+            serde_json::json!("interrupt"),
+            "类别要和共用引擎的那一类一致（打扰/通知）: {}",
+            decided.data
+        );
+        assert_eq!(decided.data["degraded"], serde_json::json!(false));
+        assert_eq!(decided.data["action"], serde_json::json!("主动开口"));
+        assert!(
+            decided.span.is_some(),
+            "决策事件必须被边界包住，否则 reload 时会被当崩溃残尾丢掉"
+        );
+    }
+
+    /// 规则判定那一类**一条决策痕都不留**：它没问过模型。
+    ///
+    /// 这一条同时是降噪的证据：收件箱里绝大多数信件在第一层就定了，
+    /// 台账不会因为这一层被灌满。
+    #[test]
+    fn a_rule_judged_item_records_no_decision() {
+        let (mut l, _d) = ledger();
+        let src = FakeSource::with(vec![item("1", "b@spam.com", "促销")]);
+        let n = SpyNotifier::new();
+        let mut engine = DecisionEngine::new(
+            StubDecider::succeeding(),
+            crate::decide::DecisionClass::Interrupt,
+        );
+        let mut input = PassInput {
+            source: &src,
+            engine: &mut engine,
+            notifier: &n,
+            policy: TriagePolicy {
+                block_senders: vec!["@spam.com".into()],
+                ..Default::default()
+            },
+            companion: CompanionPolicy::default(),
+            ctx: ctx(),
+            local_hour: 14,
+            now_ms: 1_000,
+            limit: 20,
+            dry_run: false,
+        };
+        run_pass(&mut l, &mut input).unwrap();
+
+        assert!(
+            !l.events().iter().any(|e| matches!(
+                e.kind,
+                EventKind::DecisionAsked | EventKind::DecisionDecided
+            )),
+            "规则判定没问过模型，写 asked 就是假账: {:?}",
+            kinds(&l)
+        );
     }
 
     // ---- 常驻场景的正确性：不重复打扰 ----

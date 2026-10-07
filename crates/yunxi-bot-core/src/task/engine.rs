@@ -364,8 +364,18 @@ pub struct Engine<'a, H: TaskHandler, S: TaskStore> {
     /// 一个可能没人监听的 17872 上——那正是这次要堵的洞。
     /// `a_degraded_local_sidecar_moves_a_task_step_to_agnes` 钉着这件事。
     local_probe: Option<Probe>,
-    /// 回落留痕的出口：本地槽位不可用而改走 Agnes 时，往这本台账写一条
-    /// [`DecisionClass::Route`] 决策事件。`None` = **不记，一个字节的 I/O 都没有**。
+    /// 决策留痕的出口：本地槽位不可用而改走 Agnes 时，往这本台账写一条
+    /// [`DecisionClass::Route`] 决策事件；任务决策点的判断
+    /// （[`super::decide::decision_point_with_ledger`]）也走这一本。
+    /// `None` = **不记，一个字节的 I/O 都没有**。
+    ///
+    /// ## 为什么字段名还叫 `route_ledger`
+    ///
+    /// 它是 D129 为路由回落加的，名字只覆盖了当时那一件事。现在它同时是
+    /// 决策点的出口，按语义该叫 `decision_ledger`——**但没改**：
+    /// `an_engine_without_a_ledger_keeps_todays_behaviour` 读的就是这个字段名，
+    /// 改名会让那条断言跟着动，而它要钉的事情（"默认一本都不挂"）和名字无关。
+    /// 与其动一条已经钉住行为的断言，不如在这里把名字的来历写清楚。
     ///
     /// ## 为什么是"另接一本台账"，而不是从 `store` 里取
     ///
@@ -387,10 +397,11 @@ pub struct Engine<'a, H: TaskHandler, S: TaskStore> {
     /// 而"有一条链路悄悄不回落了"正是 D128 的形状：功能还在，只是退化了，
     /// 且退化之后每一处显示都正常。**两边共用同一类，查法才只有一种。**
     ///
-    /// 代价写明白：**没挂 = 回落只在 stderr 上出现**，和加这一层之前一样。
-    /// 所以 CLI 那几条真会发请求的路每一处都必须挂（`do` / 干跑 / `resume` /
-    /// 守护的任务回合）；`a_local_fallback_is_recorded_as_a_route_decision`
-    /// 钉着"挂上就得记下来"，`an_engine_without_a_ledger_keeps_todays_behaviour`
+    /// 代价写明白：**没挂 = 回落只在 stderr 上出现、决策点只在步骤事件里出现**，
+    /// 和加这一层之前一样。所以 CLI 那几条真会发请求的路每一处都必须挂
+    /// （`do` / 干跑 / `resume` / 守护的任务回合）；
+    /// `a_local_fallback_is_recorded_as_a_route_decision` 钉着"挂上就得记下来"，
+    /// `an_engine_without_a_ledger_keeps_todays_behaviour`
     /// 钉着"不挂就一个字节都不多"。
     route_ledger: Option<&'a mut Ledger>,
 }
@@ -436,11 +447,17 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
         self
     }
 
-    /// 挂上台账：本地槽位不可用而改走 Agnes 时，**记一条 `Route` 决策事件**
-    /// （和对话那条链路同一个写法，见 [`Self::route_ledger`] 的字段文档）。
+    /// 挂上台账（见 [`Self::route_ledger`] 的字段文档）。它现在是**两个**决策
+    /// 事件的出口：
+    ///
+    /// 1. 本地槽位不可用而改走 Agnes 时，记一条 `Route` 决策事件
+    ///    （和对话那条链路同一个写法）
+    /// 2. 任务决策点问过本地决策模型之后，记一条 `Escalate` 决策事件——
+    ///    包括**它弃权**那一种
     ///
     /// **不挂 = 不记**，行为与加它之前逐字节相同——回落本身照旧发生、
-    /// stderr 照旧说一句，只是台账里没有那条决策事件。
+    /// 决策点照旧拍板或弃权、stderr 照旧说该说的话，
+    /// 只是台账里没有那两条决策事件。
     /// CLI 那几条真会发请求的路必须挂。
     pub fn with_ledger(mut self, ledger: &'a mut Ledger) -> Self {
         self.route_ledger = Some(ledger);
@@ -1091,7 +1108,16 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        match super::decide::decision_point(decider, "task_decision", &q, &criteria_ref)? {
+        match super::decide::decision_point_with_ledger(
+            decider,
+            "task_decision",
+            &q,
+            &criteria_ref,
+            // **决策点的留痕走同一本台账**（CLI 已经用 `with_ledger` 挂上了）。
+            // 不挂的后果和回落那条一样：模型拍了板、任务照着做了，
+            // 而"这一步问过模型没有、它是不是弃权"在台账里查不出来。
+            self.route_ledger.as_deref_mut(),
+        )? {
             TaskDecision::Chosen {
                 choice,
                 rationale,
@@ -2239,6 +2265,177 @@ mod tests {
         assert_eq!(handler.observe_calls, 1);
         // 落盘的是选项原文，不是 opt0/opt1 这种占位键
         assert!(!result.contains("opt0"), "台账里不该出现占位键: {result}");
+    }
+
+    /// **挂上台账时，决策点的判断必须留下一条 `Escalate` 决策事件。**
+    ///
+    /// 用**真台账**（临时文件）而不是一个假 sink：要验的四条
+    /// （类别、degraded、动作原文、审计对落在边界里）全在
+    /// `record_decision` 那一层——**换掉器件就等于把要验的那一层换掉了**
+    /// （D90 / D93 两次栽的都是"测试和生产用了两套器件"）。
+    #[test]
+    fn a_decision_point_is_recorded_in_the_engines_ledger() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding().with_choice("task_decision", "opt1");
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 选哪个方案？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        handler.observes =
+            vec![r#"{"question":"选哪个方案？","options":["保守方案","激进方案"]}"#.to_string()];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "需要选择的任务").unwrap();
+
+        let dir = std::env::temp_dir().join(format!("yunxi-decide-point-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ledger.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut decision_ledger = Ledger::open(&path).expect("开台账");
+
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .with_ledger(&mut decision_ledger)
+        .run("t1")
+        .unwrap();
+
+        let decided: Vec<&crate::ledger::Event> = decision_ledger
+            .events()
+            .iter()
+            .filter(|e| e.kind == EventKind::DecisionDecided)
+            .collect();
+        assert_eq!(
+            decided.len(),
+            1,
+            "这一步只问了一次模型，就该恰好留一条决策事件（多条=重复记，零条=洞又开了）"
+        );
+        let d = &decided[0].data;
+        assert_eq!(
+            d["class"],
+            serde_json::json!("escalate"),
+            "决策点的出口是'停下等人'——那是 Escalate: {d}"
+        );
+        assert_eq!(
+            d["degraded"],
+            serde_json::json!(false),
+            "模型拍板不是降级: {d}"
+        );
+        assert_eq!(
+            d["action"],
+            serde_json::json!("激进方案"),
+            "台账里要写选项**原文**，不是 opt1——写占位符等于没留痕: {d}"
+        );
+        let reason = d["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("stub"), "理由要带上是谁判的: {reason}");
+        assert!(
+            decided[0].span.is_some(),
+            "决策事件必须被边界包住，否则 reload 时会被当成残尾丢掉"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **弃权也要留下痕，而且是 `degraded = true`。**
+    ///
+    /// 这是六条留痕里最要紧的一条：弃权在此之前只进了 `TaskDecision`
+    /// 的返回值和任务台账里那条 `DecisionAsked`，而"它为什么不敢定"
+    /// 正是该去调提示词或补样本的信号（D78 / D104）。
+    #[test]
+    fn an_abstaining_decision_point_is_recorded_as_degraded() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding().with_choice("task_decision", "不在选项里");
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 选哪个？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        handler.observes =
+            vec![r#"{"question":"选哪个？","options":["保守方案","激进方案"]}"#.to_string()];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "需要选择").unwrap();
+
+        let dir = std::env::temp_dir().join(format!("yunxi-decide-abstain-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ledger.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut decision_ledger = Ledger::open(&path).expect("开台账");
+
+        let outcome = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .with_ledger(&mut decision_ledger)
+        .run("t1")
+        .unwrap();
+        assert_eq!(outcome.task.state, TaskState::AwaitingHuman);
+
+        let decided = decision_ledger
+            .events()
+            .iter()
+            .find(|e| e.kind == EventKind::DecisionDecided)
+            .expect("弃权也必须留下决策事件——否则'它为什么不敢定'查不出来");
+        assert_eq!(decided.data["class"], serde_json::json!("escalate"));
+        assert_eq!(
+            decided.data["degraded"],
+            serde_json::json!(true),
+            "弃权要如实记成降级: {}",
+            decided.data
+        );
+        let reason = decided.data["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("不合法") || reason.contains("弃权"),
+            "要说清它到底做了什么: {reason}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **不挂台账时，决策点照旧拍板，别处也不许多出决策事件。**
+    #[test]
+    fn a_decision_point_without_a_ledger_keeps_todays_behaviour() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding().with_choice("task_decision", "opt1");
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("d", &[])]));
+        handler.plans = vec![serde_json::json!({
+            "steps": [{ "id": "d", "instruction": "decide: 选哪个方案？", "depends_on": [], "kind": "analysis" }]
+        })
+        .to_string()];
+        handler.observes =
+            vec![r#"{"question":"选哪个方案？","options":["保守方案","激进方案"]}"#.to_string()];
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "需要选择的任务").unwrap();
+
+        let mut eng = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        );
+        assert!(
+            eng.route_ledger.is_none(),
+            "默认必须不挂：挂上的话每个构造引擎的地方都会开始写决策事件"
+        );
+        let outcome = eng.run("t1").unwrap();
+
+        assert_eq!(
+            outcome.task.step("d").unwrap().state,
+            StepState::Succeeded,
+            "没挂台账时这一步的结局一个字节都不该变"
+        );
+        assert!(
+            !store.events().iter().any(|e| matches!(
+                e.kind,
+                EventKind::DecisionAsked | EventKind::DecisionDecided
+            )),
+            "留痕只能走注入的那本台账，顺手写进 store 会让'没挂'和'挂了'在投影上分不开"
+        );
     }
 
     #[test]

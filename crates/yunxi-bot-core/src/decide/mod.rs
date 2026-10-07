@@ -341,6 +341,54 @@ pub fn record_decision(
     Ok(span_id)
 }
 
+/// 一条决策的**可选**留痕口。
+///
+/// ## 为什么是一个类型别名，而不是"每个调用点自己判断"
+///
+/// 决策模型的调用点有六处（输入分类 / 路由回落 / 召回门控 / 工具审批 /
+/// 任务决策点 / 陪伴介入与通知分流），其中**四处**此前一条痕都不留：
+/// 问过了、用了答案、然后什么都没写下来。后果是台账回答不了
+/// "这一步到底问没问过模型、它是不是弃权了"——而 D128 正是被这种
+/// 假账骗过去的（终端标签、台账、成本三处都在说模型被调用了，实际一次都没调）。
+///
+/// 把它写成一个**具名的**口子，是为了让"留痕"这件事在签名上就看得见：
+/// `DecisionSink<'_>` 出现在参数里，读代码的人不需要翻实现就知道
+/// "这一处会把判断记进台账"。
+///
+/// ## `None` 是什么意思
+///
+/// **没挂口子 = 一个字节的 I/O 都没有**：不是"写进一个丢掉的地方"，
+/// 也不是"先分配一个结构再扔掉"。core 里这些函数被近千条测试反复调用，
+/// 默认真去开一本台账的话，每条测试都会凭空多出一批审计事件。
+/// 所以默认永远是 `None`（见各处的 `with_*_ledger` 构造方法），
+/// 由真正知道自己跑在哪的调用方显式挂上。
+pub type DecisionSink<'a> = Option<&'a mut crate::ledger::Ledger>;
+
+/// 往**可选**的留痕口写一条决策。没挂口子就什么都不做。
+///
+/// 这是六处调用点共用的收口：`class` / `degraded` / `action` / `reason`
+/// 全部由调用方**如实**填（理由见 [`record_decision`] 的文档——
+/// 早先版本要求传一个 `DecisionOutcome`，结果调用方为了省事一律构造
+/// `Degraded`，台账于是把成功的判断也标成降级）。
+///
+/// 返回值只保留"成不成"：边界号是 [`record_decision`] 的细节，
+/// 这几处调用点没有一处需要它（陪伴那一处由 `agent::run_cycle` 自己记账）。
+#[allow(clippy::too_many_arguments)]
+pub fn record_decision_optional(
+    sink: DecisionSink<'_>,
+    class: DecisionClass,
+    degraded: bool,
+    action: &str,
+    reason: &str,
+    model: Option<&str>,
+    question_ids: &[String],
+) -> Result<(), crate::ledger::LedgerError> {
+    let Some(ledger) = sink else {
+        return Ok(());
+    };
+    record_decision(ledger, class, degraded, action, reason, model, question_ids).map(|_| ())
+}
+
 /// 决策引擎：包住一个 [`Decider`]，负责降级与熔断。
 #[derive(Debug)]
 pub struct DecisionEngine<D: Decider> {
