@@ -2516,7 +2516,7 @@ mod tests {
     // ---- 路由在任务框架里的接线 ----
 
     #[test]
-    fn simple_steps_go_to_agnes_complex_steps_go_to_deepseek() {
+    fn simple_steps_go_to_the_local_model_complex_steps_go_to_deepseek() {
         // 使用者的要求：复杂任务给 DeepSeek，简单任务给 Agnes
         let router = ModelRouter::default();
         let decider = StubDecider::succeeding();
@@ -2544,15 +2544,17 @@ mod tests {
         // 第一次调用是拆解，之后依次是 s1、s2
         assert_eq!(handler.seen_kinds[1], TaskKind::Lookup);
         assert_eq!(handler.seen_kinds[2], TaskKind::Analysis);
-        // **原来是 `"agnes"`。** 用户改了规格：**真实任务一律走 DeepSeek**，
-        // 哪怕这一步只是简单查找。代价要说明白——这一步现在要花钱了。
+        // **这个断言改过两次，每次都跟着规格走。**
         //
-        // 动机有真机证据：Agnes 免费档 10 RPM，一次真实任务连着几步
-        // 必然撞限流（`e2e_allmodules` 那次连续 9 次"等 N ms 后重发"，
-        // 然后任务卡在 s10 推不动）。
+        // 原来是 `"agnes"`（简单步骤省钱）。后来改成 `"deepseek"`
+        // （真实任务一律走 DeepSeek——因为 Agnes 10 RPM 会把任务拖死，
+        // `e2e_allmodules` 那次连续 9 次"等 N ms 后重发"之后卡在 s10）。
+        //
+        // 现在是 `"local"`：**s1 是查找类、判得出轻量，所以走本地模型。**
+        // 分界从"是不是任务"变成了"这件事有多重"。
         assert_eq!(
-            handler.seen_providers[1], "deepseek",
-            "真实任务一律走 DeepSeek（{:?}）",
+            handler.seen_providers[1], "local",
+            "简单步骤走本地模型（{:?}）",
             handler.seen_providers
         );
         assert!(!handler.seen_thinking[1], "查找类不该开思考");

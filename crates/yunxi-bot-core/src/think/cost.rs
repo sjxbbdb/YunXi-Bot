@@ -60,6 +60,25 @@ impl PriceTable {
     ///
     /// 来源：<https://wiki.agnes-ai.cn/zh-Hans/docs/pricing>（2026-10 核对）
     /// Agnes 的缓存折扣是 **10%**（10 倍），与 DeepSeek 的 50 倍不同。
+    /// 本地模型：**不产生 API 费用**。
+    ///
+    /// 全零而不是"照 Agnes 记 0.35"——Agnes 那档虽然 `free: true`，
+    /// 但刊例价是真的（哪天收费了，改 `free` 一个字就行）。而本地模型
+    /// **压根没有刊例价**，硬填一个数会让成本报表凭空多出一列假数字。
+    ///
+    /// 电费和显卡折旧不进这个表：那是"要不要跑本地模型"的决策成本，
+    /// 不是"这一句话花了多少"的边际成本。**两笔账混在一起就都算不清了。**
+    pub const LOCAL: Self = Self {
+        cache_hit_peak: 0.0,
+        cache_hit_idle: 0.0,
+        input_peak: 0.0,
+        input_idle: 0.0,
+        output_peak: 0.0,
+        output_idle: 0.0,
+        free: true,
+        source: "本地模型（sidecar/local_llm_server.py）：无 API 费用",
+    };
+
     pub const AGNES_30_FLASH: Self = Self {
         cache_hit_peak: 0.035,
         cache_hit_idle: 0.035,

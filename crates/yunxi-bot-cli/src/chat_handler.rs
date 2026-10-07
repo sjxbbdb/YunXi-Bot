@@ -1604,7 +1604,15 @@ mod chat_session_tests {
         // 对话要自己判断"这活复杂不复杂"——任务引擎那条路由是引擎给的
         let h = handler();
         let r = h.route_for("你好", yunxi_bot_core::think::ReasoningEffort::Auto);
-        assert_eq!(r.spec.provider, "agnes", "闲聊不该走贵的那条");
+        // **这条测试真正要守的是"闲聊没走贵的那条"，不是"它一定走 Agnes"。**
+        // 所以断言档位——那是跨实现都成立的不变量；
+        // 再顺带钉住当前实现，免得哪天悄悄换成一个收费端点。
+        assert_eq!(
+            r.spec.tier,
+            yunxi_bot_core::think::router::Tier::Cheap,
+            "闲聊要压在最低档"
+        );
+        assert_eq!(r.spec.provider, "local", "闲聊走本地模型，不走收费端点");
     }
 
     #[test]

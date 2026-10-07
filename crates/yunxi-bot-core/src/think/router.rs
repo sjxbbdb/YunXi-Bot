@@ -307,6 +307,42 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
+    /// 本地小模型：**闲聊和简单任务的第一选择**。
+    ///
+    /// ## 为什么档位是 `Cheap` 而不是新加一档
+    ///
+    /// `Tier` 表达的是"这件事有多重"，不是"用哪个模型"。
+    /// 闲聊和简单任务**本来就是最轻的那一档**，只是以前 `Cheap`
+    /// 没有对应的 spec、于是回落到默认档（免费的 Agnes）。
+    /// 现在给它一个真正本地的实现，语义反而更顺。
+    ///
+    /// ## 为什么不需要密钥
+    ///
+    /// 它在 `127.0.0.1` 上，是本机的一个 Python 进程
+    /// （`sidecar/local_llm_server.py`）。`key_hint` 留着是为了
+    /// 出错时能告诉人"这里本来该有什么"，**不是每个槽位都得有密钥。**
+    ///
+    /// ## 一个要留意的取舍
+    ///
+    /// 本地模型的能力上限明显低于 DeepSeek。所以它只该接
+    /// **闲聊和简单任务**——复杂任务走 `Tier::Deep`，不由这里决定。
+    pub const LOCAL_QWEN: Self = Self {
+        tier: Tier::Cheap,
+        provider: "local",
+        // **`/v1` 结尾**：`OpenAiThinker` 会自己拼 `/chat/completions`。
+        base_url: "http://127.0.0.1:17872/v1",
+        model: "Qwen3-4B-Instruct-2507",
+        price: PriceTable::LOCAL,
+        // **本地没有端点限流**，所以这个数只用来算"两次调用之间
+        // 至少隔多久"。填 600 而不是 0：0 在限流器里通常意味着
+        // "不允许任何调用"，而不是"不限"——**那是两种相反的语义，
+        // 猜错的方向是本地模型一次也用不上。**
+        rpm: 600,
+        // 本地 sidecar 不吃 `thinking` 字段，和 Agnes 同理。
+        thinking: Thinking::ServerDefault,
+        key_hint: "本地模型不需要密钥（先起 sidecar/local_llm_server.py）",
+    };
+
     /// Agnes 3.0 Flash：轻量/默认档。512K 上下文、支持工具调用、当前免费。
     ///
     /// 选它做默认的理由：**免费 + 配额够用**。10 RPM 对一两次调用绰绰有余。
@@ -672,7 +708,11 @@ pub struct ModelRouter {
 impl Default for ModelRouter {
     fn default() -> Self {
         Self::new(
-            vec![ModelSpec::AGNES_FLASH, ModelSpec::DEEPSEEK_FLASH],
+            vec![
+                ModelSpec::LOCAL_QWEN,
+                ModelSpec::AGNES_FLASH,
+                ModelSpec::DEEPSEEK_FLASH,
+            ],
             // 拿不准时走免费的那个
             Tier::Standard,
         )
@@ -748,16 +788,46 @@ impl ModelRouter {
         //    那条 ✗）。现在这条路上不再需要它——**分类才是它该管的**。
         // 2. 原来一次会话输入会问它 2~3 次（拆解路由 + 步骤路由 + 决策点）。
         //    **路由不再问之后，那两次直接消失了。**
+        // **三层分派：闲聊和简单任务走本地，复杂任务走 DeepSeek。**
+        //
+        // 为什么闲聊不给 DeepSeek：**贵，而且没必要。** 一句"今天好累"
+        // 不需要一个付费端点。
+        //
+        // 为什么简单任务也不给 DeepSeek：`heuristic_tier` 早就能判
+        // "这件事有多重"（按预计调用次数、步数、字数、有没有代码）。
+        // **判据一直都在，只是 D118 之后没人用它**——那会儿任务一刀切
+        // 走了 DeepSeek。现在把它接回来，正好分本地和远程。
+        //
+        // 为什么复杂任务仍然给 DeepSeek：本地是 4B，**能力上限明显更低**。
+        // 让它接多步推理，省下的钱会在"改不对、要重试"里加倍还回去。
         let (tier, reason) = if kind == TaskKind::Conversation {
             (
-                Tier::Standard,
-                "档位=免费：寒暄/陪伴类走 Agnes（agnes-3.0-flash）".to_string(),
+                Tier::Cheap,
+                "档位=轻量：寒暄/陪伴走本地模型（Qwen3-4B-Instruct-2507）".to_string(),
+            )
+        // **只有"确定简单"才走本地，其余一律 DeepSeek。**
+        //
+        // `heuristic_tier()` 返回 `Option<Tier>`——`None` 是"拿不准"。
+        // 拿不准的时候往哪边倒，**两边的代价是不对称的**：
+        //
+        // - 错判成本地：一个任务办砸，可能还要重试，**用户直接受损**
+        // - 错判成 DeepSeek：多花几分钱，**任务还是办成了**
+        //
+        // 所以门槛卡在"确定是轻量"，而不是"大概不重"。
+        // **省钱的收益是线性的，砸任务的损失不是。**
+        } else if profile.heuristic_tier() == Some(Tier::Cheap) {
+            (
+                Tier::Cheap,
+                format!(
+                    "档位=轻量：简单任务走本地模型，预计 {calls} 次调用（{} 字 / {} 步）",
+                    profile.prompt_chars, profile.step_count
+                ),
             )
         } else {
             (
                 Tier::Deep,
                 format!(
-                    "档位=深度：真实任务走 DeepSeek（deepseek-flash），预计 {calls} 次调用（{} 字 / {} 步）",
+                    "档位=深度：复杂任务走 DeepSeek（deepseek-flash），预计 {calls} 次调用（{} 字 / {} 步）",
                     profile.prompt_chars, profile.step_count
                 ),
             )
@@ -1060,8 +1130,13 @@ mod tests {
             ReasoningEffort::Auto,
             Some(&stub),
         );
-        assert_eq!(r.tier, Tier::Standard, "陪伴类走免费档");
-        assert_eq!(r.spec.provider, "agnes");
+        // **规格又变了（用户定）：陪伴走本地模型。**
+        //
+        // 上一版是 Agnes（免费端点）。本地模型**比它更省**——
+        // 不花钱、不占配额、不走网络，而且 10 RPM 那个限制根本不存在。
+        // 不变的是那条意图：**陪伴类不该走贵的那条。**
+        assert_eq!(r.tier, Tier::Cheap, "陪伴类压在最低档");
+        assert_eq!(r.spec.provider, "local", "陪伴走本地模型");
         assert_eq!(stub.calls(), 0, "寒暄也不该为了选档去问决策模型");
     }
 
@@ -1210,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn a_simple_task_still_goes_to_deepseek() {
+    fn a_simple_task_goes_to_the_local_model() {
         // **这条原来是 `simple_tasks_go_to_agnes_without_thinking`。**
         //
         // 旧规格：调用次数少就省钱，走免费的 Agnes。
@@ -1233,9 +1308,19 @@ mod tests {
             ReasoningEffort::Auto,
             None,
         );
-        assert_eq!(r.spec.provider, "deepseek", "真实任务走 DeepSeek");
-        assert_eq!(r.spec.model, "deepseek-flash");
-        assert_eq!(r.tier, Tier::Deep);
+        // **规格又变了（用户定）：简单任务走本地模型，只有复杂任务走 DeepSeek。**
+        //
+        // 上一版是"真实任务一律走 DeepSeek"——那解决了 Agnes 10 RPM
+        // 把任务拖死的问题（`e2e_allmodules` 那次连续 9 次"等 N ms 后重发"），
+        // **但代价是每一次简单查找都在花钱。**
+        //
+        // 现在的分界不是"是不是任务"，而是"这件事有多重"：
+        // 这句话是查找类、`heuristic_tier` 判得出轻量，所以走本地。
+        //
+        // **代价也要说明白**：本地是 4B，能力上限更低。所以门槛卡在
+        // "确定轻量"，拿不准的一律回 DeepSeek——那个方向错了只是多花钱。
+        assert_eq!(r.spec.provider, "local", "简单任务走本地模型");
+        assert_eq!(r.tier, Tier::Cheap);
         // 分类没变：它仍然被认成"不需要推理"的查找类
         assert!(!r.thinking, "查找类不开思考——省的是思考的钱，不是模型的钱");
     }
