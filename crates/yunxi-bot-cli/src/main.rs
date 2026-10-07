@@ -2498,9 +2498,10 @@ fn ensure_decider_running() {
 /// **多数是复杂的**——它们走 DeepSeek，根本碰不到本地这条路。
 /// 为每次 `do` 白等几十秒，是拿最常走的路去补贴最少走的路。
 ///
-/// **代价要说清楚**：`do` 里那些"简单任务"会打到一个没人监听的端口上。
-/// 也就是说**必须先有回落链**（本地不可达 → 换 Agnes），
-/// 否则 `do` 的简单任务就是坏的。那件事还没做。
+/// **代价要说清楚**：不预热意味着 `do` 里那些"简单任务"一开始会打到
+/// 一个没人监听的端口上。这曾经是个真实的洞——`do` 的简单步骤直接失败。
+/// 现在由回落链兜住了：探到不是"就绪"就这一轮改走 Agnes，并顺手催一次
+/// `/warmup` 把冷启动摊到下一轮（见 `think::local_health`）。
 ///
 /// ## 为什么等这么久
 ///
@@ -2519,7 +2520,7 @@ fn ensure_local_model_running() {
         eprintln!(
             "  [本地模型] 端口 {LOCAL_MODEL_PORT} 没人监听，而且找不到 sidecar/local_llm_server.py。"
         );
-        eprintln!("             闲聊会走不通（这条链路还没有回落）。");
+        eprintln!("             这一轮会自动改走 Agnes（回落链会处理），只是不再免费。");
         return;
     };
     let Some(python) = sidecar_python(&script) else {

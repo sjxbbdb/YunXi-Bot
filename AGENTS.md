@@ -81,7 +81,7 @@
 
 ### Rust
 
-- **Rust 2024**，`rust-version = 1.85`
+- **Rust 2024**，`rust-version = 1.88`
 - 模块小而专注；公开接口用显式 facade 类型
 - 改动后必须 `cargo fmt --all`
 - **声明完成前必须 `cargo test` 全绿**

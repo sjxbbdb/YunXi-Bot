@@ -76,9 +76,9 @@ export YUNXI_BOT_AGNES_KEY=sk-...      # 或放到 %LOCALAPPDATA%\YunXiBot\secre
 cargo run -- chat
 ```
 
-**没装本地模型时**，`chat` 会先试着把那个 sidecar 拉起来，拉不起来就在 stderr 上说一句
-"闲聊会走不通（这条链路还没有回落）"，然后这一轮会走 Agnes——**回落链本身还没写完**，
-别把它当成已经接好的行为（见[路由真正的判据](#路由真正的判据)下面的说明）。
+**没装本地模型时**，`chat` 会先试着把那个 sidecar 拉起来；拉不起来也不至于聊不下去——
+选中本地槽位时会探一次 `/health`，不是"就绪"就**这一轮改走 Agnes**，并在 stderr 上说清为什么
+（见[路由真正的判据](#路由真正的判据)下面的说明）。
 
 数据目录默认为 `%LOCALAPPDATA%\YunXiBot`（Windows）或 `~/.yunxi-bot`，可用 `YUNXI_BOT_HOME` 覆盖。
 `.venv/`、`data/`、`dist/`、模型权重都在 `.gitignore` 里，不进仓库。
@@ -95,7 +95,7 @@ cargo run -- chat
    脚本本身默认下的是更小的 `Qwen/Qwen3-1.7B`，而路由里写死的槽位是
    `Qwen3-4B-Instruct-2507`——**要跟代码对齐就得显式给这两个参数**。
    权重落在 `<数据目录>/models/`；下载脚本在国内会先试 HuggingFace 官方、再回落镜像。
-   （`chat` 拿不到权重时不会自动换成 Agnes——回落链还没接完。）
+   （拿不到权重不至于让对话中断：本地没就绪时这一轮会自动改走 Agnes。）
 
 2. **本地 sidecar 需要带 `torch` 的 Python**。`setup.ps1` 装的正是这个（约 1 GB），
    所以别跳过它。没装 torch 时 sidecar 会在 `/health` 上报 `degraded`，而不是假装健康。
