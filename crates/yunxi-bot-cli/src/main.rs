@@ -1463,7 +1463,7 @@ fn record_think_cost(resp: &yunxi_bot_core::think::ThinkResponse) {
 }
 
 fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
-    use yunxi_bot_core::think::{Message, ThinkRequest, Thinker, agnes::OpenAiThinker};
+    use yunxi_bot_core::think::{Message, ModelSpec, ThinkRequest, Thinker, agnes::OpenAiThinker};
 
     let positional: Vec<String> = args
         .iter()
@@ -1483,9 +1483,15 @@ fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let home = default_home();
     // --provider 让同一套代码在 Agnes 与 DeepSeek 之间切换。
     // 两者都是 OpenAI 兼容，差别只在 base_url / model / 密钥文件 / 思考模式。
+    //
+    // **配置从 `ModelSpec` 取，不在这里重抄一遍端点参数。**
+    // 这里原来各写一份 `ThinkerConfig::agnes()` / `::deepseek()`，
+    // 于是这个命令报的端点可以和路由实际用的那个不一样——
+    // 而"命令说测的是 Agnes、实际发去别处"正是刚修掉的那类 bug
+    // （路由说本地模型、请求发给 Agnes）。同一个事实只留一份数据。
     let config = match flag(args, "--provider").unwrap_or("agnes") {
-        "agnes" => ThinkerConfig::agnes(),
-        "deepseek" => ThinkerConfig::deepseek(),
+        "agnes" => ModelSpec::AGNES_FLASH.thinker_config(),
+        "deepseek" => ModelSpec::DEEPSEEK_FLASH.thinker_config(),
         other => {
             eprintln!("未知 provider {other}，可用: agnes / deepseek");
             return Ok(2);

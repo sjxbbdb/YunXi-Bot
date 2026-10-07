@@ -76,6 +76,27 @@ impl std::fmt::Debug for ApiKey {
     }
 }
 
+/// 密钥从哪来。
+///
+/// ## 为什么要有这个枚举
+///
+/// 原来这里只有一个 `key_file: &'static str`，于是"这个端点要不要密钥"
+/// 是靠**填哪个文件名字符串**表达的。本地侧车（`127.0.0.1:17872`）没有
+/// 密钥文件可填，调用方只能把它归进 Agnes 那一支——
+/// 结果就是**路由说"用本地 4B"，请求却发到了 Agnes 的服务器**，
+/// 而终端标签和台账都写着本地模型。那种错误不报错、只发错地方，
+/// 从任何一处输出上都看不出来。
+///
+/// 所以把它做成类型上的一件事：**"不需要密钥"是一个明确的取值，
+/// 不是一个凑出来的字符串。** 而且它带一个守卫，见 [`KeySource::Loopback`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// `<home>/secrets/<name>`；环境变量优先。
+    File(&'static str),
+    /// 不需要密钥。**只对回环地址生效**。
+    Loopback,
+}
+
 /// Agnes 客户端配置。
 #[derive(Debug, Clone)]
 pub struct ThinkerConfig {
@@ -84,8 +105,8 @@ pub struct ThinkerConfig {
     pub timeout: Duration,
     /// 每分钟请求数上限。默认按免费档 10 处理。
     pub rpm: u32,
-    /// 密钥文件名（相对 `<home>/secrets/`）。Agnes 与 DeepSeek 各一份。
-    pub key_file: &'static str,
+    /// 密钥来源。见 [`KeySource`]。
+    pub key_source: KeySource,
     /// 思考模式。DeepSeek **默认开**，那是输出 token 的大头。
     pub thinking: Thinking,
 }
@@ -98,7 +119,7 @@ impl Default for ThinkerConfig {
             // 长上下文 + 大输出的请求可能要跑一会儿；给足余量但不无限等
             timeout: Duration::from_secs(120),
             rpm: FREE_TIER_RPM,
-            key_file: "agnes.key",
+            key_source: KeySource::File("agnes.key"),
             thinking: Thinking::ServerDefault,
         }
     }
@@ -117,7 +138,7 @@ impl ThinkerConfig {
             model: "deepseek-flash".into(),
             timeout: Duration::from_secs(180),
             rpm: 60,
-            key_file: "deepseek.key",
+            key_source: KeySource::File("deepseek.key"),
             thinking: Thinking::Enabled,
         }
     }
@@ -126,6 +147,85 @@ impl ThinkerConfig {
     pub fn agnes() -> Self {
         Self::default()
     }
+
+    /// 本地侧车（`sidecar/local_llm_server.py`，默认 `127.0.0.1:17872`）。
+    ///
+    /// 端点参数由调用方给（它应当来自 [`super::router::ModelSpec`]），
+    /// 这样"路由说的端点"和"客户端连的端点"就只有一份数据。
+    ///
+    /// ## 超时为什么是 2 分钟
+    ///
+    /// 本地这条路的耗时大头**不是生成，是加载**：4B 的权重有 8 GB 左右，
+    /// 冷启动要先把它们从盘上读进显存/内存。而且侧车的结构决定了
+    /// **这一段会算进客户的等待里**——它先在 `ThreadingHTTPServer(...)`
+    /// 里 bind 端口，再在 `serve_forever()` 之前同步 `load()`；
+    /// 于是端口看着已经通了，请求却排在 accept 队列里等权重加载完。
+    /// 所以这个超时必须**同时**覆盖"加载几十秒"和"生成一段回答"，
+    /// 不能用远端那几个值照搬（那边没有加载这一项）。
+    ///
+    /// 上界同样是理由：超时是"卡住了"的唯一出口。填成十几分钟的话，
+    /// 侧车进程死了、显存被别的进程占了，都会表现成"还在算"，
+    /// 使用者看到的是一个不动的光标，而不是一条错误——
+    /// **把一次明确的失败伪装成一次漫长的成功，比失败本身更贵。**
+    /// 2 分钟比 `main.rs` 里估计的加载时间（"几十秒"）宽裕一倍有余，
+    /// 又短到一次真卡死能在一轮对话里暴露出来。
+    pub fn local(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            model: model.into(),
+            timeout: Duration::from_secs(120),
+            // 和 `ModelSpec::LOCAL_QWEN` 声明的一致：本地没有端点限流，
+            // 这个数只用来算"两次调用之间至少隔多久"。
+            rpm: 600,
+            // 本地侧车的 socket 只绑回环（它自己也会拒绝其他 host），
+            // 而且不认 `Authorization`——见 [`KeySource::Loopback`]。
+            key_source: KeySource::Loopback,
+            // 侧车不吃 `thinking` 字段，和 Agnes 同理：不塞。
+            thinking: Thinking::ServerDefault,
+        }
+    }
+}
+
+/// 这个 base_url 指向的是不是本机。
+///
+/// ## 为什么手写而不引 `url` crate
+///
+/// 这里要回答的只是"会不会把请求发到别的机器上"，一行判断的事。
+/// 为一个布尔判断加一个依赖，换来的是**又多一份需要跟版本走的代码**。
+///
+/// ## 判不准的时候一律当"不是回环"
+///
+/// 认不出的形状（没有 scheme、方括号不闭合、怪主机名）都返回 `false`。
+/// **两边的代价不对称**：误拒的代价是一次配置报错，几句话就能修；
+/// 误放的代价是把提示词、记忆、工具结果发给一台不需要凭证的服务器。
+///
+/// 注意 `decide::http` 里还有一句同样意思的判断。**刻意没有合并**：
+/// 那边绑在"必须显式给出端口的 http 端点"上，它按 `rsplit_once(':')` 切主机、
+/// 返回的是 `HttpError`，输入形状和这里不是一回事。
+/// 为共用一个布尔判断去动那条已经跑通的解析链，风险比这点重复大。
+pub(crate) fn is_loopback_url(base_url: &str) -> bool {
+    let Some((_, rest)) = base_url.split_once("://") else {
+        // 没有 scheme 就没法谈"主机是谁"——不猜
+        return false;
+    };
+    // 主机到第一个 `/` `?` `#` 为止；先切掉这些，再去掉 userinfo 和端口。
+    // 顺序不能反：`http://evil.com#@127.0.0.1` 这种形状就是冲着
+    // "先找 @ 再切串"的写法来的。
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(inside) = host_port.strip_prefix('[') {
+        // IPv6 字面量必须带方括号；不闭合就当它形状不对
+        match inside.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        // 没有方括号时 `:` 后面是端口（IPv6 不带方括号在这里是非法的，
+        // 也就没必要支持）
+        host_port.split(':').next().unwrap_or("")
+    };
+    // 主机名大小写不敏感，别因为写了 `LocalHost` 就拒掉一个本机地址
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 /// 默认的密钥文件位置：`<home>/secrets/agnes.key`。
@@ -165,8 +265,34 @@ impl OpenAiThinker {
     }
 
     /// 走默认配置 + 默认密钥文件构造。
+    ///
+    /// 密钥怎么来由 [`ThinkerConfig::key_source`] 决定——**"这个端点要不要密钥"
+    /// 是配置的一部分，不是调用点各自 `match` 出来的。**
     pub fn from_home(home: &Path, config: ThinkerConfig) -> Result<Self, ThinkError> {
-        let key = ApiKey::load(&key_file_for(home, config.key_file))?;
+        let key = match config.key_source {
+            KeySource::File(name) => ApiKey::load(&key_file_for(home, name))?,
+            KeySource::Loopback => {
+                // **回环之外一律拒绝构造，而不是打个警告继续。**
+                //
+                // 无密钥客户端的 `Authorization` 头是个固定值，等于没有凭证。
+                // 一旦 base_url 指向远端，我们这边的提示词、常驻记忆、
+                // 工具结果就会整套发给一台**不需要凭证就能进**的服务器。
+                // 那不是"配置写错了"，是在往外发数据——
+                // 所以让它在这里就造不出来，而不是等请求飞出去。
+                if !is_loopback_url(&config.base_url) {
+                    return Err(ThinkError::Auth(format!(
+                        "{} 被标成不需要密钥，但它的 base_url 不是回环地址（{}）。\
+                         无密钥客户端只能连本机：要么把它改回 127.0.0.1 / localhost / [::1]，\
+                         要么给它配一个真正的密钥来源。",
+                        config.model, config.base_url
+                    )));
+                }
+                // 侧车不校验这个头，值本身无所谓；但**不能是空串**——
+                // `think` / `think_stream` 开头那道 `is_empty` 闸会把它当成
+                // "没配密钥"直接拒掉，于是本地槽位一次也发不出去。
+                ApiKey::new("local")
+            }
+        };
         Ok(Self::new(config, key))
     }
 
@@ -883,6 +1009,73 @@ mod tests {
         let t = OpenAiThinker::new(ThinkerConfig::default(), ApiKey::new("sk-x"));
         let err = t.think(&ThinkRequest::new(vec![])).unwrap_err();
         assert!(matches!(err, ThinkError::BadRequest { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_keyless_client_refuses_a_remote_endpoint() {
+        // **这是守卫本身。** 无密钥客户端等于没有凭证——它只对回环地址成立。
+        // 指向远端时必须**造都造不出来**：等到发出去再报错就晚了，
+        // 那时候提示词、记忆、工具结果已经在对面了。
+        let cfg = ThinkerConfig {
+            base_url: "https://api.agnes-ai.cn/v1".into(),
+            model: "某本地模型".into(),
+            key_source: KeySource::Loopback,
+            ..Default::default()
+        };
+        let err = match OpenAiThinker::from_home(Path::new("C:/不存在"), cfg) {
+            Ok(_) => panic!("无密钥客户端指向远端时必须被拒绝"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, ThinkError::Auth(_)),
+            "该报成认证/配置错误: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("回环"), "要说清是回环这条约束: {msg}");
+        assert!(
+            msg.contains("api.agnes-ai.cn"),
+            "要把写错的地址带出来: {msg}"
+        );
+    }
+
+    #[test]
+    fn loopback_detection_reads_the_host_not_the_path() {
+        // 认得出的三种：127.0.0.1 / localhost / [::1]，带端口和路径都算。
+        // 主机名大小写不敏感，写了 `LocalHost` 也不该被拒。
+        for ok in [
+            "http://127.0.0.1:17872/v1",
+            "http://localhost:17872/v1",
+            "http://[::1]:17872/v1",
+            "http://LocalHost/v1",
+        ] {
+            assert!(is_loopback_url(ok), "{ok} 是回环，不该被拒");
+        }
+        // **认不出的必须拒。** 下面几条都是想把"回环"伪装出来的形状：
+        // 主机名后缀、userinfo、fragment、少一个方括号、没有 scheme。
+        // 按"先找 @ 再切串"写的解析会被其中几条绕过。
+        for bad in [
+            "https://api.agnes-ai.cn/v1",
+            "http://127.0.0.1.evil.com/v1",
+            "https://127.0.0.1.evil.com/v1",
+            "http://127.0.0.1@evil.com/v1",
+            "http://evil.com#@127.0.0.1",
+            "http://[::1/v1",
+            "127.0.0.1:17872/v1",
+        ] {
+            assert!(!is_loopback_url(bad), "{bad} 不是回环，必须拒");
+        }
+    }
+
+    #[test]
+    fn a_local_client_needs_no_key_file_at_all() {
+        // 构造本地客户端**不该碰盘**：home 指到一个不存在的目录也照样造得出来。
+        // 这正是"不需要密钥"那个类型级事实的验收——
+        // 老写法（`key_file` 字符串）在这一步就会去读 `secrets/agnes.key`。
+        let cfg = ThinkerConfig::local("http://127.0.0.1:17872/v1", "Qwen3-4B-Instruct-2507");
+        let t = OpenAiThinker::from_home(Path::new("C:/绝对不存在的目录"), cfg)
+            .expect("不需要密钥的客户端不该因为读不到密钥文件而失败");
+        assert_eq!(t.config().base_url, "http://127.0.0.1:17872/v1");
+        assert_eq!(t.config().model, "Qwen3-4B-Instruct-2507");
     }
 
     #[test]

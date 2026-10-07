@@ -29,8 +29,7 @@ use yunxi_bot_core::task::engine::{
 };
 use yunxi_bot_core::think::prompt::{PromptLayout, build_persona};
 use yunxi_bot_core::think::{
-    ModelSpec, OpenAiThinker, ReasoningEffort, Routing, ThinkError, ThinkRequest, Thinker,
-    ThinkerConfig, Thinking,
+    ModelSpec, OpenAiThinker, ReasoningEffort, Routing, ThinkError, ThinkRequest, Thinker, Thinking,
 };
 use yunxi_bot_core::tool::{Approver, RefusingApprover, ToolPolicy, ToolRegistry, ToolRunner};
 
@@ -376,12 +375,20 @@ impl ChatHandler {
     ///
     /// 造不出来就是配置问题（缺密钥），**直接报错而不是换一个模型偷偷跑**——
     /// 悄悄降级会让"为什么这次答案变差了"永远查不清。
+    ///
+    /// ## 客户端配置一律从 spec 取
+    ///
+    /// 这里原来是 `match spec.provider` 再手写一份 `ThinkerConfig`。
+    /// 那份手写的表**漏掉了 `"local"`**，于是路由选本地模型时，
+    /// 请求实际发给了 Agnes：终端标签和台账都写着本地，只有请求去错了地方。
+    /// 所以现在改成 [`ModelSpec::thinker_config`]——**端点只有一个出处**，
+    /// 路由和客户端不可能各说各话。
+    ///
+    /// 注意缓存是按 `provider` 取键的：**同一个 provider 名下只能有一个端点**。
+    /// 两个同名但 base_url 不同的 spec 会共用先造出来的那个客户端。
     fn thinker(&mut self, spec: &ModelSpec) -> Result<std::sync::Arc<OpenAiThinker>, TaskError> {
         if !self.thinkers.contains_key(spec.provider) {
-            let cfg = match spec.provider {
-                "deepseek" => ThinkerConfig::deepseek(),
-                _ => ThinkerConfig::agnes(),
-            };
+            let cfg = spec.thinker_config();
             let t = OpenAiThinker::from_home(&self.home, cfg).map_err(|e| {
                 TaskError::Core(yunxi_bot_core::CoreError::Ledger(format!(
                     "无法初始化 {} 的客户端（{}）: {e}",
@@ -1499,6 +1506,35 @@ mod chat_session_tests {
         assert_eq!(
             handler().expected_chat_prefix(),
             handler().expected_chat_prefix()
+        );
+    }
+
+    #[test]
+    fn the_client_for_a_slot_connects_to_the_endpoint_that_slot_names() {
+        // **这是那个 bug 在真正出事那一层的回归测试。**
+        //
+        // `thinker()` 原来按 provider 手写客户端配置，`"local"` 掉进 `_ =>`
+        // 兜底，于是"路由说本地模型、请求发给 Agnes 的服务器"。
+        // 这一层才是请求真正发出去的地方，所以直接拿本地槽位要一个客户端，
+        // 看它连的是哪儿、报的是哪个模型。
+        //
+        // **只测本地槽位**：远端那两个要密钥，测试机上没有，构造必然失败——
+        // 那是环境问题，不是配置漂移。"每个槽位都不漂"由 core 的
+        // `every_slot_actually_calls_the_endpoint_it_names` 全量覆盖。
+        let mut h = handler();
+        let spec = ModelSpec::LOCAL_QWEN;
+        let t = h
+            .thinker(&spec)
+            .unwrap_or_else(|e| panic!("本地槽位不需要密钥，不该造不出客户端: {e:?}"));
+        assert_eq!(
+            t.config().base_url,
+            spec.base_url,
+            "客户端连的端点不是路由选的那个——界面和台账会替真正的回答者报错名字"
+        );
+        assert_eq!(
+            t.config().model,
+            spec.model,
+            "客户端报的模型名不是路由选的那个"
         );
     }
 

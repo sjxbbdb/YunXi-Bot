@@ -61,6 +61,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::agnes::ThinkerConfig;
 use super::cost::{Cost, PriceTable, Usage, is_peak_hour};
 use crate::decide::Decider;
 
@@ -378,6 +379,54 @@ impl ModelSpec {
     /// 这个端点吃不吃思考模式的字段。Agnes 不吃，就不该给它塞。
     pub fn accepts_thinking(&self) -> bool {
         !matches!(self.thinking, Thinking::ServerDefault)
+    }
+
+    /// 这条 spec 对应的客户端配置。**端点参数的唯一出处。**
+    ///
+    /// ## 为什么必须有这一层
+    ///
+    /// 在这之前没有它：调用方各自 `match spec.provider`，再手写一份
+    /// [`ThinkerConfig`]。于是"路由选了哪个端点"和"客户端实际连哪个端点"
+    /// 是两份数据，**而只有后一份会被真正使用**。
+    ///
+    /// 后果是实测出来的：`ModelSpec::LOCAL_QWEN` 的 `provider` 是 `"local"`，
+    /// 调用方的 `match` 里没有这一支，掉进 `_ =>` 兜底拿到了 Agnes 的地址
+    /// 和模型名。终端打印的是 `Qwen3-4B-Instruct-2507`、台账记的也是
+    /// `provider: "local"`，**唯独发出去的请求是给 Agnes 的**——
+    /// 本地模型一次都没被调用过，而所有显示都正常，没有任何一处报错。
+    ///
+    /// ## 所以这里只决定"密钥从哪来、超时给多少"
+    ///
+    /// `base_url` / `model` / `rpm` / `thinking` 一律从 `self` 取（见下面那四行
+    /// 覆盖）——它们**不可能和 spec 不一致**，因为它们就是 spec 的值。
+    /// 新增一个槽位时，只有密钥来源和超时需要有人拿主意——**而且这一支必须显式写出来**：
+    /// 默认那一支不给密钥（见下），所以漏写不会悄悄借用别人的凭证，只会在构造时失败。
+    pub fn thinker_config(&self) -> ThinkerConfig {
+        let mut cfg = match self.provider {
+            // 本地侧车：不读密钥文件，而且只认回环地址
+            "local" => ThinkerConfig::local(self.base_url, self.model),
+            "deepseek" => ThinkerConfig::deepseek(),
+            "agnes" => ThinkerConfig::agnes(),
+            // 没见过的 provider：**不 panic，也不替它挑一把密钥。**
+            //
+            // 这里本来落到 Agnes 的配置上。那样不安全：`agnes.key` 是真存在的，
+            // 于是一个新加的远端 provider 会**拿着 Agnes 的密钥把请求发到别的
+            // 机器上**——凭证就这么交出去了，而且全程不会有任何报错。
+            //
+            // 所以默认给"不需要密钥"，而这一类**只在回环地址上成立**
+            // （守卫在 `agnes::from_home`）。结果是新增远端槽位时**必须显式
+            // 加一支**、说明它的密钥从哪来，否则它在这里就响亮地造不出客户端。
+            // **没接上的槽位报错，好过没接上的槽位借别人的钥匙。**
+            _ => ThinkerConfig {
+                key_source: super::agnes::KeySource::Loopback,
+                ..ThinkerConfig::agnes()
+            },
+        };
+        cfg.base_url = self.base_url.to_string();
+        cfg.model = self.model.to_string();
+        cfg.rpm = self.rpm;
+        cfg.thinking = self.thinking;
+        cfg
     }
 }
 
@@ -1012,6 +1061,8 @@ pub fn is_peak_now(now: chrono::DateTime<chrono::Local>) -> bool {
 mod tests {
     use super::*;
     use crate::decide::StubDecider;
+    use crate::think::agnes::{KeySource, OpenAiThinker, is_loopback_url};
+    use std::path::Path;
 
     fn profile(chars: usize, steps: usize) -> TaskProfile {
         TaskProfile {
@@ -1211,6 +1262,73 @@ mod tests {
         let deep = router.spec(Tier::Deep).unwrap();
         assert_eq!(deep.provider, "deepseek");
         assert_eq!(deep.model, "deepseek-flash", "模型名不能写错");
+    }
+
+    #[test]
+    fn every_slot_actually_calls_the_endpoint_it_names() {
+        // **这条就是那个 bug 的回归测试。**
+        //
+        // 症状：路由选的是本地槽位（终端打印 `Qwen3-4B-Instruct-2507·不思考`，
+        // 台账里 `provider` 也是 `local`），可请求发到了 Agnes 的服务器——
+        // 因为调用方按 provider 手写客户端配置，`"local"` 掉进了 `_ =>` 兜底。
+        // **没有任何一处显示能看出这件事：名字、台账、标签全是对的。**
+        //
+        // 判据直接盯最终的 `ThinkerConfig`：客户端连的地址和它报的模型，
+        // 必须就是这条 spec 写的那两条。中间不允许再存一份手抄的数据。
+        //
+        // 遍历 `router.specs()` 而不是手写三个常量：**手写的清单恰好测不出
+        // "新加的槽位没接上"**，而漏接新槽位就是这个 bug 的形状
+        // （`local` 正是当时新加的那一个）。
+        for spec in ModelRouter::default().specs() {
+            let cfg = spec.thinker_config();
+            assert_eq!(
+                cfg.base_url, spec.base_url,
+                "provider `{}` 的客户端连的是 {}，但 spec 说的是 {}——\
+                 路由按 spec 报名字、客户端按 config 发请求，这两份一旦不同，\
+                 界面和台账都会指着另一个模型说是它答的",
+                spec.provider, cfg.base_url, spec.base_url
+            );
+            assert_eq!(
+                cfg.model, spec.model,
+                "provider `{}` 的模型名漂了：客户端要用 {}，spec 说的是 {}",
+                spec.provider, cfg.model, spec.model
+            );
+            // 限流和思考能力同理，也是 spec 的属性：它们要是各说各话，
+            // "这个端点能不能开思考"就会有两个答案。
+            assert_eq!(
+                cfg.rpm, spec.rpm,
+                "provider `{}` 的 RPM 没跟着 spec 走：{} vs {}",
+                spec.provider, cfg.rpm, spec.rpm
+            );
+            assert_eq!(
+                cfg.thinking, spec.thinking,
+                "provider `{}` 的思考能力没跟着 spec 走：{:?} vs {:?}",
+                spec.provider, cfg.thinking, spec.thinking
+            );
+        }
+    }
+
+    #[test]
+    fn the_local_slot_is_keyless_and_only_ever_points_at_loopback() {
+        // 本地槽位没有密钥文件可读，所以它必须落在"不需要密钥"那一类；
+        // 而这一类**只在回环地址上成立**（守卫在 `agnes::from_home`）。
+        // 两件事要一起断言：只测"能构造出来"的话，
+        // 哪天有人把它指到远端，这条测试反而会替那个改动放行。
+        let spec = ModelSpec::LOCAL_QWEN;
+        let cfg = spec.thinker_config();
+        assert_eq!(
+            cfg.key_source,
+            KeySource::Loopback,
+            "本地槽位不该去读密钥文件——它根本没有"
+        );
+        assert!(
+            is_loopback_url(&cfg.base_url),
+            "本地槽位的 base_url 必须是回环地址，否则无密钥客户端连构造都会被拒: {}",
+            cfg.base_url
+        );
+        // 真从构造入口走一遍：home 里不需要存在任何文件。
+        OpenAiThinker::from_home(Path::new("C:/没有这个目录"), cfg)
+            .expect("本地槽位必须能无密钥构造出来");
     }
 
     #[test]
