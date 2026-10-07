@@ -858,6 +858,12 @@ impl ChatHandler {
     /// 走的是**同一份判据**（`local_health::apply_fallback`），
     /// 但注入点在引擎上（`Engine::with_local_probe`）、由 CLI 挂上——
     /// **两处都得挂**，漏一处那条链路就没有兜底。
+    ///
+    /// **留痕也一样要挂两处**：这条链路把回落记成一条
+    /// `DecisionClass::Route` 决策事件（见 [`Self::apply_local_fallback`]），
+    /// 引擎那条走 `Engine::with_ledger`，记的是同一类、同一句 action。
+    /// 引擎那边漏挂的表现最阴：回落照旧发生、终端上照旧打一行，
+    /// 而台账里就是没有那条 `route`——**"本地到底有没有被用上"又查不出来了**。
     pub fn route_for(&self, input: &str, effort: ReasoningEffort) -> Routing {
         use yunxi_bot_core::think::router::{TaskKind, profile_task};
         // 对话还没拆解，所以步骤数是 0——`profile_task` 会按长度粗估。

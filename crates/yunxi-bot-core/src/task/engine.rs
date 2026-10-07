@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 
 use crate::costlog::CallRecord;
-use crate::decide::Decider;
+use crate::decide::{Decider, DecisionClass, record_decision};
 use crate::ledger::{EventKind, Ledger, LedgerError, task_from_events};
 use crate::think::local_health::{self, Probe};
 use crate::think::{ModelRouter, ReasoningEffort, Routing, TaskKind, TaskProfile};
@@ -364,6 +364,35 @@ pub struct Engine<'a, H: TaskHandler, S: TaskStore> {
     /// 一个可能没人监听的 17872 上——那正是这次要堵的洞。
     /// `a_degraded_local_sidecar_moves_a_task_step_to_agnes` 钉着这件事。
     local_probe: Option<Probe>,
+    /// 回落留痕的出口：本地槽位不可用而改走 Agnes 时，往这本台账写一条
+    /// [`DecisionClass::Route`] 决策事件。`None` = **不记，一个字节的 I/O 都没有**。
+    ///
+    /// ## 为什么是"另接一本台账"，而不是从 `store` 里取
+    ///
+    /// `store` 是任务事件的落点（[`TaskStore`]），它已经可变借着 `self` 了——
+    /// 同一个台账对象借不出第二个可变引用，而且那个限制是对的：
+    /// **"谁持有这本台账"只能有一个答案**。所以这里走和 [`Self::local_probe`]
+    /// 完全同一条路：默认 `None`，由真正知道自己跑在哪的调用方显式挂上。
+    ///
+    /// ## 为什么是决策事件，而不是只靠 `routing.reason`
+    ///
+    /// 回落的理由**已经**进了 `TaskPlanned` / `StepRouted` 的 `routing.reason`，
+    /// 所以"这一步为什么走了 Agnes"查得出来。但那两个事件回答的是
+    /// "这一步的路由长什么样"，**回答不了"这一轮到底有没有回落"**：
+    /// 一份写着 `provider: agnes` 的路由记录，和"本来就要走 Agnes"长得一模一样。
+    ///
+    /// 对话那条链路（`ChatHandler::apply_local_fallback`）记的是一条
+    /// `DecisionClass::Route` 决策事件——D129 加这一类就是为了这件事。
+    /// 引擎这条不记的话，同一个动作在两条链路上留下两种形状的痕，
+    /// 而"有一条链路悄悄不回落了"正是 D128 的形状：功能还在，只是退化了，
+    /// 且退化之后每一处显示都正常。**两边共用同一类，查法才只有一种。**
+    ///
+    /// 代价写明白：**没挂 = 回落只在 stderr 上出现**，和加这一层之前一样。
+    /// 所以 CLI 那几条真会发请求的路每一处都必须挂（`do` / 干跑 / `resume` /
+    /// 守护的任务回合）；`a_local_fallback_is_recorded_as_a_route_decision`
+    /// 钉着"挂上就得记下来"，`an_engine_without_a_ledger_keeps_todays_behaviour`
+    /// 钉着"不挂就一个字节都不多"。
+    route_ledger: Option<&'a mut Ledger>,
 }
 
 impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
@@ -384,6 +413,10 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             // **不挂就是不探。** 默认值给一个"永远就绪"的假探测器会更坏：
             // 它看起来像"这一层接上了"，而行为和没接一模一样。
             local_probe: None,
+            // **不挂就是不记。** 同理：默认给一本"丢掉一切"的假台账，
+            // 会让"留痕接上了"和"留痕没接"在代码上长得一样——
+            // 那正是 D128 那种"看起来正常"。
+            route_ledger: None,
         }
     }
 
@@ -403,23 +436,61 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
         self
     }
 
+    /// 挂上台账：本地槽位不可用而改走 Agnes 时，**记一条 `Route` 决策事件**
+    /// （和对话那条链路同一个写法，见 [`Self::route_ledger`] 的字段文档）。
+    ///
+    /// **不挂 = 不记**，行为与加它之前逐字节相同——回落本身照旧发生、
+    /// stderr 照旧说一句，只是台账里没有那条决策事件。
+    /// CLI 那几条真会发请求的路必须挂。
+    pub fn with_ledger(mut self, ledger: &'a mut Ledger) -> Self {
+        self.route_ledger = Some(ledger);
+        self
+    }
+
     /// 把一条路由过一道本地槽位的健康：**没挂探测器就立刻返回**。
     ///
     /// 判据、催热、改写全在 [`local_health::apply_fallback`] 里——
     /// **这里不重新实现一遍**。两份判据必然漂移，而漂移的方向是
     /// "有一条链路悄悄不回落了"（D128 的形状：功能还在，只是退化了）。
-    fn apply_local_fallback(&self, routing: &mut Routing) {
+    ///
+    /// 留痕也收在这一处，而不是三个调用点各写一遍：`plan_task`、
+    /// `run_step`、`run_decision` 三条路都从这里出去，所以
+    /// **回落一次就恰好记一条**，不会漏、也不会重。
+    fn apply_local_fallback(&mut self, routing: &mut Routing) {
         let Some(probe) = self.local_probe.as_ref() else {
             return;
         };
         if let Some(reason) = local_health::apply_fallback(routing, probe) {
             // **回落必须看得见。** 终端上这一行是使用者唯一会主动看的地方，
             // 而"这一轮其实没走本地那个模型"只有这里说得清。
-            //
-            // 留痕的另一半在任务台账里：理由已经被接进 `routing.reason`，
-            // 而调用方紧接着写的 `TaskPlanned` / `StepRouted` 记的正是
-            // 这份 `RoutingRecord`（含 `reason`）。
             eprintln!("  [本地模型] {reason}。");
+
+            // 终端那一行只活在这次运行里，**台账那一份才留得下来**。
+            //
+            // 字段全部逐字对齐对话那条链路（`ChatHandler::apply_local_fallback`）：
+            // `DecisionClass::Route` + `degraded = true` + 同一句 action。
+            // 两边各编一套说法的话，"查台账"这件事就得按链路分两遍做，
+            // 而两条链路迟早会有一边少填一个字段。
+            //
+            // `model` 是 `None`：**没有模型回答过这个问题**——答话的是
+            // sidecar 的 `/health`。填一个模型名会把归因引到一条根本
+            // 没发生过的调用上（D128 就是被这种假账骗过去的）。
+            //
+            // 写失败只报不中断，和 [`Self::flush_records`] 同一个判据：
+            // 留痕失败不该挡住任务。
+            if let Some(ledger) = self.route_ledger.as_mut()
+                && let Err(e) = record_decision(
+                    ledger,
+                    DecisionClass::Route,
+                    true,
+                    "改走 Agnes（远端）",
+                    &reason,
+                    None,
+                    &[],
+                )
+            {
+                eprintln!("⚠ 回落留痕写入失败（不影响任务）: {e}");
+            }
         }
     }
 
@@ -2756,6 +2827,179 @@ mod tests {
         assert!(
             reason.contains("ModuleNotFoundError"),
             "回落理由要进台账，否则事后查不出为什么换了模型: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_local_fallback_is_recorded_as_a_route_decision() {
+        // **这条钉的是"引擎那条回落也留痕"，也是这次补的那个洞。**
+        //
+        // 回落本来存在两处：对话（`ChatHandler::route_for`）和任务引擎。
+        // 对话那条记一条 `DecisionClass::Route` 决策事件，引擎这条**不记**——
+        // 它只把理由放进 `routing.reason`（进了 `TaskPlanned` / `StepRouted`），
+        // 于是 `do` 里一步一步从本地槽位挪到 Agnes，台账里**一条 `route`
+        // 决策事件都没有**。而一份写着 `provider: agnes` 的路由记录，和
+        // "本来就要走 Agnes"长得一模一样——D128 那一类"显示正常、实际退化"。
+        //
+        // 少了这条测试，将来谁把 `.with_ledger` 拆掉、或者把这一行挪到一个
+        // 不常走的分支里，都不会有东西变红——**那正是这个洞藏了一轮的原因**。
+        //
+        // 用**真台账**（临时文件）而不是一个假 sink：留痕这件事的器件必须是
+        // 生产那一套。假 sink 只能回答"有人调过我"，而"记的是 `route` 类、
+        // `degraded` 是 true、理由是那句 degraded 原文、而且落在边界里"
+        // 这四条全在 `record_decision` 那一层——**换掉器件就等于把要验的
+        // 那一层换掉了**（D90 / D93 两次栽的都是"测试和生产用了两套器件"）。
+        // 对话那边同一条测试（`the_fallback_is_visible_in_the_ledger`）也是这么写的。
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        // 和 `a_degraded_local_sidecar_moves_a_task_step_to_agnes` 同一个指令：
+        // 查找类、判得出轻量，也就是**会落在本地槽位上**的那一种。
+        let plan = serde_json::json!({
+            "steps": [
+                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "lookup" }
+            ]
+        })
+        .to_string();
+        let mut handler = ScriptedHandler::with_plan(&plan);
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "查一下今天的日程").unwrap();
+
+        let dir = std::env::temp_dir().join(format!("yunxi-route-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ledger.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut route_ledger = Ledger::open(&path).expect("开台账");
+
+        // 假探测器（**不连端口**）：真起一个 4B sidecar 要几十秒和几 GB 内存。
+        let probe = Probe::new(
+            |_: &str| {
+                crate::think::local_health::LocalHealth::Degraded(
+                    "ModuleNotFoundError: No module named 'torch'".into(),
+                )
+            },
+            |_: &str| {},
+        );
+
+        engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .with_local_probe(probe)
+        .with_ledger(&mut route_ledger)
+        .run("t1")
+        .unwrap();
+
+        // 回落**真的发生了**（不然下面那条断言验的是一个没发生的事）：
+        // 拆解走 DeepSeek，只有 s1 落在本地槽位上。
+        assert_eq!(
+            handler.seen_providers[1], "agnes",
+            "本地槽位 degraded 时，简单步骤该改走 Agnes（{:?}）",
+            handler.seen_providers
+        );
+
+        let decided: Vec<&crate::ledger::Event> = route_ledger
+            .events()
+            .iter()
+            .filter(|e| e.kind == EventKind::DecisionDecided)
+            .collect();
+        assert_eq!(
+            decided.len(),
+            1,
+            "回落**恰好**该留一条决策事件（多条=重复记，零条=洞又开了）"
+        );
+        let d = &decided[0].data;
+        assert_eq!(
+            d["class"],
+            serde_json::json!("route"),
+            "记的必须是 Route 那一类——借 Classify 会把「换了端点」记成「分类结果」: {d}"
+        );
+        assert_eq!(
+            d["degraded"],
+            serde_json::json!(true),
+            "这一条一定是降级：路由本来选的是本地，而它用不了: {d}"
+        );
+        // **理由要带上 sidecar 的原话。** 只记"回落了"等于没记——
+        // 事后要看的是"它为什么一直不好"（degraded 是唯一不会自愈的那种）。
+        let reason = d["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("ModuleNotFoundError"),
+            "回落理由要进台账，否则事后查不出为什么换了模型: {reason}"
+        );
+        // 审计对必须落在边界里（ADR D6）：落在边界外的与崩溃残尾无法区分。
+        assert!(
+            decided[0].span.is_some(),
+            "决策事件必须被边界包住，否则 reload 时会被当成残尾丢掉"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_engine_without_a_ledger_keeps_todays_behaviour() {
+        // **默认必须是"什么都不记"。**
+        //
+        // 引擎是 core 里的东西，被近千条测试、干跑、端到端脚本反复构造。
+        // 默认去开一本台账（或者写进 `store`）的话，**每条引擎测试都会
+        // 凭空多出一批审计事件**，而那只会在有人正好在查留痕时被发现。
+        //
+        // 这里把三件事分开钉住：
+        //
+        // 1. 默认字段就是 `None`（私有字段，测试模块看得到）
+        // 2. 挂了探测器时**回落本身照旧发生**——不记不等于不回落
+        // 3. **任务 store 里一条决策事件都不多**：留痕只能走注入的那本台账，
+        //    顺手写进 `store` 会让"没挂台账"和"挂了台账"在投影上分不开
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let plan = serde_json::json!({
+            "steps": [
+                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "lookup" }
+            ]
+        })
+        .to_string();
+        let mut handler = ScriptedHandler::with_plan(&plan);
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "t1", "查一下今天的日程").unwrap();
+
+        let probe = Probe::new(
+            |_: &str| {
+                crate::think::local_health::LocalHealth::Degraded(
+                    "ModuleNotFoundError: No module named 'torch'".into(),
+                )
+            },
+            |_: &str| {},
+        );
+        let mut eng = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .with_local_probe(probe);
+        assert!(
+            eng.route_ledger.is_none(),
+            "默认必须不记：挂了的话每个构造引擎的地方都会开始写台账"
+        );
+        let outcome = eng.run("t1").unwrap();
+
+        assert_eq!(
+            handler.seen_providers[1], "agnes",
+            "没挂台账不影响回落本身（{:?}）",
+            handler.seen_providers
+        );
+        assert_eq!(
+            outcome.task.state,
+            TaskState::Done,
+            "没挂台账时任务的结局一个字节都不该变"
+        );
+        assert!(
+            !store.events().iter().any(|e| matches!(
+                e.kind,
+                EventKind::DecisionAsked | EventKind::DecisionDecided
+            )),
+            "没挂台账时不该有任何决策事件——留痕只能走注入的那本，不能顺手写进 store"
         );
     }
 

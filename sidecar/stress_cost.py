@@ -37,11 +37,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from e2e_common import real_home_dir  # noqa: E402
+
 MIN_RATE = 60.0
 
 
 def main() -> int:
-    home = Path(os.environ.get("LOCALAPPDATA", "")) / "YunXiBot"
+    # **这一行原来是写死的 `%LOCALAPPDATA%\YunXiBot`。** 运行目录搬家之后
+    # 那个路径已经不在，于是这里报"没有台账"——而它要读的**就是真实台账**
+    # （这个脚本没有临时 home：它统计的是真机上跑过的钱）。
+    home = real_home_dir()
     ledger = home / "ledger.jsonl"
     if not ledger.exists():
         print(f"没有台账：{ledger}", file=sys.stderr)

@@ -11,6 +11,7 @@
 mod approval;
 mod chat;
 mod chat_handler;
+mod detach;
 mod tool_sink;
 mod tooling;
 
@@ -563,7 +564,11 @@ fn run_task_round<D: yunxi_bot_core::decide::Decider>(
                 // **守护这条也要挂。** 它同样是自己调 `router.route` 的——
                 // 引擎默认不探（见 `Engine::local_probe` 的字段文档），
                 // 漏挂这一处的表现是"半夜里简单步骤全失败，而理由和任务无关"。
-                .with_local_probe(yunxi_bot_core::think::local_health::Probe::real());
+                .with_local_probe(yunxi_bot_core::think::local_health::Probe::real())
+                // **回落留痕也挂这一本台账。** 守护这条路上漏挂的表现最阴：
+                // 半夜里回落发生了、stderr 没人看、台账里也查不到，
+                // 而"本地模型到底有没有被用上"正是 D128 查了一整轮的问题。
+                .with_ledger(&mut *ledger);
             engine.run(&id)
         };
         match out {
@@ -2471,7 +2476,11 @@ fn ensure_decider_running() {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
-    if let Err(e) = cmd.spawn() {
+    // **走 `detach`，不走 `cmd.spawn()`。** 这条同样是分离启动，所以同样会
+    // 把调用方的管道继承给 sidecar——那一头卡住的是 `subprocess.run(...,
+    // capture_output=True)` 这类调用方的 `communicate()`。
+    // 机制和证据都在 `detach` 的模块文档里，这里不重复。
+    if let Err(e) = detach::spawn_detached(&mut cmd) {
         eprintln!("  [决策模型] 启动失败：{e}");
         return;
     }
@@ -2508,12 +2517,41 @@ fn ensure_decider_running() {
 /// 决策模型是几百 MB，10 秒足够；这个是 8 GB，**加载完要几十秒**。
 /// 用同一个超时会把它误判成"起失败了"——而那个误判的后果是
 /// 每次调用都重新拉一遍，越拉越慢。
+///
+/// ## 为什么先看权重在不在，再决定启不启动
+///
+/// sidecar 是按 `YUNXI_BOT_HOME` 去找 `<home>/models/<名字>/` 的
+/// （`sidecar/local_llm_server.py` 的 `resolve_model_dir`，和
+/// `verdict_server.py` 里那套同一份规则）。而它继承的环境**就是跑 `chat`
+/// 那个环境**——所以"权重在不在它要去找的地方"，只有这里能提前算出来。
+///
+/// 不算会怎样（实测出来的）：拿一个临时 home 跑 `chat`，它照样会把 sidecar
+/// 拉起来；那个进程找不到权重，`/health` 报
+/// `degraded + OSError: Can't load the configuration of 'Qwen3-4B-Instruct-2507'`，
+/// 然后——**它永远不重试，也永远不放开 17872**。于是本地槽位整条死掉，
+/// 每一轮都安静地改走 Agnes，而每一处显示都正常。
+///
+/// 也就是说：**启动一个注定失败的 sidecar，比不启动更坏。** 不启动只是这一轮
+/// 没有本地模型；启动了是把本地槽位锁死，而且锁它的那个进程看着还挺健康
+/// （端口是开着的）。所以这里的判据只有一条：**它要去找的那个目录里有没有
+/// 权重**，没有就如实说、不启动。
+///
+/// ## 端口开着不等于它在干活
+///
+/// sidecar 是"先 bind 端口（`main()` 里 `ThreadingHTTPServer(...)`）、
+/// 再加载权重"的顺序，而加载失败之后它**照样占着端口**：
+/// `_load_once` 见到 `_model_error` 就立刻返回，`/warmup` 也一样不重试。
+/// 所以这里看到"有人在"就掉头走，会把一个**永远不会好**的进程当成"已经在跑"。
+/// 这种情况下要说话（[`warn_if_squatting`]），但**只认它自己说的 `degraded`**：
+/// 「正在加载」和「已经废了」在这一眼里长得一样，猜错的方向是让人去查一个
+/// 没坏的东西。
 fn ensure_local_model_running() {
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};
     use std::time::Duration;
 
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_MODEL_PORT));
     if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+        warn_if_squatting();
         return;
     }
     let Some(script) = sidecar_script("local_llm_server.py") else {
@@ -2527,6 +2565,37 @@ fn ensure_local_model_running() {
         eprintln!("  [本地模型] 没找到可用的 Python，起不来。先跑一次 安装Python环境.cmd。");
         return;
     };
+
+    // **权重不在它要去找的地方，就别启动了**（理由见函数文档）。
+    //
+    // 判据用 `config.json` 而**不是**"目录在不在"：那正是 sidecar 自己的判据
+    // （`resolve_model_dir` 里 `(candidate / "config.json").is_file()` 那一行）。
+    // 两边口径必须一致——不然我们会在"它到底认不认这个目录"上和它吵起来，
+    // 而这正是 D128 那一类"两处各算一份、然后漂移"的形状。
+    //
+    // **这里没做、也不该做的事**：判断"权重完不完整"。半个下载（有 config.json、
+    // 没有 safetensors）照样会加载失败——那属于 transformers 该报的错，
+    // 再写一套"哪些文件算权重"的判据只会是第三份口径。它失败时
+    // `warn_if_squatting` 至少会让这件事被看见。
+    let weights = local_model_dir(LOCAL_MODEL_NAME);
+    if !local_weights_present(&weights) {
+        eprintln!("  [本地模型] 端口 {LOCAL_MODEL_PORT} 没人监听，而且权重不在它要去找的地方：");
+        eprintln!("             {}", weights.display());
+        eprintln!(
+            "             它按 YUNXI_BOT_HOME 找（现在是 {}）；找不到就只剩",
+            default_home().display()
+        );
+        eprintln!("             \"拿模型名去 HuggingFace 拉\"这一条路，而实测那条路是失败的：");
+        eprintln!("             OSError: Can't load the configuration of '{LOCAL_MODEL_NAME}'。");
+        eprintln!("             所以**这次不启动**它——启动了只会留下一个端口开着、");
+        eprintln!("             `/health` 永远 degraded、而且不会重试的进程占着本地槽位。");
+        eprintln!("             这一轮会自动改走 Agnes（回落链会处理），只是不再免费。");
+        eprintln!(
+            "             要让它回来：把权重放到上面那个路径（scripts/fetch_local_model.py），"
+        );
+        eprintln!("             或者把 YUNXI_BOT_HOME 指到有 models/ 的那个 home。");
+        return;
+    }
 
     eprintln!("  [本地模型] 不在跑，正在拉起……（4B 要几十秒）");
     let mut cmd = std::process::Command::new(&python);
@@ -2549,15 +2618,33 @@ fn ensure_local_model_running() {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
-    if let Err(e) = cmd.spawn() {
-        eprintln!("  [本地模型] 启动失败：{e}");
-        return;
-    }
+    // **走 `detach`，不走 `cmd.spawn()`。** 分离启动的子进程会把调用方的
+    // 管道一起继承走，而调用方很可能正用管道读我们（`capture_output=True`
+    // 这类）——那会让它的 `communicate()` 永远不返回。机制和证据见
+    // `detach` 的模块文档。
+    let mut child = match detach::spawn_detached(&mut cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  [本地模型] 启动失败：{e}");
+            return;
+        }
+    };
 
     // 8 GB 的模型，给足 3 分钟。**宁可多等，也不要误判成失败**——
     // 误判之后每次调用都会再拉一遍。
     for _ in 0..180 {
         std::thread::sleep(Duration::from_millis(1000));
+        // **先看它还在不在。** 参数写错、缺个包、端口被别的进程占了……
+        // 这些情况下端口永远不会监听，而等满 3 分钟之后才说"可能起失败了"，
+        // 是把一个**当时就能确定**的事实说成了猜测。
+        if let Ok(Some(status)) = child.try_wait() {
+            eprintln!("  [本地模型] 刚起来就退了（{status}），没有监听端口 {LOCAL_MODEL_PORT}。");
+            eprintln!("             手动跑一次看它报什么：");
+            eprintln!(
+                "               .venv\\Scripts\\python.exe sidecar\\local_llm_server.py --model {LOCAL_MODEL_NAME}"
+            );
+            return;
+        }
         if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
             eprintln!("  [本地模型] 已就绪（端口 {LOCAL_MODEL_PORT}）。");
             return;
@@ -2568,6 +2655,67 @@ fn ensure_local_model_running() {
     eprintln!(
         "               .venv\\Scripts\\python.exe sidecar\\local_llm_server.py --model {LOCAL_MODEL_NAME}"
     );
+}
+
+/// 本地小模型的权重目录：`<home>/models/<名字>`。
+///
+/// **规则必须和 sidecar 的 `resolve_model_dir` 一模一样**（`YUNXI_BOT_HOME`
+/// 优先，下面接 `models/<名字>`）。这里直接用 [`default_home`]——它和 Python
+/// 那份本来就是同一套解析（见 `yunxi_bot_core::default_home` 的文档），
+/// 所以"两边对齐"这件事只有一处要维护。
+///
+/// sidecar 还有一条"`--model` 直接给路径就用路径"的规则，那条我们用不到：
+/// [`LOCAL_MODEL_NAME`] 是名字不是路径。**哪天有人把它改成路径，这个函数要
+/// 跟着改**——否则这里会去 `<home>/models/<一整条路径>` 下面找，
+/// 然后拒绝启动一个其实起得来的 sidecar。
+fn local_model_dir(model: &str) -> PathBuf {
+    default_home().join("models").join(model)
+}
+
+/// 权重在不在它要去找的地方。
+///
+/// 判据就是 sidecar 自己那一条：`config.json` 在不在（理由见调用处）。
+/// **抽成纯函数是为了能测**——这条判据判错的代价不是"多跑一次"，
+/// 而是"本地槽位被一个永远好不了的进程锁住"。
+fn local_weights_present(dir: &std::path::Path) -> bool {
+    dir.join("config.json").is_file()
+}
+
+/// 端口被占着的时候，看一眼占着它的那个进程是不是已经废了。
+///
+/// 只在它**自己说** `degraded` 的时候开口：那是 `local_llm_server.py` 里
+/// "加载失败过、而且不会再试"的状态，唯一不会自愈的一种。探不到（正在加载、
+/// 或者它卡住了）就一个字都不说——那种情况下猜错的方向是让人去查一个没坏的东西。
+///
+/// ## 为什么只报告，不杀
+///
+/// 杀进程这件事这里既做不了、也不该做：
+///
+/// - **做不了**：这个端口的占用者可能是别的 home 拉起来的、可能是使用者
+///   手动跑的。我们手里只有一个 socket，没有任何办法证明"它是我们该管的那一个"。
+/// - **不该做**：`chat` 的职责是说话，不是清理别人的进程。真要自动收拾，
+///   正确的落点是 sidecar 自己的重试策略（`_load_once` 里"失败过就不再试"
+///   那条规矩）——而那是 `sidecar/*.py` 的事，不是这里的事。
+///
+/// 所以这里把话说完整：**是什么状态、为什么不会好、怎么收拾**。
+/// 说不说这件事本身很重要——不说的话，"本地槽位一直死着"没有任何症状。
+fn warn_if_squatting() {
+    use yunxi_bot_core::think::local_health::{LocalHealth, health_endpoint, probe};
+
+    // 端点从 `LOCAL_QWEN.base_url` 推——**端口号不在这里再写一遍**
+    // （理由见 `think::local_health::health_endpoint` 的文档）。
+    let endpoint = health_endpoint(ModelSpec::LOCAL_QWEN.base_url);
+    let LocalHealth::Degraded(detail) = probe(&endpoint) else {
+        return;
+    };
+    eprintln!(
+        "  [本地模型] 端口 {LOCAL_MODEL_PORT} 被一个**加载失败、而且不会重试**的 sidecar 占着："
+    );
+    eprintln!("             {detail}");
+    eprintln!("             它不会自愈——不管它的话，本地槽位会一直是死的，而每一轮都");
+    eprintln!("             安静地改走 Agnes（功能还在，只是不再免费）。");
+    eprintln!("             看是谁占着： netstat -ano | findstr {LOCAL_MODEL_PORT}");
+    eprintln!("             收拾掉之后重开 chat 会重新拉一个： taskkill /PID <上面那个 pid> /F");
 }
 
 /// 找 `sidecar/verdict_server.py`。
@@ -2672,7 +2820,13 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             ModelRouter::new(vec![spec], tier)
         }
     };
-    let (ledger, decider, decider_alive) = open_decider(args);
+    // **这本句柄留着做回落留痕**（引擎的 `with_ledger`），任务 store 另开一本
+    // 指向同一个文件：引擎已经可变借着 store，同一个台账对象借不出第二个
+    // 可变引用——而那个限制是对的，谁持有台账只能有一个答案。
+    // 两本句柄写同一个文件是有支持的：`Ledger::append` 每次都会先对齐磁盘
+    // 序号（`sync_seq_from_disk`），守护那一轮本来就是这么干的
+    // （`run_task_round` 里 store 那本也是 `Ledger::open(ledger.path())`）。
+    let (mut route_ledger, decider, decider_alive) = open_decider(args);
 
     // ---- 先把"会怎么走"说清楚，再花钱 ----
     //
@@ -2712,7 +2866,7 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     }
     println!();
 
-    let mut store = LedgerTaskStore::new(ledger);
+    let mut store = LedgerTaskStore::new(Ledger::open(route_ledger.path())?);
     let tasks = store.project();
     let task_id = match flag(args, "--id") {
         Some(id) => id.to_string(),
@@ -2728,6 +2882,10 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         let out = Engine::new(&router, &decider, &mut handler, &mut store, budget)
             .with_effort(effort)
             .with_local_probe(yunxi_bot_core::think::local_health::Probe::real())
+            // **干跑也要留痕。** 干跑算出来的路由就是真跑时会走的路由，
+            // 回落了却不记的话，事后翻台账只会看到"这一步路由选了 Agnes"——
+            // 而"它其实是被回落过去的"就看不出（D128 的形状）。
+            .with_ledger(&mut route_ledger)
             .run(&task_id)?;
         println!("—— 干跑推演 ——");
         for line in &handler.seen {
@@ -2770,6 +2928,10 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             // 不挂的话，一个判成轻量的步骤会直直打到 `127.0.0.1:17872` 上，
             // 而 sidecar 没起来时那一跳必然失败，失败理由和执行毫无关系。
             .with_local_probe(yunxi_bot_core::think::local_health::Probe::real())
+            // **回落也要真的记。** 只探不记的话，这一步悄悄从本地槽位挪到
+            // Agnes，而台账里一条 `route` 决策事件都没有——对话那条链路
+            // 有、这条没有，"本地到底有没有被用上"就还是查不出来。
+            .with_ledger(&mut route_ledger)
             .run(&task_id)?
     };
 
@@ -3710,7 +3872,10 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     };
 
     let router = ModelRouter::default();
-    let (_, decider, _) = open_decider(args);
+    // **这本句柄原来被丢掉了（`_`）。留着它**：引擎要用它把回落记成
+    // `Route` 决策事件（`Engine::with_ledger`）——续跑和 `do` 是同一个任务的
+    // 同一批步骤，留痕的形状也得一样。store 那本照旧另开（下面那一行）。
+    let (mut route_ledger, decider, _) = open_decider(args);
     let mut store = LedgerTaskStore::new(Ledger::open(ledger_path())?);
     let tasks = store.project();
     let Some(t) = tasks.get(id) else {
@@ -3848,6 +4013,9 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             // 续跑和 `do` 是**同一个任务的同一批步骤**，所以兜底也得一模一样：
             // 少了它，"这一步在哪条命令下跑"会决定它走不走本地槽位。
             .with_local_probe(yunxi_bot_core::think::local_health::Probe::real())
+            // 留痕同理：漏了这一处，同一步在 `do` 里回落有记录、在 `resume`
+            // 里没有——两条路看同一本台账，却给出两套答案。
+            .with_ledger(&mut route_ledger)
             .run(id)?
     };
     print!("{}", summarize(&outcome.task));
@@ -4273,4 +4441,79 @@ fn cmd_policy() -> Result<i32, Box<dyn std::error::Error>> {
     }
     println!("\n注意: `never` 策略表示「需要批准的动作自动拒绝」，不是自动放行。");
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    //! CLI 这一层里**能纯函数化**的那点判据。
+    //!
+    //! 这一层剩下的东西几乎都要真的起进程、真的连端口（`ensure_*_running`
+    //! 那两条），测起来要么慢要么骗人——所以这里只钉住"判错了代价最大"
+    //! 的那一条：**权重在不在 sidecar 会去找的地方**。
+    //! 它判错的代价不是"多跑一次"，而是"本地槽位被一个永远好不了的进程锁住"。
+
+    use super::*;
+
+    /// 一个干净的临时目录（跑完自己删）。
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("yunxi-cli-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("建临时目录");
+        d
+    }
+
+    /// **判据必须和 sidecar 一模一样。**
+    ///
+    /// sidecar 认的是 `<dir>/config.json` 是不是文件（`resolve_model_dir` 里
+    /// 那一行）；我们就认同一个文件。两边口径一旦漂开，方向是"我们说权重在、
+    /// 它说找不到"——于是它照样被拉起来、照样加载失败、照样占着 17872 不放手。
+    #[test]
+    fn weights_count_as_present_exactly_when_the_sidecar_would_accept_them() {
+        let home = tmp("weights");
+        let dir = home.join("models").join(LOCAL_MODEL_NAME);
+
+        // 目录都不在：**这是最要紧的一条**——"别启动那个注定失败的 sidecar"
+        // 全部落在这个返回值上。
+        assert!(!local_weights_present(&dir), "目录不在时不该算有权重");
+
+        // 光有目录、没有 config.json：sidecar 也不认，所以不算。
+        std::fs::create_dir_all(&dir).expect("建模型目录");
+        assert!(!local_weights_present(&dir), "只有空目录不该算有权重");
+
+        // config.json 到位：算。
+        std::fs::write(dir.join("config.json"), "{}").expect("写 config.json");
+        assert!(local_weights_present(&dir), "config.json 在了就该算有权重");
+
+        // **同名目录不能骗过判据**：`is_file()` 而不是 `exists()`。
+        std::fs::remove_file(dir.join("config.json")).expect("删 config.json");
+        std::fs::create_dir(dir.join("config.json")).expect("建同名目录");
+        assert!(
+            !local_weights_present(&dir),
+            "config.json 是个目录时不该算有权重"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 权重目录的形状：`<home>/models/<名字>`。
+    ///
+    /// 三段里的后两段在这里钉死——`scripts/fetch_local_model.py` 落盘用的是
+    /// "HF 仓库名的最后一段"，`sidecar/local_llm_server.py` 找的也是
+    /// `<home>/models/<名字>`。**这三处必须同时对上**，而对不上的表现是
+    /// "权重明明下过，它却永远说找不到"。
+    #[test]
+    fn model_dir_is_home_then_models_then_the_model_name() {
+        let dir = local_model_dir(LOCAL_MODEL_NAME);
+        let tail = PathBuf::from("models").join(LOCAL_MODEL_NAME);
+        assert!(
+            dir.ends_with(&tail),
+            "{} 该以 {} 结尾",
+            dir.display(),
+            tail.display()
+        );
+        assert_eq!(
+            dir.parent().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("models"))
+        );
+    }
 }

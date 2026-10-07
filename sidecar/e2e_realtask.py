@@ -23,7 +23,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from e2e_common import ensure_fresh_binary  # noqa: E402
+from e2e_common import (  # noqa: E402
+    ensure_fresh_binary,
+    home_untouched,
+    real_home_dir,
+    snapshot_home,
+)
 
 BUGGY = '''"""计费逻辑。"""
 
@@ -59,7 +64,9 @@ def main() -> int:
         if not cond:
             ok = False
 
-    real_home = Path(os.environ.get("LOCALAPPDATA", "")) / "YunXiBot"
+    real_home = real_home_dir()
+    # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
+    before_home = snapshot_home(real_home)
     key = real_home / "secrets" / "agnes.key"
     if not key.exists():
         print("没有 agnes.key，这个验证需要真模型", file=sys.stderr)
@@ -140,7 +147,14 @@ def main() -> int:
         # 先改文件、后面才遇到决策步骤。**断言写宽了会把正确行为判成错的**
         # （同一个坑在 human_answer 那条测试上刚踩过一次）。
 
-        if not m or decider_took_over:
+        # **这里只能看 `m`。**
+        #
+        # 原来写的是 `if not m or decider_took_over:`，而 `decider_took_over`
+        # 要到下面（查完任务状态之后）才赋值——也就是说：**只要真走到了
+        # "停下来等人"这条正常路，这里必定 `UnboundLocalError`**，
+        # 于是脚本崩在人工答案那一整条路的前一步，那条路从来没被执行过。
+        # （"决策模型有没有接管"必须查了状态才知道，所以那个判断留在下面。）
+        if not m:
             # 分支 B：它自己跑完了（可能是决策模型接管的）
             print()
             print("=== 决策模型接管 / 没有决策步骤，任务自己跑完了 ===")
@@ -148,6 +162,12 @@ def main() -> int:
             print(f"      billing.py 现在 {len(final.splitlines())} 行")
             check("**文件没被截断**", len(final.splitlines()) >= 10)
             check("**判定被改对了**", ">= DISCOUNT_THRESHOLD" in final)
+            # **隔离断言：真实 home 一个字节都不该动。**
+            # 这条以前不存在——`real_home` 只被用来借密钥，没有任何东西
+            # 证明这次测试没写回真实数据（见 `e2e_common.home_untouched`）。
+            # **这条早退的路上也要查**：不查的话，"跑完就走"的那一半
+            # 永远不在这条断言覆盖之内。
+            check("**没有碰真实 home**", *home_untouched(before_home, real_home))
             print()
             print("真实任务端到端："
                   + ("全部通过" if ok else "**有失败项**")
@@ -259,6 +279,11 @@ def main() -> int:
             "等人工" not in state_now and "卡住" not in state_now,
             "还停在等人/卡住的话，说明闭环没走完",
         )
+
+    # **隔离断言：真实 home 一个字节都不该动。**
+    # 这条以前不存在——`real_home` 只被用来借密钥，没有任何东西证明
+    # 测试没写回真实数据（见 `e2e_common.home_untouched`）。
+    check("**没有碰真实 home**", *home_untouched(before_home, real_home))
 
     print()
     print("真实任务端到端：" + ("全部通过" if ok else "**有失败项**"))

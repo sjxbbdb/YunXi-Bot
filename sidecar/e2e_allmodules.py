@@ -44,6 +44,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from e2e_common import (  # noqa: E402
+    home_untouched,
+    real_home_dir,
+    snapshot_home,
+)
+
 REPO = Path(__file__).resolve().parent.parent
 BIN = REPO / "target" / "release" / ("yunxi-bot.exe" if os.name == "nt" else "yunxi-bot")
 
@@ -134,7 +142,14 @@ def main():
            "PYTHONIOENCODING": "utf-8"}
 
     # 密钥从真实 home 借（测试不碰真实数据）
-    real_home = Path(os.environ.get("LOCALAPPDATA", "")) / "YunXiBot"
+    #
+    # **这一行原来是写死的 `%LOCALAPPDATA%\YunXiBot`。** 运行目录搬家之后
+    # 那个路径已经不在，于是密钥一个也借不到、而这里**没有那道
+    # `if not key.exists(): return 2` 的门**——它会带着一个空的 secrets
+    # 接着往下跑。所以路径必须和产品一样从 `YUNXI_BOT_HOME` 解析。
+    real_home = real_home_dir()
+    # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
+    before_home = snapshot_home(real_home)
     (home / "secrets").mkdir(parents=True, exist_ok=True)
     for n in ("agnes.key", "deepseek.key", "bocha.key"):
         src = real_home / "secrets" / n
@@ -257,6 +272,11 @@ def main():
                 ("路由留痕点名决策模型" if "决策模型" in out else "没看到决策模型参与"))
         rep.add("任务终态", "完成" in out or "卡住" in out or "等人工" in out,
                 "任务有明确终态")
+
+        # **隔离断言：真实 home 一个字节都不该动。**
+        # 这条以前不存在——`real_home` 只被用来借密钥，没有任何东西证明
+        # 这次测试没写回真实数据（见 `e2e_common.home_untouched`）。
+        rep.add("测试隔离", *home_untouched(before_home, real_home))
 
         ok = rep.show()
         _KEEP[0] = not ok

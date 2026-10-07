@@ -37,7 +37,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from e2e_common import ensure_fresh_binary  # noqa: E402
+from e2e_common import (  # noqa: E402
+    ensure_fresh_binary,
+    home_untouched,
+    real_home_dir,
+    snapshot_home,
+)
 
 # 小窗口：五轮长对话就能逼出压缩
 WINDOW = 1500
@@ -77,7 +82,9 @@ def main() -> int:
         if not cond:
             ok = False
 
-    real_home = Path(os.environ.get("LOCALAPPDATA", "")) / "YunXiBot"
+    real_home = real_home_dir()
+    # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
+    before_home = snapshot_home(real_home)
     key = real_home / "secrets" / "agnes.key"
     if not key.exists():
         print(f"没有 agnes.key，这个验证需要真模型", file=sys.stderr)
@@ -163,6 +170,11 @@ def main() -> int:
         # **对话还在继续**：6 轮都跑完了，没有被压缩打断
         check("**压缩之后对话继续跑完了**", "会话已存" in out,
               "压缩不该打断会话")
+
+    # **隔离断言：真实 home 一个字节都不该动。**
+    # 这条以前不存在——`real_home` 只被用来借密钥，没有任何东西证明
+    # 测试没写回真实数据（见 `e2e_common.home_untouched`）。
+    check("**没有碰真实 home**", *home_untouched(before_home, real_home))
 
     print()
     print("上下文压缩端到端：" + ("全部通过" if ok else "**有失败项**"))

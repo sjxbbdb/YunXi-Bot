@@ -25,7 +25,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from e2e_common import ensure_fresh_binary  # noqa: E402
+from e2e_common import (  # noqa: E402
+    ensure_fresh_binary,
+    home_untouched,
+    real_home_dir,
+    snapshot_home,
+)
 
 
 def main() -> int:
@@ -38,7 +43,9 @@ def main() -> int:
         if not cond:
             ok = False
 
-    real_home = Path(os.environ.get("LOCALAPPDATA", "")) / "YunXiBot"
+    real_home = real_home_dir()
+    # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
+    before_home = snapshot_home(real_home)
     if not (real_home / "secrets" / "agnes.key").exists():
         print("没有 agnes.key，这个验证需要真模型", file=sys.stderr)
         return 2
@@ -169,6 +176,11 @@ def main() -> int:
         check("**被拒的调用留了痕**", denied >= 1, "被拒绝却没记录，事后说不清")
         check("**留下的记录里没有那次写入**",
               not (work / "hello.txt").exists())
+
+    # **隔离断言：真实 home 一个字节都不该动。**
+    # 这条以前不存在——`real_home` 只被用来借密钥，没有任何东西证明
+    # 测试没写回真实数据（见 `e2e_common.home_untouched`）。
+    check("**没有碰真实 home**", *home_untouched(before_home, real_home))
 
     print()
     print("任务类型端到端：" + ("全部通过" if ok else "**有失败项**"))

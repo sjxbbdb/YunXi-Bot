@@ -40,7 +40,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from e2e_common import ensure_fresh_binary  # noqa: E402
+from e2e_common import (  # noqa: E402
+    ensure_fresh_binary,
+    home_untouched,
+    real_home_dir,
+    snapshot_home,
+)
 
 
 def main() -> int:
@@ -53,7 +58,9 @@ def main() -> int:
         if not cond:
             ok = False
 
-    real_home = Path(os.environ.get("LOCALAPPDATA", "")) / "YunXiBot"
+    real_home = real_home_dir()
+    # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
+    before_home = snapshot_home(real_home)
     key = real_home / "secrets" / "agnes.key"
     if not key.exists():
         print("没有 agnes.key，这个验证需要真模型", file=sys.stderr)
@@ -111,17 +118,27 @@ def main() -> int:
         # 把字节批拼起来，同时记下每一批的到达时刻。
         # `› ` 提示符是不带换行打出来的，所以它会粘在下一行前面——
         # 第一版没考虑这点，一段正文都没抓到。
+        #
+        # **不再认模型名。** 这里原来找的是 `[agnes`，而路由标签
+        # （`chat.rs` 打的 `  [{模型}·{思考|不思考}]`）里的模型名是会变的：
+        # 本地槽位一接上就变成了 `[Qwen3-4B-Instruct-2507·不思考]`，
+        # 于是这个循环**一个字符都不收**——而脚本只会报"没抓到正文"，
+        # 看起来像流式坏了。所以改成认**结构**：提示符 `›` 之后的第一行
+        # 是路由标签（不管里面写着哪个模型），标签之后才是正文。
         body_times = []
         started = False
+        pending = ""
         for t, chunk in batches:
-            if "[agnes" in chunk:
-                # 路由标记之后才是正文；同一批里同时有标记和正文时只留正文
-                chunk = chunk.split("[agnes", 1)[1]
-                if "]" in chunk:
-                    chunk = chunk.split("]", 1)[1]
-                started = True
             if not started:
-                continue
+                pending += chunk
+                if "›" not in pending:
+                    continue          # 命令还没回显/提示符还没出来
+                after = pending.split("›", 1)[1]
+                if "\n" not in after:
+                    continue          # 路由标签那一行还没打完
+                chunk = after.split("\n", 1)[1]
+                pending = ""
+                started = True
             if "›" in chunk:
                 chunk = chunk.split("›", 1)[0]
                 if chunk:
@@ -244,6 +261,11 @@ def main() -> int:
             r.returncode == 0,
             f"退出码 {r.returncode}——看上面的原话判断是限流还是真坏了",
         )
+
+    # **隔离断言：真实 home 一个字节都不该动。**
+    # 这条以前不存在——`real_home` 只被用来借密钥，没有任何东西证明
+    # 测试没写回真实数据（见 `e2e_common.home_untouched`）。
+    check("**没有碰真实 home**", *home_untouched(before_home, real_home))
 
     print()
     print("流式输出端到端：" + ("全部通过" if ok else "**有失败项**"))

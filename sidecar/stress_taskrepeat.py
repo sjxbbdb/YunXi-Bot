@@ -40,7 +40,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from e2e_common import ensure_fresh_binary  # noqa: E402
+from e2e_common import (  # noqa: E402
+    ensure_fresh_binary,
+    home_untouched,
+    real_home_dir,
+    snapshot_home,
+)
 
 BUGGY = '''"""计费逻辑。"""
 
@@ -181,7 +186,9 @@ def main() -> int:
     if len(sys.argv) > 1:
         n = int(sys.argv[1])
     BIN = ensure_fresh_binary()
-    real_home = Path(os.environ.get("LOCALAPPDATA", "")) / "YunXiBot"
+    real_home = real_home_dir()
+    # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
+    before_home = snapshot_home(real_home)
     if not (real_home / "secrets" / "agnes.key").exists():
         print("没有 agnes.key", file=sys.stderr)
         return 2
@@ -234,6 +241,14 @@ def main() -> int:
     print(f"  改对了      {ok}/{n}   （{ok / n * 100:.0f}%）")
     print(f"  文件被毁    {destroyed}/{n}")
     print(f"  因限流失败  {rate_limited}/{n}")
+
+    # **隔离断言：真实 home 一个字节都不该动。**
+    # 这条以前不存在——`real_home` 只被用来借密钥，没有任何东西证明
+    # 这几轮没写回真实数据（见 `e2e_common.home_untouched`）。
+    # **命名避开 `ok`/`n`**：那两个在上面有别的意思（见本文件里
+    # "变量名不能再用 n" 那一段）。
+    home_ok, home_why = home_untouched(before_home, real_home)
+    print(f"  {'✓' if home_ok else '✗'} 没有碰真实 home   {home_why}")
     print()
 
     # **判据和措辞都要诚实。**
@@ -241,6 +256,8 @@ def main() -> int:
     # 这不是"测试通过"那种二值判断——它是**一个比率**，而比率的用途是
     # 判断严重程度、以及改动前后有没有变好。所以这里只在**全挂**或
     # **有文件被毁**时判失败；部分失败时报数字、让人自己看。
+    if not home_ok:
+        return 1
     if destroyed > 0:
         print("**文件被工具毁过——这是数据损坏，必须查。**")
         return 1
