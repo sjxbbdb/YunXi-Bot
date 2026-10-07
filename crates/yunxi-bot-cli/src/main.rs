@@ -2394,6 +2394,13 @@ fn open_decider(args: &[String]) -> (Ledger, yunxi_bot_core::decide::LayaDecider
 /// 决策模型的默认端口。
 const DECIDER_PORT: u16 = 17870;
 
+/// 本地小模型的端口。**和 `ModelSpec::LOCAL_QWEN` 的 base_url 必须一致**——
+/// 两处写死是隐患，所以这里也留一条注释指回去（改一处要改两处）。
+const LOCAL_MODEL_PORT: u16 = 17872;
+
+/// 本地槽位用的模型名。同样要和 `ModelSpec::LOCAL_QWEN` 对齐。
+const LOCAL_MODEL_NAME: &str = "Qwen3-4B-Instruct-2507";
+
 /// **确保决策模型在跑；不在就拉起来。**
 ///
 /// ## 为什么这件事要我们自己保证，而不是写进文档
@@ -2423,7 +2430,7 @@ fn ensure_decider_running() {
         return;
     }
 
-    let Some(script) = sidecar_script() else {
+    let Some(script) = sidecar_script("verdict_server.py") else {
         eprintln!(
             "  [决策模型] 端口 {DECIDER_PORT} 没人监听，而且找不到 sidecar/verdict_server.py。"
         );
@@ -2473,15 +2480,94 @@ fn ensure_decider_running() {
     eprintln!("             先跑一次 `yunxi-bot decide` 看它报什么。");
 }
 
+/// **确保本地小模型在跑；不在就拉起来。**
+///
+/// ## 为什么只在 `chat` 里调它，不在 `do` 里
+///
+/// 本地模型是 4B、占 8 GB 显存、加载要几十秒。而 `do` 跑的任务
+/// **多数是复杂的**——它们走 DeepSeek，根本碰不到本地这条路。
+/// 为每次 `do` 白等几十秒，是拿最常走的路去补贴最少走的路。
+///
+/// **代价要说清楚**：`do` 里那些"简单任务"会打到一个没人监听的端口上。
+/// 也就是说**必须先有回落链**（本地不可达 → 换 Agnes），
+/// 否则 `do` 的简单任务就是坏的。那件事还没做。
+///
+/// ## 为什么等这么久
+///
+/// 决策模型是几百 MB，10 秒足够；这个是 8 GB，**加载完要几十秒**。
+/// 用同一个超时会把它误判成"起失败了"——而那个误判的后果是
+/// 每次调用都重新拉一遍，越拉越慢。
+fn ensure_local_model_running() {
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, LOCAL_MODEL_PORT));
+    if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+        return;
+    }
+    let Some(script) = sidecar_script("local_llm_server.py") else {
+        eprintln!(
+            "  [本地模型] 端口 {LOCAL_MODEL_PORT} 没人监听，而且找不到 sidecar/local_llm_server.py。"
+        );
+        eprintln!("             闲聊会走不通（这条链路还没有回落）。");
+        return;
+    };
+    let Some(python) = sidecar_python(&script) else {
+        eprintln!("  [本地模型] 没找到可用的 Python，起不来。先跑一次 安装Python环境.cmd。");
+        return;
+    };
+
+    eprintln!("  [本地模型] 不在跑，正在拉起……（4B 要几十秒）");
+    let mut cmd = std::process::Command::new(&python);
+    cmd.arg(&script)
+        .arg("--model")
+        .arg(LOCAL_MODEL_NAME)
+        .arg("--port")
+        .arg(LOCAL_MODEL_PORT.to_string())
+        .arg("--device")
+        .arg("cuda")
+        // **先热起来**：不然第一个使用者的第一句话要等一次完整加载，
+        // 而那正是"第一印象"那一句。
+        .arg("--warmup")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+    if let Err(e) = cmd.spawn() {
+        eprintln!("  [本地模型] 启动失败：{e}");
+        return;
+    }
+
+    // 8 GB 的模型，给足 3 分钟。**宁可多等，也不要误判成失败**——
+    // 误判之后每次调用都会再拉一遍。
+    for _ in 0..180 {
+        std::thread::sleep(Duration::from_millis(1000));
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+            eprintln!("  [本地模型] 已就绪（端口 {LOCAL_MODEL_PORT}）。");
+            return;
+        }
+    }
+    eprintln!("  [本地模型] 拉起来了但端口一直没监听——多半是显卡被占了或权重不全。");
+    eprintln!("             手动跑一次看它报什么：");
+    eprintln!(
+        "               .venv\\Scripts\\python.exe sidecar\\local_llm_server.py --model {LOCAL_MODEL_NAME}"
+    );
+}
+
 /// 找 `sidecar/verdict_server.py`。
 ///
 /// **从可执行文件的位置往上找**，不读当前工作目录：
 /// 人在别的目录里跑 `yunxi-bot` 是常事，而 sidecar 永远在仓库里。
-fn sidecar_script() -> Option<std::path::PathBuf> {
+fn sidecar_script(file: &str) -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     // <repo>/target/<profile>/yunxi-bot.exe → 上两级是 <repo>
     let repo = exe.parent()?.parent()?.parent()?;
-    let p = repo.join("sidecar").join("verdict_server.py");
+    let p = repo.join("sidecar").join(file);
     p.is_file().then_some(p)
 }
 
@@ -2714,6 +2800,9 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 fn cmd_chat(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     // **每次跑之前先保证决策模型在跑**——它不在时整条链路会静默降级。
     ensure_decider_running();
+    // 本地模型比决策模型重得多（8 GB / 几十秒），**所以只在 chat 里拉**——
+    // `do` 跑的多是复杂任务，走 DeepSeek，为它们白等不值得。
+    ensure_local_model_running();
     use yunxi_bot_core::think::ReasoningEffort;
     use yunxi_bot_core::think::session::SessionStore;
 
