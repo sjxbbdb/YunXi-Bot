@@ -1,631 +1,500 @@
+<div align="center">
+
 # YunXi Bot
 
-> **陪伴型 · 通用 · 常驻 · Agent 助理**
+**陪伴型 · 通用 · 常驻 Agent 助理**
 
-一个**本地优先、7×24 常驻**的个人 Agent。它跑在你自己的机器上，记得你，会自己决定什么时候该主动开口。
-核心不在于"能聊"，而在于**它知道什么时候该介入、什么时候该沉默**。
+让陪伴有连续性，让行动有分寸。
 
----
+[设计哲学](#设计哲学) · [系统架构](#系统架构) · [记忆与人格](#记忆与人格) · [任务执行](#任务执行) · [主动陪伴](#主动陪伴) · [开始使用](#开始使用)
 
-## 这是什么，给谁用
+</div>
 
-| | |
-|---|---|
-| **是什么** | 常驻的调度器（任务按间隔 / cron / 文件变化触发）+ 交互式对话 Agent（`chat`，带工具循环与审批门禁）+ 一条"看外部信息、决定要不要打扰你"的链路 |
-| **给谁用** | 想在自己的机器上长期跑一个助理、并且**愿意为它的判断和边界买单**的人 |
-| **现在能干什么** | 建任务并自动执行、按目标拆解成步骤逐步跑（`do`）、对话里读写文件/跑命令/抓网页（每个动作过审批门禁）、把记忆与画像沉淀进 append-only 台账 |
-| **现在不能干什么** | 语音 / 微信 / Web 入口都还没有，**入口层只有 CLI**；Windows 之外的平台没有 OS 级写入隔离；本地小模型的权重不在仓库里，要自己下（约 8 GB，见[装不上的部分](#装不上的部分要自己动手的三件事)） |
-| **平台** | 主要在 Windows 上开发和实测。其他地方能编译，但隔离能力会降级，并且**降级会被如实写进台账** |
+YunXi Bot 是 YunXi 家族衍生的个人 Agent。它以本地机器为长期运行的载体，将对你的了解、对当下情境的判断，以及实际执行任务的能力连接起来。你提出需求时，它可以对话、查找信息、操作文件和推进任务；常驻时，它可以关注任务与外部信息，在合适的时候提醒你。
 
-这个项目的文档习惯和多数开源项目不同：**它写自己的做不到，也写代价。**
-下面每一处结论都能在源码里找到对应。
+项目的目标是让一个助理长期在场：相处有连续性，行动有边界，主动有分寸。
 
----
-
-## 目录
-
-| 章节 | 讲什么 |
-|---|---|
-| [快速开始](#快速开始) | 五分钟内让它跑起来 |
-| [全链路架构](#全链路架构) | 一句话从进来到落地的完整链路 |
-| [模型怎么选](#模型怎么选) | 四个模型槽位、逐任务的路由判据、思考模式 |
-| [三张图](#三张图) | 消息前缀缓存、记忆召回、Agent 循环 |
-| [它现在是什么状态](#它现在是什么状态) | 每个模块实现到哪一步 |
-| [常驻与自动化](#常驻与自动化) | daemon / 监督 / 开机自启 / 定时任务 |
-| [决策层](#决策层) | 本地决策模型、七个降级类别、只在更保守的方向降级 |
-| [不可动摇的边界](#不可动摇的边界) | 八条硬规则 |
-| [安装与附录](#安装一条命令) | 安装细节、权重为什么不在 git 里、决策模型为什么是 Verdict |
-| [仓库结构](#仓库结构) | 目录一览 |
-| [许可与致谢](#许可与致谢) | Apache-2.0 |
-| [深入阅读](#深入阅读) | 三篇对着源码写的正文 |
-
----
-
-## 快速开始
-
-需要 **Rust `rust-version = 1.88`**（edition 2024，见 [`Cargo.toml`](Cargo.toml)）。
-Windows 上跑本地模型还需要 NVIDIA 显卡（拉起 sidecar 时硬编码了 `--device cuda`）。
-
-```powershell
-git clone https://github.com/sjxbbdb/YunXi-Bot
-cd YunXi-Bot
-pwsh scripts/setup.ps1        # 建 .venv + 装 Python 依赖 + 拉决策模型权重（校验 SHA256）
-cargo build
-cargo run -- isolation-check  # 验证写入隔离真的生效
-```
-
-`setup.ps1` 做三件事：建 `.venv`、装 Python 依赖（约 1 GB，含 torch CPU 版）、
-拉决策模型权重（约 348 MB，校验 SHA256）。**它不会下载本地小模型。**
-
-然后跑一跑：
-
-```bash
-cargo run -- status                    # 数据目录与台账概况
-cargo run -- list                      # 列出任务
-cargo run -- log -n 12                 # 看台账事件流
-cargo run -- policy                    # 看权限预设
-cargo run -- tools                     # 列出工具及其能力类别（不需要模型）
-cargo run -- cost                      # 模型调用花销（按台账重算）
-cargo run -- decide --demo             # 六类降级方向表（不需要模型）
-```
-
-再让它说句话（这一步会拉起本地小模型）：
-
-```bash
-export YUNXI_BOT_AGNES_KEY=sk-...      # 或放到 %LOCALAPPDATA%\YunXiBot\secrets\agnes.key
-cargo run -- chat
-```
-
-**没装本地模型时**，`chat` 会先试着把那个 sidecar 拉起来；拉不起来也不至于聊不下去——
-选中本地槽位时会探一次 `/health`，不是"就绪"就**这一轮改走 Agnes**，并在 stderr 上说清为什么
-（见[路由真正的判据](#路由真正的判据)下面的说明）。
-
-数据目录默认为 `%LOCALAPPDATA%\YunXiBot`（Windows）或 `~/.yunxi-bot`，可用 `YUNXI_BOT_HOME` 覆盖。
-`.venv/`、`data/`、`dist/`、模型权重都在 `.gitignore` 里，不进仓库。
-
-### 装不上的部分：要自己动手的三件事
-
-1. **本地小模型的权重不在 git 里**，`setup.ps1` 也不会替你下它——**那要另外花约 8 GB 的下载和显存**：
-
-   ```bash
-   python scripts/fetch_local_model.py Qwen/Qwen3-4B-Instruct-2507
-   .venv\Scripts\python.exe sidecar\local_llm_server.py --model Qwen3-4B-Instruct-2507
-   ```
-
-   脚本本身默认下的是更小的 `Qwen/Qwen3-1.7B`，而路由里写死的槽位是
-   `Qwen3-4B-Instruct-2507`——**要跟代码对齐就得显式给这两个参数**。
-   权重落在 `<数据目录>/models/`；下载脚本在国内会先试 HuggingFace 官方、再回落镜像。
-   （拿不到权重不至于让对话中断：本地没就绪时这一轮会自动改走 Agnes。）
-
-2. **本地 sidecar 需要带 `torch` 的 Python**。`setup.ps1` 装的正是这个（约 1 GB），
-   所以别跳过它。没装 torch 时 sidecar 会在 `/health` 上报 `degraded`，而不是假装健康。
-
-3. **第一次加载要几十秒、占约 8 GB 显存**。空闲一段时间后权重会被释放
-   （见 [`sidecar/local_llm_server.py`](sidecar/local_llm_server.py) 的空闲看守），
-   下一次说话要重新加载。
-
----
-
-## 全链路架构
-
-**一句话进来，先看走哪条路：`chat` 是问一句答一句，`do` / `run` 是先拆成步骤再逐步跑——两条路都不直接连模型，中间隔着"选哪张牌"。**
-**判据只有一条：闲聊和确定简单的事走本地小模型（免费），其余（含拿不准）一律走 DeepSeek；动手之前要过审批门禁，每一步、每次调用、每次降级都落台账。**
-
-```mermaid
-flowchart TD
-    U["你说一句话"] --> WORK{"用哪条命令"}
-    WORK -- "chat：一问一答" --> CMP{"问决策模型：<br/>要办事还是闲聊"}
-    WORK -- "do / run：办事" --> PLAN["先拆成步骤<br/>走 DeepSeek"]
-    CMP -- "闲聊" --> LOC["本地小模型<br/>127.0.0.1:17872"]
-    CMP -- "要办事" --> HV{"确定是简单活吗"}
-    LOC -. "没就绪才改走" .-> AG["Agnes 远端<br/>免费"]
-    AG --> MEM
-    HV -- "确定简单" --> LOC
-    HV -- "其余，含拿不准" --> DS["DeepSeek 远端<br/>收费"]
-    LOC --> MEM{"要不要翻记忆<br/>拿不准才问模型"}
-    DS --> MEM
-    MEM -- "要" --> RCL["找出相关的记忆<br/>拼进这一轮提问"]
-    RCL --> LOOP
-    MEM -- "不用" --> LOOP
-    PLAN --> STEP["逐步执行<br/>每步再选一次模型"]
-    STEP --> LOOP["工具循环<br/>要动手就调工具"]
-    STEP --> DP{"这一步要你拍板吗"}
-    DP -- "是（decide:）" --> OPT["先列几个候选做法"]
-    OPT --> DEC["本地决策模型<br/>127.0.0.1:17870<br/>只管挑一个"]
-    DEC -. "挑不出来" .-> HUMAN["升级人工<br/>等你拍板"]
-    DP -- "否" --> LOOP
-    LOOP --> GATE{"审批门禁<br/>拿不准先问模型"}
-    GATE -- "自动放行" --> RUN["执行动作<br/>文件 / 命令 / 网页"]
-    GATE -- "要问你" --> ASKH["你点头才继续"]
-    ASKH -- "同意" --> RUN
-    ASKH -- "拒绝" --> REJ
-    GATE -- "拒绝" --> REJ["拒绝也是结果<br/>回灌给模型"]
-    RUN --> LEDGER["每一步都落台账<br/>调用 / 审批 / 降级"]
-    REJ --> LEDGER
-    HUMAN --> LEDGER
-    LEDGER --> DONE["回话或摘要<br/>聊完的会话落盘"]
-    DONE -. "记忆要显式记" .-> MEMO["remember 记一条"]
-```
-
-链路本身分在三处：[`router.rs`](crates/yunxi-bot-core/src/think/router.rs) 管选模型，
-[`chat_handler.rs`](crates/yunxi-bot-cli/src/chat_handler.rs) 管一轮对话怎么发出去，
-[`task/engine.rs`](crates/yunxi-bot-core/src/task/engine.rs) 管办事那条链路怎么推进；
-审批门禁在 [`tool/runner.rs`](crates/yunxi-bot-core/src/tool/runner.rs)。
-
-**图之外，三件值得知道的事：**
-
-- **本地决策模型（17870）不止被问一次**——输入分类（只在 `chat` 这条路上）、召回门控、
-  工具审批、任务决策点各问一次，陪伴介入是第五条、不在这张图里；
-  它答不出来就往**更保守**的方向兜底，方向按类别分（见[决策层](#决策层)）。
-- **它答不出来时，输入按"闲聊"处理**（走免费的那一档）——判错的方向是"少办事"，
-  不是"乱花钱"，`verdict == None` 这件事本身会记进台账。
-- **每一步各自选一次模型，但一步从开始到结束不换模型**——中途换会把已建好的前缀缓存全部作废；
-  `do` 的步骤走的就是图上"确定是简单活吗"这同一道判据。
-
----
-
-## 模型怎么选
-
-四张牌，各管一件事。前三个是**思考层**的模型槽位，第四个是**决策层**的判定模型。
-
-```mermaid
-flowchart TD
-    U["输入一句话"] --> D{"决策模型：<br/>要办事还是闲聊？"}
-    D -- "闲聊" --> L["本地 Qwen3-4B<br/>免费"]
-    D -- "要办事" --> S{"确定是简单任务？"}
-    S -- "是" --> L
-    S -- "否 / 拿不准" --> K["DeepSeek Flash<br/>收费"]
-    L --> G["写台账"]
-    K --> G
-```
-**要看的结论：判错的两个方向代价不对称**——繁琐的活错给了本地 4B 是"事办砸了"，
-简单的活错给了 DeepSeek 只是"多花几分钱"。所以门槛卡在"确定是轻量"，
-拿不准一律往 DeepSeek 倒。
-
-| 槽位 | 端点 / 模型 | 谁在用 | 限流 | 需不需要密钥 |
-|---|---|---|---|---|
-| 本地 | `http://127.0.0.1:17872/v1` · `Qwen3-4B-Instruct-2507` | 闲聊 / 陪伴、**确定的**简单任务 | 无端点限流（本地进程，槽位里填 600） | 不需要 |
-| Agnes | `https://api.agnes-ai.cn/v1` · `agnes-3.0-flash` | 本地不可用或没就绪时的回落目标 | **10 RPM**（免费档） | `secrets/agnes.key` 或 `YUNXI_BOT_AGNES_KEY` |
-| DeepSeek | `https://api.deepseek.com/v1` · `deepseek-flash` | **复杂任务**、拿不准的一切 | 60 RPM | `secrets/deepseek.key` 或 `YUNXI_BOT_DEEPSEEK_KEY` |
-| 决策模型 | `http://127.0.0.1:17870/decide` · `verdict-small` | 只回答分类/选择类问题，不生成文本 | 本地，走回环 | 不需要（权重约 348 MB，`setup.ps1` 会拉） |
-
-定价表在 [`think/cost.rs`](crates/yunxi-bot-core/src/think/cost.rs) 里（元 / 百万 token）：
-DeepSeek 高峰 ¥2 输入、¥8 输出，空闲时段减半（¥1 / ¥4），**缓存命中是输入的 1/50**；
-本地那一档**全是 0**。Agnes 当前是免费档，价目表里仍留着它的记录值（¥0.35 / ¥1.0）。
-
-### 路由真正的判据
-
-`ModelRouter::route` 的判据和理由都写在
-[`crates/yunxi-bot-core/src/think/router.rs`](crates/yunxi-bot-core/src/think/router.rs) 里：
-
-1. **任务类型**（`TaskKind`，七类）决定**要不要思考**：只有"分析"和"规划"需要推理。
-2. **落到哪张牌**：`Conversation` → 本地；`heuristic_tier()` 明确返回"轻量" → 本地；
-   **其余（含拿不准的 `None`）→ DeepSeek**。`heuristic_tier()` 看的是预估调用次数
-   （> 4 次算深度档）、步数、字数、有没有代码——**不过路由本身不去问任何人**，
-   这个预估值是算出来的，不是问出来的。
-3. **需要推理但端点不吃思考模式** → 换成支持思考的最小档端点（即 DeepSeek），
-   并把这条理由写进台账理由链。
-
-**四条值得记住：**
-
-- 路由**不调用决策模型**。分类那一步已经问过一次了，路由再问就是重复花钱。
-  `Routing::used_decider` 因此恒为 `false`。
-- 本地 / Agnes 都**不吃 `thinking` 字段**，路由不会硬塞；只有 DeepSeek 接受它。
-- **每个任务只在开始时决定一次**，全程用同一个模型同一档思考模式——中途换模型会把
-  已经构建的前缀缓存全部作废。拆出来的**每个子步骤各自路由一次**，那是"每个任务"，不是中途换。
-- 档位的名字容易读错：`Standard` 挂的是免费的 Agnes，而 `Cheap` 挂的是**更省的本地模型**。
-  **看到 `Standard` 不要当成"贵的那个"。**
-
-思考模式的默认值由 `ReasoningEffort` 决定：
-`auto`（默认，只对需要推理且落在 DeepSeek 上的任务开）、`on`、`off`。
-命令行上就是 `--thinking auto|on|off`。
-
-> ✅ **本地不可用时的回落链已经接通，`chat` 和任务引擎都在用。**
-> 选中本地槽位时会探一次 `/health`（300 ms 超时），不是"就绪"就改走 Agnes，
-> 并把原因打出来、写进台账。判定只有一份，在
-> [`local_health.rs`](crates/yunxi-bot-core/src/think/local_health.rs) 里，
-> [`chat_handler.rs`](crates/yunxi-bot-cli/src/chat_handler.rs) 和
-> [`task/engine.rs`](crates/yunxi-bot-core/src/task/engine.rs) 共用它
-> ——两份判定一定会漂，这个项目已经栽过一次。
->
-> 六种状态里只有 `ok` 留在本地。`idle`（权重被空闲释放了）和 `loading`
-> **除了这一轮改走 Agnes，还会顺手踢一脚 `/warmup`**：不踢的话没有任何东西
-> 会再把模型热起来，本地槽位就**静默地永远用不上**。
-> `degraded`（加载失败过，不会重试）和连不上，则只回落、不踢。
->
-> 真机实测这一整环：`ok` → 空闲 15 秒 → `idle`（显存 924 MiB）→
-> 第一次说话走 Agnes 并在 4 秒内热回 `ok`（显存 8654 MiB）→
-> 第二次说话回到本地。
-
----
-
-## 三张图
-
-### 一、一次请求的消息序列：稳定前缀 + 易变尾
-
-要看的结论只有一句：**第 0 条 system 消息逐字节不变，变化的东西全放最后一条 user 消息里。**
-DeepSeek 的前缀缓存要求完整匹配，所以这个布局不是风格问题，是能不能命中缓存的问题。
-
-```mermaid
-flowchart TD
-    S["messages[0] system<br/>稳定前缀 · 逐字节不变"] --> H["messages[1..n-1] 历史<br/>追加式 · 每轮的易变段被原样冻结"]
-    H --> V["messages[n] user<br/>本轮易变段 · 召回的记忆 + 当前问题"]
-    S -.-> F["指纹由稳定段算出<br/>跨调用必须相同"]
-    V -.-> C["不进前缀<br/>所以缓存仍命中"]
-```
-
-`messages[0]` 里固定四块，顺序不可换：人格块、画像块（`profile.md`）、
-常驻记忆块（只放事实 / 偏好）、项目规则块（`AGENTS.md` / `CLAUDE.md`）。
-实现见 [`think/prompt.rs`](crates/yunxi-bot-core/src/think/prompt.rs) 与
-[`chat_handler.rs`](crates/yunxi-bot-cli/src/chat_handler.rs)（`chat_prefix_fingerprint`）。
-
-### 二、从一句话到注入了哪几条记忆
-
-要看的结论：**两路召回（语义 + 词面）各自取前 12 条，再用 RRF 按名次融合**，
-最后按权重、疲劳惩罚和字符预算裁一遍才落到提示词里。
-
-```mermaid
-flowchart TD
-    Q["query"] --> P["候选池：按作用域筛"]
-    P --> SEM["路 1 语义<br/>向量余弦"]
-    P --> LEX["路 2 词面<br/>实词重叠"]
-    SEM --> F["RRF 融合<br/>只看名次"]
-    LEX --> F
-    F --> A["乘权重与疲劳惩罚"]
-    A --> O["按字数放行<br/>装不下的落选"]
-```
-
-实现见 [`memory.rs`](crates/yunxi-bot-core/src/memory.rs)、
-[`embedding.rs`](crates/yunxi-bot-core/src/embedding.rs)、
-[`recall_gate.rs`](crates/yunxi-bot-core/src/recall_gate.rs)。
-**召回前还有一道门控**：先做确定性的关键词判断，只有拿不准时才问一次决策模型——
-门控要是每次都调模型，省下来的调用还不够付它的。
-
-### 三、Agent 循环：三层各管一段
-
-要看的结论：**顺序不能反。** 本地判断快、免费、离线可用；而成规模的远端配额（Agnes 免费档
-只有 **10 RPM**）经不起常驻进程每轮都打一次。本地那一层先筛，是这套配额下的结构必然，不是优化。
-
-```mermaid
-flowchart TD
-    E["投影：记忆 + 现状"] --> L["本地决策层<br/>该不该介入？"]
-    L --> R["写决策台账"]
-    R --> Q{"判定开口？"}
-    Q -- 否 --> Z["止步：不花远端配额"]
-    Q -- 是 --> T["远端思考层<br/>组织措辞"]
-```
-
-跑得起来的验证方式：
-
-```bash
-cargo run -- companion --demo      # 桩模型每一刻都说「该开口」，看约束如何压住它
-cargo run -- agent --hour 3        # 假定凌晨 3 点，观察安静时段把它压成「延后聚合」
-```
-
----
-
-## 它现在是什么状态
-
-**可运行的调度原型 + 一条能用的对话链路。** 任务能按触发条件自动执行、结果落台账、
-需批准的任务被拦下、崩溃残留被回收、状态跨进程存活；`do` 能把目标拆成步骤逐步跑；
-`chat` 能带工具循环对话。
-
-| 模块 | 状态 |
-|---|---|
-| `job` — 任务模型与状态机 | ✅ 状态迁移白名单；区分「上次运行结果」与「任务生命周期」 |
-| `ledger` — append-only 台账 + 投影 | ✅ 边界内审计、格式版本、拒绝无损 JSON |
-| `policy` — 两个正交旋钮 + 封闭审批词汇表 | ✅ 表外结果一律归一为 `unavailable` |
-| `trigger` — 定时 / cron / 文件监听 | ✅ 本地时间 cron、单飞、崩溃残留回收 |
-| `exec` — 子进程执行与凭证剥离 | ✅ 硬超时 + 进程树清理；**拿不到要求的隔离就拒绝执行** |
-| `runner` — 调度循环 | ✅ 把上面五个模块串成一个回合 |
-| `decide` — 决策层 | ✅ typed questions、响应校验、六类双向降级、熔断 |
-| `instance` — 单实例锁 | ✅ pid 存活探测；**陈旧锁自动接管**（崩溃过一次不会再也起不来） |
-| `win_job` — Windows 隔离 | ✅ Job Object：进程树强制回收 + 内存/进程数上限 |
-| `memory` — 记忆层 | ✅ 事件溯源投影；`build_decision_state` 主动裁剪 state |
-| `companion` — 陪伴层 | ✅ 记忆 → 模型判断 → **约束只能更保守** |
-| `think` — 思考层 | ✅ 三个模型槽位（本地 / Agnes / DeepSeek）+ 本地限流 + 可分流式的错误重试 |
-| `sidecar` — 决策模型接入 | ✅ Verdict 后端（选项顺序不变 + 估形弃权 + 可离线） |
-| `agent` — Agent 循环 | ✅ 记忆投影 → 本地判断 → 约束收紧 → 远端表达 → 落台账 |
-| `task` — 任务执行框架 | ✅ 拆解、逐步执行、`decide:` 步骤、预算与重试上限 |
-| `tool` — 工具层 | ✅ 读文件 / 跑命令 / 抓网页，每个动作过审批门禁并留痕 |
-| `mcp` — MCP 客户端 | ✅ stdio 传输，`mcp list` / `mcp call` |
-| `info` — 信息源 | ✅ 只读 IMAP 邮件入口（走 sidecar，不标已读） |
-| 常驻守护 | ✅ 单实例锁、连续失败熔断、开机自启 |
-| 本地槽位的回落链 | ✅ `chat` 与任务引擎都接了：本地没就绪时这一轮走 Agnes，`idle` / `loading` 还会在后台把它热回来 |
-| 入口层（语音 / 微信 / Web） | ⬜ 待实现（当前是 CLI） |
-
-### 隔离：承诺到哪就说到哪
-
-| 机制 | 状态 | 真实保证 |
-|---|---|---|
-| **Windows 低完整性令牌** | ✅ **已实现并自检通过** | 子进程**写不进**任何中完整性对象（用户目录里的文件全是中完整性）；可写区仅限低完整性沙箱 |
-| **Windows Job Object** | ✅ 已实现并验证 | 进程树强制回收、单进程内存上限、进程数上限 |
-| 其他平台 | ✅ 进程隔离 | 独立进程组 + 超时整组清理 |
-
-> ⚠️ **它只隔离写入，不隔离读取。** 子进程仍能读该用户能读的任何东西。
-> Job Object 也不构成文件系统沙箱。把"进程与资源隔离"说成"沙箱"是本项目明令禁止的。
-
-**隔离声明由自检背书，不由代码注释背书：**
-
-```bash
-cargo run -- isolation-check     # 真起一个受限子进程去写允许与禁止的路径
-```
-
-`--require-os-isolation` 的执行点是 `write_isolation_verified()`：**不会因为
-"代码里有这个功能"就放行**，而是要求自检真的跑过一次并成功；不通过就在派生之前拒绝。
-每条执行记录都会把**实际达到**的级别写进台账；Job 建失败时如实回落到 `进程隔离`，
-不会把没做到的说成做到了。
-
-机制说明、被证伪的能力 SID 路线、以及自检抓出的错误，记录在
-[ADR-0001 D7](docs/adr/0001-架构与边界.md) 与
-[`win_token.rs`](crates/yunxi-bot-core/src/win_token.rs) 的模块文档。
-
----
-
-## 常驻与自动化
-
-```bash
-cargo run -- daemon --interval 5000     # 常驻（Ctrl+C 停止，锁自动释放）
-cargo run -- supervise                  # 监督模式：异常退出自动重启
-cargo run -- install-autostart          # 注册当前用户登录时自启（跑的是 supervise）
-cargo run -- autostart-status           # 查看注册状态
-cargo run -- uninstall-autostart        # 取消自启
-```
-
-**三层看护**，各管一段：
-
-| 层 | 管什么 |
-|---|---|
-| `daemon` 循环 | 单轮失败不致命；连续 5 次失败才退出，避免空转刷屏 |
-| `supervise` | 进程级崩溃（OOM / panic / 被强杀）后自动重启，指数退避，超过上限就放弃并暴露问题 |
-| `install-autostart` | 登录时拉起 `supervise`，per-user、零权限 |
-
-自启走**当前用户的「启动」文件夹 + VBS 隐藏启动器**：
-
-> 实测 `schtasks /SC ONLOGON` 在普通用户下返回 `ERROR: Access is denied.`，
-> 因此改用 per-user 的启动文件夹；`.cmd` 会弹控制台窗口，故用 VBS 的
-> `Run(..., 0, False)` 以隐藏窗口拉起。删除那个 `.vbs` 即可取消自启。
-
-日常的调度与自动化命令：
-
-```bash
-cargo run -- add "心跳任务" --every 2 -- cmd /C "echo heartbeat-ok"
-cargo run -- add "发送通知" --irreversible --every 2 -- ./publish.sh   # 创建即待批准，不会执行
-cargo run -- approve <id>        # 批准待批准任务
-cargo run -- do "把这周的邮件整理成一份摘要" --budget 20 --max-steps 12
-cargo run -- do "..." --dry-run  # 不调模型，只展示会怎么拆分与路由（不花钱）
-cargo run -- tasks               # 列出执行框架里的任务及其步骤
-cargo run -- resume <id>         # 续跑一个停在半路的任务
-cargo run -- check --dry-run     # 看信息源 → 判断 → 该通知你的才通知（台账照记）
-cargo run -- notify "标题" "正文" --console
-cargo run -- daemon --agent --judge-every 12   # 常驻循环里开启陪伴判断
-```
-
-`daemon` 的默认节奏：任务推进每 60 秒一次、邮件巡览每 300 秒一次，
-都可以用 `--task-interval` / `--assistant-interval` 调（给 0 表示关闭）。
-陪伴判断**只有显式加 `--agent` 才开**——判断要调本地决策模型，没装时它每次都降级
-（那是正确行为，但会在日志里刷屏）。
-
-邮件那条路需要先起 sidecar：
-
-```bash
-python sidecar/mail_server.py --port 17871
-cargo run -- mail --limit 20     # 只读，不会把邮件标成已读
-```
-
----
-
-## 决策层
-
-决策模型是**本地 sidecar**，只绑回环：
-
-```bash
-python -m pip install -r sidecar/requirements.txt   # 或直接跑 pwsh scripts/setup.ps1
-python sidecar/verdict_server.py --port 17870
-```
-
-Rust 侧只认一个固定 JSON 契约，上游库的差异由 sidecar 吸收
-（见 [`sidecar/verdict_server.py`](sidecar/verdict_server.py)；
-早先的 Laya 后端 [`sidecar/laya_server.py`](sidecar/laya_server.py) 仍在仓库里，
-但默认走 Verdict）。
-
-**它现在只在六个地方被问到**（都能在源码里对上）：
-
-| 调用点 | 问什么 | 出处 |
-|---|---|---|
-| 输入分类 | 这句话是要我办事，还是随口聊聊 | `ModelRouter::classify_input` |
-| 召回门控 | 要不要去翻关于你的记忆（只在前面的关键词判断拿不准时才问） | `recall_gate::gate_questions` |
-| 工具审批 | 这个动作该不该先问过你（答不出来就**问人**，不问人这一侧没有"放行"兜底） | `tool::ask_local` |
-| 任务决策点 | `decide:` 步骤里各选项怎么选 | `task::decide::decision_point` |
-| 陪伴介入 | 此刻该开口、沉默，还是留到合适的时候 | `companion::decide_intervention` |
-| 通知分流 | 这条通知该不该现在打扰你，还是先攒起来 | `triage::triage_item` |
-
-**降级方向按类别相反**（`cargo run -- decide --demo` 会打印前六类）：
-
-| 类别 | 降级方向 | 模型不可用时的动作 |
-|---|---|---|
-| 打扰 / 通知 | fail-closed | 延后聚合，本轮不打扰 |
-| 升级 / 人工介入 | fail-open | 升级给人 |
-| 不可逆动作 | 不参与降级 | 保持强制人工批准（行为不变） |
-| 分类 / 归档 | fail-closed | 归入待分类队列，不猜 |
-| 紧急度 | fail-closed | 按普通处理 |
-| 异常识别 | fail-open | 按可疑处理并记日志 |
-| 路由 / 选端点 | fail-open | 改走远端（Agnes），这一轮照常办 |
-
-（上面这张表列的是**降级类别**，不是"被问到的调用点"。最后一行的"路由 / 选端点"
-是本地槽位回落时留下的痕迹——那一次**没有任何模型被问到**（答话的是 sidecar 的 `/health`），
-所以它不在上面那张六行表里。两张表挨着放容易读混，这里分开说清楚。）
-
-**"模型挂了就走规则兜底"是错的**——那会同时犯两个错：打扰类该闭嘴时张嘴，
-安全类该叫人时不叫。所以方向必须按类别分。
-
-**三条硬规则：**
-
-1. **模型的判断是策略的输入，不是策略的替代**——模型给概率，约束层做决定。
-2. **不信任模型返回值**：选项不在声明的判据里、概率越界、缺答案 → 一律判为非法并降级。
-3. **模型不可用时返回明确错误让上层降级，绝不伪造答案。**
-
-每一次降级都写进台账，用 `cargo run -- journal` 看。
-
-架构与边界的完整设计见 **[ADR-0001](docs/adr/0001-架构与边界.md)**。
-
----
+> **开发状态**：当前提供 CLI 交互与常驻守护，主要在 Windows 上开发和验证。语音、微信和 Web 入口尚未接入本仓库。下面的功能与流程按当前源码说明；产品目标与实现限制分别列出。
 
 ## 设计哲学
 
-| 词 | 承诺 |
-|---|---|
-| **陪伴** | 对你的状态有连续记忆，介入方式随关系状态变化 |
-| **通用** | 不预设领域；能力可扩展，内核不知道具体领域 |
-| **常驻** | 7×24 运行，任务与状态跨重启存活 |
-| **助理** | 既做判断也干活 |
+### 陪伴的温度来自连续性
 
-### 核心判断：陪伴不是功能，是「介入策略」
+人格决定表达方式，记忆承接共同经历，画像保存经确认的用户信息。一次关心应当有具体依据：你说过什么、正在做什么、之前发生过什么。连续的状态让下一次互动可以接着上一次发生。
 
-"什么时候该开口、什么时候该沉默、此刻该用关心还是汇报的语气"——**这些本质上全是分类判断**。
+### 主动性需要判断，也需要克制
 
-而常驻 + 陪伴 + 通用这三者**无法同时用规则满足**：规则要么漏（通用场景写不全），
-要么吵（保守阈值频繁打扰）。
+一个常驻助理会遇到大量事件，而用户的注意力是有限的。YunXi Bot 将“是否需要召回记忆”“是否需要询问”“此刻是否值得打扰”等判断交给本地决策模型参与，再以确定性约束限制行动。安静时段、打扰频率和授权边界不会因模型的建议而被放宽。
 
-所以本项目把「何时介入」交给**决策模型**判断，再用确定性约束层兜底：
+### 通用能力围绕目标组织
 
-```text
-state（含你的偏好与约束）+ 类型化问题
-        ↓
-   决策模型  →  标签 + 概率          ← 接管全部【判断】
-        ↓
-   约束层（确定性）→ 只能往【更保守】修正  ← 永远不会"发明"决定
-        ↓
-      动作
+用户可以给出一个目标，由系统拆解、传递前置结果、调用工具并保存进度。文件、命令和网络是通用能力，MCP 提供扩展入口。任务内核负责目标与状态，具体动作交给工具执行。
+
+### 常驻意味着持续负责
+
+任务进度、记忆、决策和反馈落在本地。守护循环检查触发条件、推进可继续的任务、巡览信息；遇到需要人工判断的情形，保存现场并交还给用户。持久化、恢复、超时和失败处理共同支撑这种连续性。
+
+这些取舍继承了 YunXi 家族的陪伴与治理设计。Bot 的主要探索集中在**跨模块的决策能力、内聚的任务内核和常驻形态**；代码独立，不依赖其他 YunXi 仓库才能编译。设计依据见 [ADR-0001](docs/adr/0001-架构与边界.md)，来源见 [NOTICE](NOTICE)。
+
+## 系统架构
+
+系统有两类互补的模型能力：**决策模型**回答有明确选项的问题，**生成模型**负责理解目标、组织内容和提出工具调用。Rust 内核组织流程、执行规则并记录状态。
+
+下面先展示核心协作关系。决策模型贯穿业务模块；具体调用位置与触发条件，在后续各图中展开。虚线表示模型建议，不代表直接执行。
+
+```mermaid
+flowchart TB
+    USER[用户对话与目标] --> CORE[Rust 内核<br/>对话 · 任务 · 常驻循环]
+    EVENTS[定时触发与外部信息] --> CORE
+    CORE --> VERDICT[决策模型 · Verdict<br/>分类、召回、选择、介入]
+    CORE --> THINK[生成模型<br/>对话、规划与表达<br/>提出工具调用]
+    MEMORY[长期记忆与当前状态] -->|判断证据| VERDICT
+    MEMORY -->|对话上下文| THINK
+    VERDICT -. 判断建议 .-> POLICY[确定性约束与授权]
+    THINK --> POLICY
+    POLICY --> TOOLS[执行工具<br/>文件、命令、网络与 MCP]
+    POLICY --> RESPONSE[回复、表达与通知<br/>回到用户]
+    TOOLS --> LEDGER[事件记录与状态投影]
+    RESPONSE --> LEDGER
+    LEDGER --> NEXT[下一回合<br/>恢复任务、记忆与反馈状态]
+    classDef decision fill:#fff2cc,stroke:#9a6700,color:#3b2e00;
+    class VERDICT decision;
 ```
 
-这条链条的形状借自本项目自身的既有设计原则：**能力可以下放，安全边界只能收紧。**
+### 决策能力嵌入在哪里
 
-记忆的作用是提供"凭什么亲近"：
+Verdict 是共享的本地判断能力。各模块构造自己的问题与证据，解释答案，再应用对应的约束和失败处理。图中的黄色节点均表示 Verdict 的业务判断。
 
-```text
-记忆 / 关系状态  ──提供「凭什么亲近」──┐
-                                      ├──→ 决策层判断介入
-当下情境         ──提供「此刻发生什么」─┘
+| 参与模块 | 判断的问题 | 对运行的影响 |
+|---|---|---|
+| 输入分类 | 这句话是在办事，还是在闲聊？ | 为对话回合的模型路由提供输入 |
+| 记忆召回 | 回答这一句，需要关于用户的什么记忆？ | 决定是否进入动态召回；关键词不确定时调用 |
+| 工具门禁 | 这个动作是否需要先询问用户？ | 在规则允许进入模型判断的路径上，选择自动执行或询问 |
+| 任务决策点 | 根据现有证据，应选择哪个候选方案？ | 为 `decide:` 步骤选择结果，弃权则等待人工 |
+| 陪伴介入 | 现在适合开口、延后，还是沉默？ | 结合记忆和现状决定介入，再受安静时段等约束收紧 |
+| 通知分流 | 这条外部信息值得现在提醒吗？ | 在通知规则未定时参与判断，影响提醒、延后与忽略 |
+
+输入分类、召回、审批、任务决策、陪伴和通知具有不同的失败代价。模型不可用时，审批与任务决策倾向交给人，陪伴与通知倾向不打扰；召回门控保留保守的召回判断。分类失败在当前对话入口中按闲聊处理。模型答案不构成越过权限的依据，未校准的概率也不用于强制审批阈值。
+
+实现入口：[决策契约](crates/yunxi-bot-core/src/decide/mod.rs) · [对话装配](crates/yunxi-bot-cli/src/chat_handler.rs) · [任务决策](crates/yunxi-bot-core/src/task/decide.rs) · [陪伴约束](crates/yunxi-bot-core/src/companion.rs)
+
+### 运行组件与模型分工
+
+| 组件 | 当前实现 | 职责 |
+|---|---|---|
+| 主程序 | Rust 2024，CLI + core 两个 crate | 会话、任务、调度、约束、工具和台账 |
+| 决策服务 | Verdict，回环端口 `17870` | 结构化分类与选择 |
+| 本地生成服务 | `Qwen3-4B-Instruct-2507`，回环端口 `17872` | 闲聊与确定简单的任务，支持工具调用和流式输出 |
+| 远端生成模型 | `deepseek-flash` | 复杂任务，以及默认需要推理的规划、分析步骤 |
+| 远端回落与表达 | `agnes-3.0-flash` | 本地未就绪时的回落；当前主动陪伴表达和画像提炼也使用它 |
+| 邮件服务 | Python IMAP sidecar，回环端口 `17871` | 只读获取邮件，不标记为已读 |
+| MCP | Rust 客户端 + stdio 子进程 | 连接外部工具；异步运行时封装在 MCP 模块内 |
+
+<details>
+<summary>展开模型路由与本地健康回落</summary>
+
+```mermaid
+flowchart TB
+    INPUT[聊天输入] --> V[Verdict<br/>办事还是闲聊？]
+    V --> ROUTE{规则路由}
+    STEP[任务步骤的类型与复杂度] --> ROUTE
+    ROUTE -->|闲聊或确定简单| LOCAL[选择本地 Qwen]
+    ROUTE -->|复杂或无法确定简单| REMOTE[选择 DeepSeek]
+    LOCAL --> REASON{需要推理？}
+    REASON -->|是| REMOTE
+    REASON -->|否或显式关闭| HEALTH{本地就绪？}
+    HEALTH -->|是| USE[本轮使用本地模型]
+    HEALTH -->|否| FALLBACK[本轮回落 Agnes<br/>记录原因]
+    HEALTH -. 空闲或加载中 .-> WARM[请求后台预热<br/>后续回合重新检查]
+    classDef decision fill:#fff2cc,stroke:#9a6700,color:#3b2e00;
+    class V decision;
 ```
 
-`build_decision_state` **主动裁剪**：每类记忆只取权重最高的若干条，关系状态压成
-一个阶段标签，而不是把知道的一切都塞进 prompt。
+路由由代码规则完成，健康探测访问 sidecar 的 `/health`。它们不额外询问 Verdict。每个任务步骤独立选模型，一步内部的工具循环保持该模型。`do --provider agnes|deepseek` 可覆盖该次执行的路由，`resume` 当前恢复默认路由；`--thinking` 控制思考模式。
 
-**判断归模型，硬事实不归它。** 安静时段、每日上限、最小间隔是使用者设定的硬约束，
-模型概率不可靠这件事被挡在安全边界之外。当前跑出来的效果：
+**本地优先不等于全程离线。** 默认复杂任务会访问远端模型，本地回落也会向 Agnes 发送本轮上下文；选择的模型会收到相应的提示词、召回内容和工具结果。模型名、端点与计价表是当前代码配置，服务可用性和实际费用以供应商为准。
 
-```text
-  时刻        模型建议   最终动作    为什么
-  03:00 凌晨   开口      延后聚合    处于安静时段，被约束收紧
-  09:00 上午   开口      主动开口    无约束限制
-  23:00 深夜   开口      延后聚合    处于安静时段，被约束收紧
+源码：[router](crates/yunxi-bot-core/src/think/router.rs) · [local_health](crates/yunxi-bot-core/src/think/local_health.rs) · [OpenAI 兼容客户端](crates/yunxi-bot-core/src/think/agnes.rs)
+
+</details>
+
+## 记忆与人格
+
+相处的连续性由几种不同的状态共同承担。
+
+| 状态 | 保存什么 | 如何使用 |
+|---|---|---|
+| 人格 `persona.md` | 名称、语气与相处方式 | 参与稳定系统提示词的组装 |
+| 画像 `profile.md` | 经用户确认的身份、偏好与背景 | 进入稳定前缀；模型提议先进入待确认列表 |
+| 长期记忆 | 事实、偏好、关系、事件、工作目录记忆 | 从台账投影，按需要召回；工作目录记忆受当前目录限制 |
+| 会话历史 | 当前对话及工具交互 | 每轮保存，可恢复；长上下文可压缩 |
+
+### 先判断需要，再召回内容
+
+对话会先识别记忆需求。常见问法由关键词处理，拿不准时让 Verdict 区分私人记忆、用户画像、通用知识等需求。随后由检索代码完成召回和筛选。
+
+```mermaid
+flowchart TB
+    INPUT[用户这一句] --> GATE{关键词判断}
+    GATE -->|确定| NEED[记忆需求]
+    GATE -->|Mixed：拿不准| V[Verdict<br/>判断 memory_need]
+    V -->|有效选择| NEED
+    V -->|失败：保留 Mixed| NEED
+    NEED -->|none / knowledge| SKIP[不召回私人记忆]
+    NEED -->|profile| PROFILE[使用前缀中已有的画像]
+    NEED -->|需要回忆| SEARCH[先筛选工作目录作用域<br/>再做词面与字符向量检索]
+    SEARCH --> TAIL[融合排序、预算与历史去重<br/>相关记忆进入本轮上下文]
+    SKIP --> ANSWER[生成模型继续对话]
+    PROFILE --> ANSWER
+    TAIL --> ANSWER
+    classDef decision fill:#fff2cc,stroke:#9a6700,color:#3b2e00;
+    class V decision;
 ```
 
----
+**记忆也反过来支撑决策。** `Memory::build_decision_state` 从事实、偏好、关系与事件中取出有限证据，与互动间隔、待处理事件等现状组合，供陪伴判断使用。于是，“记得什么”和“何时介入”形成连接。
 
-## 不可动摇的边界
+图中的“需要回忆”包括 `episode / long_term / mixed`，当前进入同一条检索链。`knowledge` 只表示不翻私人记忆，不会自动启动知识库搜索。召回使用本地字符 n-gram 向量与词面匹配，无需独立 embedding 服务。
 
-1. **失败方向朝「不执行」**——判定不明一律转待批准，绝不放行。
-2. **不可逆动作必须人工批准**，且批准不参与降级。
-3. **决策模型的判断不能替代策略**——模型给概率，约束层做决定。
-4. **审批结果使用封闭词汇表**——词汇表之外的一切归一为 `unavailable`（fail closed）。
-5. **`approval = never` 表示「自动拒绝」，不是「自动放行」。**
-6. **不写入边界外的审计事件**——宁可抛错。
-7. **不静默降级**——任何降级都必须留痕。
-8. **不把进程内策略包装成沙箱**——声称的隔离级别必须与实现一致。
+画像、常驻记忆、项目规则与动态召回目前装配在 `chat`。`do` 的步骤使用人格、任务指令与前置结果，尚未共享完整的聊天记忆上下文；主动陪伴使用长期记忆证据，但表达仍采用固定提示词，尚未复用可编辑的人格与画像前缀。
 
----
+### 记忆如何进入系统
 
-## 安装（一条命令）
+`remember` 显式记录一条记忆；`profile --learn` 从最近会话的用户发言中提炼画像候选，再由 `--accept` / `--reject` 确认。后者使用生成模型 Agnes。保存聊天历史不会自动把每一句话写成长期记忆。
 
 ```powershell
-git clone https://github.com/sjxbbdb/YunXi-Bot
-cd YunXi-Bot
-pwsh scripts/setup.ps1        # 建 venv + 装依赖 + 拉决策模型权重（校验 SHA256）
-cargo build
-cargo run -- isolation-check  # 验证写入隔离真的生效
+cargo run -- remember "回答时先给结论，再展开解释" --kind preference
+cargo run -- remember "这个项目使用 cargo test 验证" --kind workspace
+cargo run -- memory
+cargo run -- profile --learn
+cargo run -- profile --pending
 ```
 
-可选参数：`-SkipModel`（跳过权重下载，sidecar 会回落到 HuggingFace 在线下载）、
-`-Force`（重新下载）、`-Python "py -3.12"`（指定解释器，默认 Python 3.12）。
+<details>
+<summary>展开上下文组装、缓存与会话恢复</summary>
 
-### 决策模型权重为什么不在 git 里
+```mermaid
+flowchart LR
+    STABLE[稳定前缀<br/>人格与规则<br/>画像与常驻记忆] --> HISTORY[追加历史<br/>对话与工具结果] --> TAIL[易变尾部<br/>本轮问题与动态召回]
+```
 
-单个 `model.safetensors` 有 **448.8 MB**，超过 GitHub 的 **100 MiB 单文件硬上限**，
-推送会被直接拒绝。所以：
+稳定内容带指纹，动态召回放在尾部，已经存在于历史中的记忆不重复注入。超过上下文预算时，系统压缩较早的历史，并保留工具调用与结果的配对。提示词的稳定结构为模型前缀缓存提供条件，实际命中由模型服务决定。
 
-| | 放在哪 | 大小 |
+```powershell
+cargo run -- chat list
+cargo run -- chat --resume
+cargo run -- chat --resume --id '实际会话ID'
+```
+
+源码：[记忆投影与召回](crates/yunxi-bot-core/src/memory.rs) · [召回问题](crates/yunxi-bot-core/src/recall_gate.rs) · [提示词组装](crates/yunxi-bot-core/src/think/prompt.rs) · [上下文压缩](crates/yunxi-bot-core/src/think/context.rs) · [会话存储](crates/yunxi-bot-core/src/think/session.rs)
+
+</details>
+
+## 任务执行
+
+`chat` 适合在交互中边聊边做，模型可以直接进入工具循环。`do` 接受目标，建立带步骤与依赖的持久化任务；`resume` 接着推进已有任务。对话中的办事请求不会自动等同于创建一个 `do` 任务。
+
+```mermaid
+flowchart TB
+    GOAL[用户目标] --> PLAN[生成计划并校验入库<br/>步骤、类型与依赖]
+    PLAN --> KIND{选择就绪步骤}
+    KIND -->|普通步骤| RUN[路由模型并执行<br/>带入前置结果、调用工具]
+    KIND -->|decide:| OPTIONS[生成模型提出候选方案]
+    OPTIONS --> V[Verdict<br/>选择方案]
+    V -->|选中| SAVE[记录步骤结果]
+    V -->|弃权 / 不可用| HUMAN[保存问题与候选<br/>等待人工回答]
+    HUMAN -->|resume --answer| SAVE
+    RUN --> SAVE
+    SAVE -->|继续| KIND
+    SAVE -->|全部步骤成功| DONE[任务完成]
+    SAVE -->|失败、阻塞或预算用尽| STOP[保留进度并报告原因]
+    classDef decision fill:#fff2cc,stroke:#9a6700,color:#3b2e00;
+    class V decision;
+```
+
+任务引擎负责状态迁移、依赖、重试与人工介入。每次推进重新读取任务投影，将前置产物交给后续步骤。当前步骤按顺序执行；全部步骤进入终态不等于目标达成，存在失败或跳过时不会一律报告完成。
+
+```powershell
+cargo run -- do "阅读当前目录的项目文档，整理一份模块说明保存到 overview.md"
+cargo run -- tasks
+cargo run -- tasks '实际任务ID'
+cargo run -- resume '实际任务ID'
+cargo run -- resume '实际任务ID' --answer "采用第二个方案"
+```
+
+默认最多拆解 12 步，单步最多尝试 2 次，工具循环默认最多 8 轮并检测重复调用。`--budget` 控制一次引擎推进的调用计数，默认 20，**不等同于跨恢复累计的费用上限，也不逐次限制工具循环内的所有模型请求**。实际调用用量另外写入成本台账。
+
+源码：[任务状态](crates/yunxi-bot-core/src/task/model.rs) · [计划解析](crates/yunxi-bot-core/src/task/plan.rs) · [执行引擎](crates/yunxi-bot-core/src/task/engine.rs)
+
+### 工具与权限协同
+
+内置工具覆盖时间、文件读取与检索、文件写入与编辑、命令执行、网页抓取与搜索，以及向用户提问。模型提出动作后，工具门禁先检查规则；需要判断的路径再询问 Verdict，无法确定则交给人。
+
+<details>
+<summary>展开工具审批、执行与结果回灌</summary>
+
+```mermaid
+flowchart TB
+    MODEL[生成模型提出工具调用] --> RULE{能力、范围与授权规则}
+    RULE -->|拒绝规则命中| DENY[拒绝执行]
+    RULE -->|已授权或符合只读规则| EXEC[执行工具]
+    RULE -->|需要显式人工授权| HUMAN{人工确认}
+    RULE -->|允许模型参与判断| V[Verdict<br/>是否需要先询问？]
+    V -->|auto| EXEC
+    V -->|ask / 弃权 / 不可用| HUMAN
+    HUMAN -->|批准| EXEC
+    HUMAN -->|拒绝 / 无人应答| DENY
+    EXEC --> RESULT[工具结果与执行记录]
+    DENY --> RESULT
+    RESULT --> MODEL
+    classDef decision fill:#fff2cc,stroke:#9a6700,color:#3b2e00;
+    class V decision;
+```
+
+`ReadOnly / Write / Execute / Network / Outbound / Unknown` 区分动作的能力与风险。网络访问独立于只读文件操作；不可逆动作及能力未知的工具不交给模型判断。拒绝规则优先，明确的用户预批准按范围匹配。
+
+文件覆盖要求先读取，写入审批可以展示 diff。命令执行带超时、环境变量筛选和进程清理。不同工具具有不同的执行与隔离机制，不能把一处门禁等同于整个进程拥有完整沙箱。
+
+```powershell
+cargo run -- tools
+cargo run -- do "读取 README.md 并说明项目定位" --allow read_file
+cargo run -- mcp list
+```
+
+MCP 使用 stdio 传输，从数据目录中的 `mcp.json` 加载配置。当前 `chat` 接入 MCP 工具；`do`、`resume` 和守护任务推进尚未装配同一套 MCP 扩展。默认 MCP 工具按能力未知处理；配置中的 `require_approval` 会影响能力分类。独立的 `mcp call` 命令直接调用工具，不经过上述对话工具门禁。
+
+源码：[工具注册与门禁](crates/yunxi-bot-core/src/tool/mod.rs) · [工具循环](crates/yunxi-bot-core/src/tool/runner.rs) · [MCP](crates/yunxi-bot-core/src/mcp.rs)
+
+</details>
+
+## 主动陪伴
+
+主动介入有两种来源：内部的记忆与任务现状，以及外部的信息变化。它们分别进入陪伴判断和通知分流，最终都要经过克制打扰的约束。
+
+```mermaid
+flowchart TB
+    MEMORY[记忆与关系信息] --> STATE[裁剪判断所需的证据]
+    EVENTS[互动与任务现状] --> STATE
+    STATE --> V1[Verdict<br/>此刻是否适合介入？]
+    V1 --> LIMIT1[安静时段、互动间隔与打扰额度]
+    LIMIT1 -->|开口| SPEAK[生成模型组织陪伴表达]
+    LIMIT1 -->|延后或沉默| QUIET[本轮不打扰]
+    MAIL[外部信息 · 当前为邮件] --> RULE[检查通知记录<br/>用户反馈与确定性规则]
+    RULE -->|需要判断| V2[Verdict<br/>是否值得现在提醒？]
+    RULE -->|规则已有结论| LIMIT2[通知与陪伴约束]
+    V2 --> LIMIT2
+    LIMIT2 -->|提醒| NOTIFY[通知出口]
+    LIMIT2 -->|延后| HOLD[保留待后续巡览重判]
+    LIMIT2 -->|忽略| IGNORE[本轮不通知]
+    NOTIFY --> FEEDBACK[用户反馈<br/>已读、忽略、不再提醒]
+    FEEDBACK -->|影响后续分流| RULE
+    classDef decision fill:#fff2cc,stroke:#9a6700,color:#3b2e00;
+    class V1,V2 decision;
+```
+
+陪伴链路只在需要开口时调用生成模型组织表达。邮件巡览记录获取、判断和投递结果，用户反馈进入后续分流依据。暂缓项目可在后续巡览重新判断。
+
+设计上区分“决定提醒”“尝试投递”“已确认送达”和“用户已读”。当前通知去重仍有实现限制：非演练的投递记录即可能进入已处理集合，失败投递不保证自动重试；通知后端的确认也不能证明用户看到了通知。
+
+```powershell
+cargo run -- check --dry-run
+cargo run -- feedback --last --read
+cargo run -- feedback --last --never
+cargo run -- journal
+```
+
+`check --dry-run` 仍会读取信息、执行判断并写台账，只是不发送通知。邮件巡览需要先配置并启动 [邮件 sidecar](sidecar/mail_server.py)。
+
+源码：[陪伴回合](crates/yunxi-bot-core/src/agent.rs) · [信息巡览](crates/yunxi-bot-core/src/assistant.rs) · [通知分流](crates/yunxi-bot-core/src/triage.rs) · [反馈投影](crates/yunxi-bot-core/src/feedback.rs)
+
+## 常驻与可追溯性
+
+守护进程把周期性调度、信息巡览和任务推进放进同一个运行循环。命令任务 `job` 保存“何时执行什么命令”；目标任务 `task` 保存“如何逐步完成目标”。两者共享台账，但拥有各自的状态与调度逻辑。
+
+<details>
+<summary>展开守护循环与持久化协作</summary>
+
+```mermaid
+flowchart TB
+    START[启动 daemon<br/>获取单实例锁] --> TICK[调度命令任务<br/>间隔 / cron / 文件变化]
+    TICK --> COMPANION[定期判断是否介入<br/>表达需启用 --agent]
+    COMPANION --> INFO[到达巡览间隔时<br/>读取并分流外部信息]
+    INFO --> TASK[到达推进间隔时<br/>检查可接手的目标任务]
+    TASK --> WAIT[等待下一轮]
+    WAIT --> TICK
+    TICK -. 运行事件 .-> LEDGER[追加式本地台账]
+    COMPANION -. 决策事件 .-> LEDGER
+    INFO -. 分流与通知记录 .-> LEDGER
+    TASK -. 步骤状态与结果 .-> LEDGER
+    LEDGER --> PROJECT[重建任务、记忆与反馈状态]
+    PROJECT -. 重启后筛选可推进任务 .-> TASK
+```
+
+| 节奏 | 当前默认值 | 调整方式 |
 |---|---|---|
-| 编码器权重 | [GitHub Release `models-v1`](https://github.com/sjxbbdb/YunXi-Bot/releases/tag/models-v1) | 约 348 MB（清单里的 `size_bytes` 是 364,679,983） |
-| 下载 + 校验脚本、清单、模型卡 | **仓库里**（[`scripts/fetch_model.py`](scripts/fetch_model.py)、[`models/manifest.json`](models/manifest.json)、[`models/verdict-small-README.md`](models/verdict-small-README.md)） | 几十 KB |
-| Rust 侧、sidecar、契约与测试 | **仓库里** | —— |
+| 主循环 | 5 秒 | `--interval`，单位毫秒 |
+| 邮件巡览 | 300 秒 | `--assistant-interval`，`0` 关闭 |
+| 目标任务推进 | 60 秒检查一次，闲置 120 秒后可接手 | `--task-interval` / `--task-idle`，单位秒 |
+| 陪伴表达 | 用 `--agent` 启用；默认每 12 轮判断 | `--judge-every` |
 
-```bash
-python scripts/fetch_model.py          # 下载 + 校验 + 解压到 <数据目录>/models/
-python scripts/fetch_model.py --check  # 只校验，不下载
+当前陪伴与邮件巡览共用决策引擎：只开启邮件巡览时，也可能进入无表达模型的陪伴判断回合。需要纯命令调度时，可显式关闭邮件巡览和目标任务推进。
+
+`supervise` 在守护异常退出后重启，Windows 登录自启使用当前用户的启动目录。当前监督器只转发主循环间隔，不会转发全部 `daemon` 参数。无人值守的审批者不授予新的人工作业批准；需要人工的任务应回到交互入口处理。
+
+```powershell
+# 仅运行命令任务调度
+cargo run -- daemon --assistant-interval 0 --task-interval 0
+
+# 启用陪伴表达；保留默认巡览和任务推进
+cargo run -- daemon --agent
+
+# 监督与 Windows 当前用户登录自启
+cargo run -- supervise
+cargo run -- install-autostart
+cargo run -- uninstall-autostart
 ```
 
-权重落在 `<数据目录>/models/verdict-small/`，sidecar 优先读它，
-读不到才回落到 HuggingFace 仓库名——**所以第一次跑之前，要么联网，要么先跑这个脚本。**
+</details>
 
-### 决策模型为什么是 Verdict
+台账采用追加式 JSONL，任务、记忆、反馈等状态由事件投影得到。模型调用、工具结果与决策记录让运行过程可以回查；会话历史另外保存在 `sessions/`。重启后可重新读取状态，但不能据此保证外部动作恰好执行一次。
 
-选它不是为了基准分，是因为它**唯一同时满足这个项目的三条硬条件**：
+```powershell
+cargo run -- status
+cargo run -- log -n 20
+cargo run -- journal
+cargo run -- cost --calls 10
+```
 
-| 硬条件 | 出处 | Laya | **Verdict** |
-|---|---|---|---|
-| 中文可用 | 全程中文 | ⚠️ 非拉丁文字会静默失败 | ✅ multilingual-e5-small |
-| 概率可当阈值用 | ADR §7.3 第 5 条 | ❌ ECE 0.466，且未带拟合温度 | ✅ ECE 0.014–0.030，且如实报 `calibrated` |
-| 选项顺序不影响答案 | 判断"该不该打扰"，换问法变答案不可接受 | ❌ 翻转率 0.23 | ✅ 结构上保证（已实测正序/逆序一致） |
+运行数据由 `YUNXI_BOT_HOME` 指定；未设置时，Windows 使用 `%LOCALAPPDATA%\YunXiBot`，其他平台使用 `~/.yunxi-bot`。仓库的便携启动脚本另行将其指向仓库内的 `data/`。台账、会话、权重与凭证不应提交到 Git。
 
-外加：**`/v1/systemone` 线协议与 Laya 一致**，所以换后端 **Rust 侧一行未改**。
+## 开始使用
 
-⚠️ **默认未校准**（`calibrated: false`）。ADR §7.3 第 5 条禁止拿未校准的概率卡阈值，
-所以 Rust 侧目前只用 argmax，不用它的概率做阈值判断。
+以下命令以 **Windows 上的 PowerShell 7.1+** 为例。需要 Git、Rust 1.88 或更新版本及相应编译工具；本地决策服务使用 Python 3.12。第一次安装需要联网。
 
----
+### 1. 构建并准备决策模型
 
-## 仓库结构
+```powershell
+git clone https://github.com/sjxbbdb/YunXi-Bot.git
+cd YunXi-Bot
+
+# 让本节各终端使用同一数据目录；新终端也需设置此变量
+$env:YUNXI_BOT_HOME = Join-Path $PWD 'data'
+
+pwsh scripts/setup.ps1
+cargo build
+cargo run -- isolation-check
+```
+
+`setup.ps1` 创建 `.venv`、安装决策服务依赖，并下载 Verdict 权重。优先使用 [models-v1 Release](https://github.com/sjxbbdb/YunXi-Bot/releases/tag/models-v1) 归档并校验 SHA256；Hugging Face 回落使用清单固定的 revision，不执行同样的归档校验。清单位于 [models/manifest.json](models/manifest.json)。这个步骤**不会下载本地 Qwen 模型，也不保证安装了适配显卡的 CUDA 版 PyTorch**。
+
+在一个单独终端中，从仓库根目录启动决策服务：
+
+```powershell
+$env:YUNXI_BOT_HOME = Join-Path $PWD 'data'
+.\.venv\Scripts\python.exe sidecar/verdict_server.py --port 17870
+```
+
+`chat` 和 `do` 也会尝试自动拉起决策服务；显式启动便于确认模型加载情况，并供守护进程使用。
+
+### 2. 配置远端模型并开始交互
+
+在本机数据目录的专用凭证文件中分别配置 Agnes 与 DeepSeek。下面用隐藏输入读取密钥；文件中仍是明文凭证，应限制本机访问权限，不上传到仓库：
+
+```powershell
+$secretsDir = Join-Path $env:YUNXI_BOT_HOME 'secrets'
+New-Item -ItemType Directory -Force $secretsDir | Out-Null
+Read-Host 'Agnes API key' -MaskInput | Set-Content (Join-Path $secretsDir 'agnes.key') -NoNewline
+Read-Host 'DeepSeek API key' -MaskInput | Set-Content (Join-Path $secretsDir 'deepseek.key') -NoNewline
+
+# 当前共享凭证读取器会优先使用此变量；清除本终端的覆盖值
+Remove-Item Env:YUNXI_BOT_AGNES_KEY -ErrorAction SilentlyContinue
+
+cargo run -- chat
+```
+
+Agnes 用于本地回落等路径，DeepSeek 用于默认复杂任务。当前客户端存在凭证接线限制：`YUNXI_BOT_AGNES_KEY` 会同时覆盖两种服务的文件来源，`YUNXI_BOT_DEEPSEEK_KEY` 尚未被读取。因此使用双服务时，应采用上面的独立文件，并在每个运行终端清除 Agnes 环境变量覆盖。
+
+<details>
+<summary>3. 可选：启用本地 Qwen 生成模型</summary>
+
+CLI 自动启动本地模型时使用 CUDA。需要兼容的 NVIDIA 显卡、驱动、足够显存，以及同一 Python 环境中的 CUDA 版 PyTorch。按 [PyTorch 安装指南](https://pytorch.org/get-started/locally/) 为当前设备选择版本，不应仅凭 `setup.ps1` 成功就判断 GPU 环境可用。
+
+```powershell
+.\.venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"
+.\.venv\Scripts\python.exe scripts/fetch_local_model.py Qwen/Qwen3-4B-Instruct-2507
+.\.venv\Scripts\python.exe sidecar/local_llm_server.py --model Qwen3-4B-Instruct-2507 --device cuda
+```
+
+这里显式指定型号，以对齐 Rust 路由配置；下载脚本自己的默认型号是 `Qwen3-1.7B`。权重保存在同一数据目录的 `models/` 下。本地服务支持按需加载与空闲卸载；没有就绪时，本轮路由会回落 Agnes。`do` 不负责自动启动本地生成服务。
+
+</details>
+
+### 4. 按需要启用能力
+
+| 想做什么 | 入口 |
+|---|---|
+| 对话、调用工具 | `cargo run -- chat` |
+| 给出目标并逐步执行 | `cargo run -- do "目标"` |
+| 保存偏好或工作目录记忆 | `cargo run -- remember "内容" --kind preference` |
+| 查看任务并续跑 | `cargo run -- tasks` / `cargo run -- resume '实际任务ID'` |
+| 巡览邮件 | 配置并启动 [mail_server.py](sidecar/mail_server.py)，再运行 `cargo run -- check` |
+| 接入扩展工具 | 配置 [MCP](crates/yunxi-bot-core/src/mcp.rs)，运行 `cargo run -- mcp list` |
+| 长期运行 | 参阅[常驻与可追溯性](#常驻与可追溯性)的开关与前提 |
+
+不调用生成模型的入门检查：`cargo run -- status`、`cargo run -- policy`、`cargo run -- decide --demo`。完整命令入口见 [main.rs](crates/yunxi-bot-cli/src/main.rs)。
+
+## 边界与当前进展
+
+设计要求失败朝保守方向处理，模型判断服从确定性约束。需要批准的动作在无人应答时不会获得人工批准；`approval = never` 表示自动拒绝需要批准的动作。审批使用封闭词汇表，不接受任意外部文本作为授权。
+
+| 范围 | 当前能力与限制 |
+|---|---|
+| 产品入口 | CLI 与守护可用；语音、微信、Web 尚未接入 |
+| 任务完成 | 有状态机、依赖和恢复机制；步骤结果仍部分依赖模型输出，不能替代真实产物验证 |
+| 记忆连续性 | 支持显式记忆、画像确认、会话恢复和动态召回；未实现全自动长期记忆整理 |
+| 决策质量 | 默认 Verdict 未校准；能力依赖问题与输入证据质量，需要真实场景评估 |
+| 互动状态 | 当前最近互动时间会受其他决策事件影响，主动陪伴时机仍有待完善 |
+| 隔离 | Windows 在要求写隔离并通过自检时使用低完整性令牌；普通命令尽力使用 Job Object。`workspace-write` 不提供 OS 目录写入边界，读取与网络也未隔离；其他平台仅提供进程级控制 |
+| 持久化 | 追加式台账可重建状态；不承诺数据库事务、断电持久性或外部副作用恰好一次 |
+
+以上描述对应当前实现。历史对比与压力测试记录用于解释设计演进，不作为今天的成功率或稳定性保证。完整边界与取舍见 [架构决策记录](docs/adr/0001-架构与边界.md)。
+
+## 开发与深入阅读
 
 ```text
 crates/
-  yunxi-bot-core/     内聚内核：job / ledger / policy / trigger / exec / task /
-                      think / decide / tool / memory / companion / agent / mcp …
-  yunxi-bot-cli/      命令行入口（main.rs 的命令分发就是全部命令清单）
-sidecar/              Python 侧：决策模型、本地小模型、邮件、测试替身、端到端脚本
-scripts/              setup.ps1、权重下载与校验、模型发布、模型对比
-models/               权重清单与模型卡（权重本身不进 git）
+  yunxi-bot-cli/       命令、对话交互、组件装配与人工审批
+  yunxi-bot-core/      任务、决策、记忆、工具、调度与台账
+sidecar/              本地模型、邮件服务、测试替身与端到端脚本
+scripts/              环境准备、模型下载、校验与对比
+models/               模型清单与模型卡
 docs/
-  adr/                架构决策记录
-  readme/             三篇对着源码写的正文
-data/                 运行数据（台账、会话、画像），不进 git
+  adr/                架构决策与演进依据
+  readme/             架构、任务链路、人格与记忆详解
+  compare/            特定环境下的模型对比记录
 ```
 
-**这是一个内聚的具体内核，不是元内核。** 它明确知道自己管什么；没有服务查找、没有事件总线、
-没有插件生命周期，依赖全部是编译期显式的。唯一引入异步运行时的依赖是 MCP 客户端
-（`rmcp` + 当前线程版 tokio），代价在 `Cargo.toml` 里记着：67 个包 → 104 个包。
+Rust 核心使用 `serde` / `serde_json`、`chrono`、`ureq` 及 `rmcp` / `tokio`；版本与 feature 以 [Cargo.toml](Cargo.toml) 和 [Cargo.lock](Cargo.lock) 为准。核心逻辑保持同步，Python 能力通过进程与回环 HTTP 连接。
 
----
+```powershell
+cargo fmt --all -- --check
+cargo build
+cargo test
+cargo clippy --all-targets
+```
 
-## 许可与致谢
+Rust 测试覆盖状态、规则与失败路径；`sidecar/` 中另有邮件单元测试、端到端及压力脚本。部分脚本会使用真实模型、凭证与服务，运行前应查看各脚本前提。单元测试通过不等于真实模型任务已完成验收。
 
-Apache-2.0。设计参考来源见 [`NOTICE`](NOTICE)。
-
----
-
-## 深入阅读
-
-三篇正文都是**对着源码写的**，每条事实都带 `文件:行号`：
-
-| | 讲什么 |
+| 文档 | 内容 |
 |---|---|
-| [一、架构与技术栈](docs/readme/01-架构与技术栈.md) | 设计理念、技术栈、依赖清单、模块地图、分层架构图、数据落地 |
-| [二、任务链路与决策模型](docs/readme/02-任务链路与决策模型.md) | 任务输入全链路、决策模型的调用点、模型选择器、`decide:` 生命周期、工具循环 |
-| [三、提示词、人格与记忆](docs/readme/03-提示词人格与记忆.md) | 系统提示词拼接、人格文件、画像两条来源、记忆与两路召回、脱敏诊断 |
+| [架构与边界](docs/adr/0001-架构与边界.md) | 产品哲学、已采纳的决策与演进理由 |
+| [架构与技术栈](docs/readme/01-架构与技术栈.md) | 模块组织、依赖与数据落地 |
+| [任务链路与决策模型](docs/readme/02-任务链路与决策模型.md) | 任务步骤、路由、决策与工具循环 |
+| [提示词、人格与记忆](docs/readme/03-提示词人格与记忆.md) | 上下文、画像、召回与工作目录记忆 |
+| [工具层调研与设计](docs/工具层调研与设计.md) | 能力分类、审批与扩展的设计依据 |
+| [贡献约定](AGENTS.md) | 工程边界与验收要求 |
 
-ADR：[架构与边界](docs/adr/0001-架构与边界.md) ·
-[工具层调研与设计](docs/工具层调研与设计.md)
+## YunXi 家族与许可
 
-测试替身：[`sidecar/mock_laya.py`](sidecar/mock_laya.py) 实现与真实 sidecar 相同的线协议，
-但按脚本作答，让"判断 → 约束 → 表达 → 台账"这条链路能在不下载模型的情况下被验证。
+YunXi Bot 继承了 [YunXi-Agent](https://github.com/sjxbbdb/YunXi-Agent) 的陪伴与治理设计，参考 [YunXi-Next](https://github.com/sjxbbdb/YunXi-Next) 的内核与进程边界、[YunXi-Native](https://github.com/sjxbbdb/YunXi-Native) 的自然语言交互，以及 [YunXi-Voice-Runtime](https://github.com/sjxbbdb/YunXi-Voice-Runtime) 的跨语言 sidecar 模式。家族项目已有的入口与能力，不自动代表 Bot 已经集成。
+
+本项目采用 [Apache-2.0](LICENSE) 许可。设计与代码来源的归属，以及 Miyu 等上游项目的许可声明，见 [NOTICE](NOTICE)。
