@@ -16,7 +16,7 @@
 
 ## 需要真模型
 
-用的是 Agnes（免费档）。三轮对话 + 可能的工具调用，
+默认使用本地模型。三轮对话 + 可能的工具调用，
 10 RPM 下会有限流等待——脚本超时给足。
 
 跑：python sidecar/e2e_chat.py
@@ -57,15 +57,13 @@ def main() -> int:
     real_home = real_home_dir()
     # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
     before_home = snapshot_home(real_home)
-    key = real_home / "secrets" / "agnes.key"
-    if not key.exists():
-        print(f"没有 agnes.key（{key}），这个验证需要真模型", file=sys.stderr)
-        return 2
 
     with tempfile.TemporaryDirectory(prefix="yunxi-chat-") as tmp:
         home = Path(tmp)
         (home / "secrets").mkdir(parents=True, exist_ok=True)
-        shutil.copy(key, home / "secrets" / "agnes.key")
+        key = real_home / "secrets" / "deepseek.key"
+        if key.exists():
+            shutil.copy(key, home / "secrets" / "deepseek.key")
         env = dict(os.environ, YUNXI_BOT_HOME=str(home), PYTHONIOENCODING="utf-8")
 
         sid = "e2e-memory"

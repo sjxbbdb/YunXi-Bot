@@ -102,6 +102,19 @@ impl LayaDecider {
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
+
+    /// 就绪检查不发空问题：推理端点会正确拒绝空 questions。
+    pub fn is_ready(&self) -> bool {
+        let Some(base) = self.endpoint.strip_suffix("/decide") else {
+            return false;
+        };
+        http::get_json(&format!("{base}/health"), self.timeout_ms)
+            .ok()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+            .is_some_and(|body| {
+                body.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+            })
+    }
 }
 
 /// 响应体形状。
@@ -323,6 +336,43 @@ impl Decider for StubDecider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_probe_uses_get_and_only_accepts_ready() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        for (body, expected) in [
+            (r#"{"status":"ok","model":"laya-multilingual"}"#, true),
+            (r#"{"status":"loading"}"#, false),
+            (r#"{"status":"degraded"}"#, false),
+            (r#"{"status":"unknown"}"#, false),
+            ("{}", false),
+            ("not json", false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/decide", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0; 2048];
+                let n = stream.read(&mut request).unwrap();
+                assert!(String::from_utf8_lossy(&request[..n]).starts_with("GET /health "));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            });
+            assert_eq!(LayaDecider::new(endpoint).is_ready(), expected, "{body}");
+            server.join().unwrap();
+        }
+        assert!(!LayaDecider::new("not a URL").is_ready());
+    }
+
     use crate::decide::Question;
 
     fn req() -> DecisionRequest {

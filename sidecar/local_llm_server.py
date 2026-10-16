@@ -4,7 +4,7 @@
 
 ## 为什么做成 OpenAI 兼容的端点
 
-`crates/yunxi-bot-core/src/think/agnes.rs` 里的 `OpenAiThinker` **已经会说
+`crates/yunxi-bot-core/src/think/client.rs` 里的 `OpenAiThinker` **已经会说
 这个协议**（Agnes 和 DeepSeek 都走它）。所以本地模型只要长得像它们，
 **Rust 侧几乎一行不用改**——加一个 `ThinkerConfig` 就够了。
 
@@ -28,11 +28,12 @@
 
     python sidecar/local_llm_server.py                       # 默认 Qwen3-1.7B
     python sidecar/local_llm_server.py --model Qwen3-4B
-    python sidecar/local_llm_server.py --port 17872 --device cuda
+    python sidecar/local_llm_server.py --port 17872 --device auto
 """
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
@@ -45,6 +46,7 @@ _lock = threading.Lock()
 _model = None
 _tokenizer = None
 _model_name = ""
+_device: str | None = None
 _model_error: str | None = None
 _loading = False
 # **生成串行化**：见文件头 D104 那条。
@@ -63,7 +65,7 @@ _load_lock = threading.Lock()
 # 还不知道为什么"**。所以权重必须能放掉，而且要**没人用的时候自己放掉**。
 _last_use = time.monotonic()   # **单调钟**，理由见 `_idle_watchdog()`
 _ever_loaded = False           # 曾经加载成功过——`/health` 报 `idle` 的前提
-_idle_unload_seconds = 600.0   # <=0 表示不自动释放（留着手动/基准测试用）
+_idle_unload_seconds = 120.0   # <=0 表示不自动释放（留着手动/基准测试用）
 _warmup_pending = False        # 后台已经在加载了，别为每次 /warmup 再开一个线程
 
 
@@ -85,6 +87,31 @@ def resolve_model_dir(model: str) -> str:
     return model  # 交给 transformers 按仓库名去拉（联网时能用）
 
 
+def inference_device(torch, requested: str) -> tuple[str, object]:
+    """用运行时能力选设备；显式指定的设备不可用时保留故障，不暗中换设备。"""
+    device = requested
+    if device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("cuda 不可用；请检查 PyTorch/驱动或显式选择 --device cpu")
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    elif device == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("mps 不可用；请检查 PyTorch/macOS 或显式选择 --device cpu")
+        dtype = torch.float16
+    elif device == "cpu":
+        dtype = torch.float32
+    else:
+        raise ValueError(f"未知推理设备 {device!r}；可选 auto/cuda/mps/cpu")
+    return device, dtype
+
+
 def load(model: str, device: str) -> None:
     """加载模型。**并发调用会排队**：后到的等前面那个加载完，然后直接返回。
 
@@ -99,14 +126,14 @@ def load(model: str, device: str) -> None:
 
     排队之后同一个请求只是**慢**，不会失败——而慢本来就是这条路的预期。
     """
-    with _load_lock:
+    with _generate_lock, _load_lock:
         _load_once(model, device)
 
 
 def _load_once(model: str, device: str) -> None:
     """真正加载。**调用方必须已经持有 `_load_lock`。**"""
     global _model, _tokenizer, _model_name, _model_error, _loading
-    global _ever_loaded, _last_use
+    global _ever_loaded, _last_use, _device
 
     with _lock:
         if _model is not None or _model_error is not None:
@@ -119,15 +146,28 @@ def _load_once(model: str, device: str) -> None:
         _model_name = model
     path = resolve_model_dir(model)
     try:
+        if device == "mlx":
+            from mlx_backend import load_model
+
+            with _lock:
+                _device = "mlx"
+            mdl, tok = load_model(path)
+            with _lock:
+                _model, _tokenizer, _device = mdl, tok, "mlx"
+                _ever_loaded, _last_use = True, time.monotonic()
+            sys.stderr.write(f"[local-llm] 已加载 {model}（MLX Metal）\n")
+            return
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        requested = device
+        device, dtype = inference_device(torch, requested)
         # **线程数用 torch 限，不用环境变量。** D106 那次就是环境变量
         # 把模型加载弄挂了——环境变量影响的是整个进程（包括加载），
         # 而 `set_num_threads` 只影响计算。
         torch.set_num_threads(min(8, os.cpu_count() or 4))
 
-        sys.stderr.write(f"[local-llm] 加载 {path}（device={device}）\n")
+        sys.stderr.write(f"[local-llm] 加载 {path}（requested={requested}, device={device}, dtype={dtype}）\n")
         t0 = time.time()
         tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
         # **不用 `device_map`。** 它要求额外的 `accelerate` 包，而为了
@@ -137,13 +177,13 @@ def _load_once(model: str, device: str) -> None:
         mdl = AutoModelForCausalLM.from_pretrained(
             path,
             trust_remote_code=True,
-            # **bf16**：5060 Ti 支持，比 fp32 省一半显存且更快。
-            dtype=torch.bfloat16,
+            dtype=dtype,
         )
         mdl = mdl.to(device)
         mdl.eval()
         with _lock:
             _tokenizer, _model = tok, mdl
+            _device = device
             _ever_loaded = True
             # **加载完成也算一次"在用"。** 不然刚装好就被看门狗按"上次用的
             # 时间"（可能已经是几分钟前，比如空闲释放之后隔了很久才重新加载）
@@ -161,7 +201,7 @@ def _load_once(model: str, device: str) -> None:
             _loading = False
 
 
-def _flush_cuda_cache() -> None:
+def _flush_device_cache() -> None:
     """把分配器缓存的显存还给驱动。**要看着它真的降下去，不能只叫一次。**
 
     ## 为什么一次 `empty_cache()` 不够（这是实测出来的）
@@ -186,9 +226,24 @@ def _flush_cuda_cache() -> None:
     try:
         import gc
 
+        if _device == "mlx":
+            from mlx_backend import clear_cache
+
+            clear_cache()
+            return
         import torch
 
-        if not torch.cuda.is_available():
+        if _device == "mps":
+            # MPS 与 CUDA 使用不同的缓存分配器，不能用 CUDA 的清理接口代替。
+            # 同样做有界重试，以覆盖流式生成器稍晚才释放引用的情况。
+            for attempt in range(4):
+                gc.collect()
+                torch.mps.empty_cache()
+                if attempt < 3:
+                    time.sleep(0.25)
+            return
+        if _device != "cuda":
+            gc.collect()
             return
         for _ in range(4):
             gc.collect()
@@ -212,7 +267,7 @@ def _drop_weights() -> bool:
 
     掉 Python 引用只是让模型对象**可回收**；torch 的缓存分配器仍然把显存
     攥在自己手里，`nvidia-smi` **一点变化都不会有**——看起来和"这次卸载
-    根本没生效"一模一样。所以必须把缓存**还**给驱动，见 `_flush_cuda_cache()`。
+    根本没生效"一模一样。所以必须把缓存**还**给驱动，见 `_flush_device_cache()`。
 
     `gc.collect()` 是同一个道理的补刀：模型对象偶尔处在引用环里，
     光把全局引用置空不一定立刻析构，先收一遍垃圾才有东西可以还。
@@ -230,7 +285,7 @@ def _drop_weights() -> bool:
         return False
     # `had` 为假也要冲一次：上一次卸载可能正好落在上面那条缝里，
     # 缓存还攥着那几 GB，而重复的 /unload 是唯一会再来看一眼的人。
-    _flush_cuda_cache()
+    _flush_device_cache()
     return had
 
 
@@ -698,6 +753,7 @@ def _sample_kwargs(tok, inputs, max_tokens: int, temperature: float) -> dict:
 def generate(
     messages: list[dict], max_tokens: int, temperature: float,
     tools: list[dict] | None = None,
+    thinking: bool = False,
 ) -> dict:
     """跑一次生成。**全局串行**——一块 GPU 本来同时只能跑一个。
 
@@ -706,6 +762,19 @@ def generate(
     否则 Rust 那边只会拿到一段写着 `<tool_call>` 的文字，然后把它当成回答。
     """
     global _last_use
+    if _device == "mlx":
+        result = {"content": "", "reasoning_content": "", "tool_calls": []}
+        for kind, value in stream_generate(messages, max_tokens, temperature, tools, thinking):
+            if kind in ("delta", "reasoning"):
+                result["content" if kind == "delta" else "reasoning_content"] += value
+            elif kind == "tool_call":
+                for name, args in value:
+                    result["tool_calls"].append(_wire_tool_call(len(result["tool_calls"]), name, args))
+            else:
+                result.update(value)
+        return result
+    if thinking:
+        raise ValueError("此 PyTorch 后端尚未接入思考开关")
     import torch
 
     with _generate_lock:
@@ -747,6 +816,7 @@ def generate(
 def stream_generate(
     messages: list[dict], max_tokens: int, temperature: float,
     tools: list[dict] | None = None,
+    thinking: bool = False,
 ):
     """边生成边产出正文片段与工具调用，最后产出一次用量。
 
@@ -778,6 +848,24 @@ def stream_generate(
     # Python 会把它当成本函数的局部变量：赋值照做，模块全局那个纹丝不动，
     # 而看门狗看的就是全局那个——表现是"流式走完照样被当成空闲"。
     global _last_use
+    if _device == "mlx":
+        from mlx_backend import generate_events
+
+        with _generate_lock:
+            with _lock:
+                mdl, tok = _model, _tokenizer
+                _last_use = time.monotonic()
+            if mdl is None or tok is None:
+                raise RuntimeError(_model_error or "模型未加载")
+            try:
+                yield from generate_events(mdl, tok, messages, tools, max_tokens,
+                                           temperature, thinking, _TOOL_REMINDER)
+            finally:
+                with _lock:
+                    _last_use = time.monotonic()
+        return
+    if thinking:
+        raise ValueError("此 PyTorch 后端尚未接入思考开关")
     import torch
     from transformers import TextIteratorStreamer
 
@@ -888,7 +976,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _chunk(self, text: str) -> dict:
-        """正文片段。**形状要和 `agnes.rs::read_sse` 认的那个一致**：
+        """正文片段。**形状要和 `client.rs::read_sse` 认的那个一致**：
         它只认 `data:` 行，正文从 `choices[0].delta.content` 取。"""
         return {
             "id": "local-1",
@@ -903,7 +991,7 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _chunk_tool_calls(self, fragments: list[dict]) -> dict:
-        """工具调用的分片。**形状同样是 `agnes.rs` 定死的**：
+        """工具调用的分片。**形状同样是 `client.rs` 定死的**：
 
         - 每一片都在 `choices[0].delta.tool_calls` 里
         - 每片必须带 `index`——那边是 `BTreeMap<u64, ToolCallAccum>` 按它攒的，
@@ -927,9 +1015,10 @@ class Handler(BaseHTTPRequestHandler):
     def _stream(
         self, messages: list[dict], max_tokens: int, temperature: float,
         tools: list[dict] | None = None,
+        thinking: bool = False,
     ) -> None:
         """流式回一轮。"""
-        gen = stream_generate(messages, max_tokens, temperature, tools)
+        gen = stream_generate(messages, max_tokens, temperature, tools, thinking)
         # **先取第一段，再发响应头。**
         # 加载失败、权重不全这类错误都发生在第一个片段之前；那时候还没发头，
         # 就能老老实实回一个 500。一旦把头发出去，剩下的报错手段只有断开连接，
@@ -969,6 +1058,11 @@ class Handler(BaseHTTPRequestHandler):
                 if kind == "delta":
                     self._sse(self._chunk(val))
                     continue
+                if kind == "reasoning":
+                    chunk = self._chunk("")
+                    chunk["choices"][0]["delta"] = {"reasoning_content": val}
+                    self._sse(chunk)
+                    continue
                 if kind == "tool_call":
                     finish = "tool_calls"
                     for name, args in val:
@@ -1005,7 +1099,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": "local-1",
                     "object": "chat.completion.chunk",
                     "model": _model_name,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": val.get("finish_reason", finish)}],
                     "usage": None,
                 })
                 self._sse({
@@ -1029,7 +1123,7 @@ class Handler(BaseHTTPRequestHandler):
             # **头已经发出去了，HTTP 状态码这条退路没有了。**
             #
             # 还能做的只有一件：把原因塞进流里，让对面**报出来**。
-            # 这里发的是一段**JSON 字符串**（不是对象）——`agnes.rs` 的
+            # 这里发的是一段**JSON 字符串**（不是对象）——`client.rs` 的
             # `StreamChunk` 反序列化不了它，于是会把它当"解析不了的块"记下来，
             # 并在"既没有正文也没有工具调用"时**把原文带进错误信息**。
             #
@@ -1047,6 +1141,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                 pass
+        finally:
+            gen.close()
 
     def _warmup(self) -> None:
         """`/warmup`：**立刻返回**，加载扔给后台线程。
@@ -1088,7 +1184,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/health"):
             with _lock:
                 if _model is not None:
-                    self._send(200, {"status": "ok", "model": _model_name})
+                    self._send(200, {"status": "ok", "model": _model_name, "device": _device})
                 elif _model_error:
                     # **把原因报出来**，不要只说 unloaded。
                     #
@@ -1106,7 +1202,7 @@ class Handler(BaseHTTPRequestHandler):
                     # 曾经加载好、现在权重被空闲释放了。**这不是错误，
                     # 也不是"在加载"**：下一个请求会自己把它拉回来，
                     # 使用者什么都不用做。
-                    self._send(200, {"status": "idle", "model": _model_name})
+                    self._send(200, {"status": "idle", "model": _model_name, "device": _device})
                 else:
                     self._send(200, {"status": "loading", "model": _model_name})
             return
@@ -1131,32 +1227,57 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            req = json.loads(self.rfile.read(n) or b"{}")
+            if not 0 < n <= 1024 * 1024:
+                raise ValueError("请求体必须在 1 MiB 以内")
+            req = json.loads(self.rfile.read(n))
+            if not isinstance(req, dict):
+                raise ValueError("请求必须是 JSON 对象")
+            if req.get("model", _model_name) != _model_name:
+                raise ValueError("请求模型与当前加载模型不一致，请重启对应服务")
+            messages = req.get("messages")
+            if not isinstance(messages, list) or not messages or any(
+                not isinstance(m, dict) or m.get("role") not in ("system", "user", "assistant", "tool")
+                or (not isinstance(m.get("content"), str) and not (m.get("role") == "assistant" and m.get("tool_calls")))
+                for m in messages
+            ):
+                raise ValueError("需要非空的纯文本消息列表")
+            max_tokens = req.get("max_tokens", 512)
+            temperature = req.get("temperature", 0.7)
+            if type(max_tokens) is not int or not 1 <= max_tokens <= 8192:
+                raise ValueError("max_tokens 必须是 1–8192 的整数")
+            if type(temperature) not in (int, float) or not math.isfinite(temperature) or not 0 <= temperature <= 2:
+                raise ValueError("temperature 必须在 0–2 之间")
+            mode = req.get("thinking", {"type": "disabled"})
+            if not isinstance(mode, dict) or mode.get("type") not in ("enabled", "disabled"):
+                raise ValueError("thinking.type 必须是 enabled 或 disabled")
+            thinking = mode["type"] == "enabled"
+            tools = req.get("tools")
+            if tools is not None and (not isinstance(tools, list) or any(
+                not isinstance(t, dict) or not isinstance(t.get("function"), dict)
+                or not isinstance(t["function"].get("name"), str) or not t["function"]["name"]
+                for t in tools
+            )):
+                raise ValueError("tools 必须是带 function.name 的数组")
+            if tools and _model_name == "Qwen3.5-9B-4bit":
+                raise ValueError("本地 Qwen 仅提供聊天，不接受工具；助理任务请路由 DeepSeek")
         except Exception as e:  # noqa: BLE001
             self._send(400, {"error": f"bad request: {e}"})
             return
         # 没加载就先加载（第一个请求会慢，这是有意的：**空闲时不占显存**）
         if _model is None:
             load(_model_name, self.server.device)  # type: ignore[attr-defined]
-        messages = req.get("messages") or []
-        max_tokens = int(req.get("max_tokens") or 512)
-        temperature = float(req.get("temperature") or 0.7)
         # **`tools` 必须读进来。** 这一行以前不存在，于是请求带着工具清单
         # 进来、提示词里一个工具都没有，模型用散文回答，而 HTTP 200。
         # 见本文件顶部"工具调用"那一节。
-        tools = req.get("tools") or None
-        if tools is not None and not isinstance(tools, list):
-            self._send(400, {"error": f"tools 必须是数组，收到 {type(tools).__name__}"})
-            return
         if req.get("stream"):
             # **流式是必须支持的**：Rust 侧的工具循环只走流式
             # （`tool/runner.rs` 一律调 `think_stream`）。
             # 这里原来回 400 "not supported"，于是路由修好之后
             # 本地这条路依然一次也走不通。
-            self._stream(messages, max_tokens, temperature, tools)
+            self._stream(messages, max_tokens, temperature, tools, thinking)
             return
         try:
-            r = generate(messages, max_tokens, temperature, tools)
+            r = generate(messages, max_tokens, temperature, tools, thinking)
         except Exception as e:  # noqa: BLE001
             # **工具解析不了要如实报 500，不能退回一段正文。**
             # 退回去等于把"这一步什么都没做"包装成一个正常回答。
@@ -1172,6 +1293,8 @@ class Handler(BaseHTTPRequestHandler):
         }
         if r["tool_calls"]:
             message["tool_calls"] = r["tool_calls"]
+        if r.get("reasoning_content"):
+            message["reasoning_content"] = r["reasoning_content"]
         self._send(200, {
             "id": "local-1",
             "object": "chat.completion",
@@ -1179,7 +1302,7 @@ class Handler(BaseHTTPRequestHandler):
             "choices": [{
                 "index": 0,
                 "message": message,
-                "finish_reason": "tool_calls" if r["tool_calls"] else "stop",
+                "finish_reason": r.get("finish_reason", "tool_calls" if r["tool_calls"] else "stop"),
             }],
             "usage": {
                 "prompt_tokens": r["prompt_tokens"],
@@ -1199,11 +1322,12 @@ def main() -> int:
     ap.add_argument("--model", default="Qwen3-1.7B")
     ap.add_argument("--port", type=int, default=17872)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--device", default="auto", choices=("auto", "cuda", "mps", "cpu", "mlx"),
+                    help="Mac 量化聊天模型使用 mlx；PyTorch auto 选择 CUDA → MPS → CPU")
     ap.add_argument("--warmup", action="store_true",
                     help="启动时就加载（默认是第一个请求才加载）")
-    ap.add_argument("--idle-unload", type=float, default=600.0, metavar="SECONDS",
-                    help="空闲这么多秒之后释放显存（默认 600；0 = 关掉）")
+    ap.add_argument("--idle-unload", type=float, default=120.0, metavar="SECONDS",
+                    help="空闲这么多秒之后释放显存（默认 120；0 = 关掉）")
     args = ap.parse_args()
 
     if args.host not in ("127.0.0.1", "localhost", "::1"):

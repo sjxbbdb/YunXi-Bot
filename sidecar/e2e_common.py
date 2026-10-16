@@ -18,11 +18,20 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+
+
+def read_ledger(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    # JSONL按物理行分隔；邮件中的U+2028等合法字符串字符不能被splitlines拆开。
+    with path.open(encoding="utf-8") as source:
+        return [json.loads(line) for line in source]
 
 
 def real_home_dir() -> Path:

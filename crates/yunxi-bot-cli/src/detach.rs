@@ -73,6 +73,29 @@
 
 use std::process::{Child, Command};
 
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_service_does_not_share_the_callers_process_group() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "ps -o pgid= -p $$"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let child = spawn_detached(&mut cmd).unwrap();
+        let pid = child.id();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let pgid: u32 = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(pgid, pid, "后台服务必须有独立进程组，避免随终端退出被回收");
+    }
+}
+
 /// 分离启动：`cmd` 的 `creation_flags` / stdio 由调用方配好，
 /// 这里只负责**别让子进程继承调用方的管道**（理由见模块文档）。
 ///
@@ -88,9 +111,13 @@ pub fn spawn_detached(cmd: &mut Command) -> std::io::Result<Child> {
     }
     #[cfg(not(windows))]
     {
-        // 非 Windows 没有这个问题：std 在 fork 之后会把子进程的 0/1/2
-        // 换成它自己开的那些（`Stdio::null()` 走的是 dup2），
-        // 调用方的管道不会留在孙进程手里。
+        // 模型服务要跨终端会话存活，不能留在调用方被回收的进程组中。
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        cmd.stdin(std::process::Stdio::null());
         cmd.spawn()
     }
 }

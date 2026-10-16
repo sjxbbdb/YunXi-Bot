@@ -1,0 +1,2101 @@
+{
+  "base_model": "laya-multilingual",
+  "created_on": "2026-10-15",
+  "notes": [
+    "前32条及其原分组保持不变，已由用户认可。新增N01–N12为合成草案，全部待审核。",
+    "新场景只补训练覆盖；不把原验证、校准或测试组移入训练。",
+    "只有request进入模型输入，理由与标签不进入state。",
+    "此扩展仍不足以证明泛化或概率校准。"
+  ],
+  "parent_review_sha256": "7eba6999d78f1dc9296ebd05c87b8840b6fd8282897a9459e588977b06a2e60f",
+  "purpose": "human_review_before_training",
+  "review": {
+    "approved_at": "2026-10-15T12:38:51.007187+00:00",
+    "approved_sample_ids": [
+      "R01",
+      "R02",
+      "R03",
+      "R04",
+      "R05",
+      "R06",
+      "R07",
+      "R08",
+      "K01",
+      "K02",
+      "K03",
+      "K04",
+      "K05",
+      "K06",
+      "G01",
+      "G02",
+      "G03",
+      "G04",
+      "T01",
+      "T02",
+      "T03",
+      "T04",
+      "C01",
+      "C02",
+      "C03",
+      "C04",
+      "M01",
+      "M02",
+      "M03",
+      "M04",
+      "M05",
+      "M06"
+    ],
+    "draft_file_sha256": "a42771e3823e657d1fa63600ca9a3d8265e4bb72866f989bc84624bea95cf70f",
+    "message": "认可这32条标签，继续微调",
+    "reviewer": "user"
+  },
+  "samples": [
+    {
+      "area": "input",
+      "group_id": "support-only",
+      "id": "R01",
+      "proposal_reason": "明确只要陪伴，没有委托行动。",
+      "proposed_answers": {
+        "input_kind": "chat"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "input_kind",
+            "instructions": "这句话是要我办事，还是随口聊聊？",
+            "kind": {
+              "criteria": {
+                "chat": "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。不需要我动手做任何事，回一句话就够了只是引用台词、描述别人的命令而明确不要求执行时，也是闲聊。",
+                "task": "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "input": "今晚有点低落，先别给建议，陪我聊一会儿。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "input_kind": "chat"
+      },
+      "scenario": "今晚有点低落，先别给建议，陪我聊一会儿。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "input",
+      "group_id": "support-only",
+      "id": "R02",
+      "proposal_reason": "情绪前缀不取消润色任务。",
+      "proposed_answers": {
+        "input_kind": "task"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "input_kind",
+            "instructions": "这句话是要我办事，还是随口聊聊？",
+            "kind": {
+              "criteria": {
+                "chat": "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。不需要我动手做任何事，回一句话就够了只是引用台词、描述别人的命令而明确不要求执行时，也是闲聊。",
+                "task": "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "input": "今晚有点低落，先帮我把这段道歉的话润色一下：刚才语气重了。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "input_kind": "task"
+      },
+      "scenario": "今晚有点低落，先帮我把这段道歉的话润色一下：刚才语气重了。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "input",
+      "group_id": "quoted-command",
+      "id": "R03",
+      "proposal_reason": "转述不构成执行指令。",
+      "proposed_answers": {
+        "input_kind": "chat"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "input_kind",
+            "instructions": "这句话是要我办事，还是随口聊聊？",
+            "kind": {
+              "criteria": {
+                "chat": "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。不需要我动手做任何事，回一句话就够了只是引用台词、描述别人的命令而明确不要求执行时，也是闲聊。",
+                "task": "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "input": "电影里有人喊“把目录删掉”，我只是转述台词，不要执行。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "input_kind": "chat"
+      },
+      "scenario": "电影里有人喊“把目录删掉”，我只是转述台词，不要执行。",
+      "source": "synthetic_assistant_draft",
+      "split": "validation"
+    },
+    {
+      "area": "input",
+      "group_id": "quoted-command",
+      "id": "R04",
+      "proposal_reason": "明确从引用切换为实际委托。",
+      "proposed_answers": {
+        "input_kind": "task"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "input_kind",
+            "instructions": "这句话是要我办事，还是随口聊聊？",
+            "kind": {
+              "criteria": {
+                "chat": "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。不需要我动手做任何事，回一句话就够了只是引用台词、描述别人的命令而明确不要求执行时，也是闲聊。",
+                "task": "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "input": "不是在转述台词，我现在要你检查当前目录有没有临时文件。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "input_kind": "task"
+      },
+      "scenario": "不是在转述台词，我现在要你检查当前目录有没有临时文件。",
+      "source": "synthetic_assistant_draft",
+      "split": "validation"
+    },
+    {
+      "area": "input",
+      "group_id": "mixed-intent",
+      "id": "R05",
+      "proposal_reason": "情绪表达附带实际查询。",
+      "proposed_answers": {
+        "input_kind": "task"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "input_kind",
+            "instructions": "这句话是要我办事，还是随口聊聊？",
+            "kind": {
+              "criteria": {
+                "chat": "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。不需要我动手做任何事，回一句话就够了只是引用台词、描述别人的命令而明确不要求执行时，也是闲聊。",
+                "task": "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "input": "今天状态挺好，顺手帮我查一下附近图书馆的开放时间。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "input_kind": "task"
+      },
+      "scenario": "今天状态挺好，顺手帮我查一下附近图书馆的开放时间。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "input",
+      "group_id": "mixed-intent",
+      "id": "R06",
+      "proposal_reason": "明确延后任务，只请求聊天。",
+      "proposed_answers": {
+        "input_kind": "chat"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "input_kind",
+            "instructions": "这句话是要我办事，还是随口聊聊？",
+            "kind": {
+              "criteria": {
+                "chat": "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。不需要我动手做任何事，回一句话就够了只是引用台词、描述别人的命令而明确不要求执行时，也是闲聊。",
+                "task": "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "input": "今天状态挺好，去图书馆的事晚点再说，现在只想聊天。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "input_kind": "chat"
+      },
+      "scenario": "今天状态挺好，去图书馆的事晚点再说，现在只想聊天。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "input",
+      "group_id": "explicit-tool",
+      "id": "R07",
+      "proposal_reason": "明确要求工具证据。",
+      "proposed_answers": {
+        "input_kind": "task"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "input_kind",
+            "instructions": "这句话是要我办事，还是随口聊聊？",
+            "kind": {
+              "criteria": {
+                "chat": "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。不需要我动手做任何事，回一句话就够了只是引用台词、描述别人的命令而明确不要求执行时，也是闲聊。",
+                "task": "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "input": "用 now 查一下当前时刻，别凭印象回答。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "input_kind": "task"
+      },
+      "scenario": "用 now 查一下当前时刻，别凭印象回答。",
+      "source": "synthetic_assistant_draft",
+      "split": "test"
+    },
+    {
+      "area": "input",
+      "group_id": "explicit-tool",
+      "id": "R08",
+      "proposal_reason": "提到工具名称但明确否定执行。",
+      "proposed_answers": {
+        "input_kind": "chat"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "input_kind",
+            "instructions": "这句话是要我办事，还是随口聊聊？",
+            "kind": {
+              "criteria": {
+                "chat": "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。不需要我动手做任何事，回一句话就够了只是引用台词、描述别人的命令而明确不要求执行时，也是闲聊。",
+                "task": "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "input": "“用 now 查一下时间”只是我给教程举的例子，不用帮我查。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "input_kind": "chat"
+      },
+      "scenario": "“用 now 查一下时间”只是我给教程举的例子，不用帮我查。",
+      "source": "synthetic_assistant_draft",
+      "split": "test"
+    },
+    {
+      "area": "memory",
+      "group_id": "world-versus-profile",
+      "id": "K01",
+      "proposal_reason": "通用概念无需私人记忆。",
+      "proposed_answers": {
+        "memory_need": "none"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "memory_need",
+            "instructions": "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+            "kind": {
+              "criteria": {
+                "episode": "问的是他经历过的事：什么时候、当时、上次、最近一次",
+                "knowledge": "要查的是文档或资料库，而不是关于他的私人记忆",
+                "long_term": "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+                "mixed": "既有个人指代又涉及具体的事，两类都可能用得上",
+                "none": "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+                "profile": "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "使用者这一句": "散列函数通常用来做什么？"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "memory_need": "none"
+      },
+      "scenario": "散列函数通常用来做什么？",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "memory",
+      "group_id": "world-versus-profile",
+      "id": "K02",
+      "proposal_reason": "询问长期个人称呼。",
+      "proposed_answers": {
+        "memory_need": "profile"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "memory_need",
+            "instructions": "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+            "kind": {
+              "criteria": {
+                "episode": "问的是他经历过的事：什么时候、当时、上次、最近一次",
+                "knowledge": "要查的是文档或资料库，而不是关于他的私人记忆",
+                "long_term": "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+                "mixed": "既有个人指代又涉及具体的事，两类都可能用得上",
+                "none": "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+                "profile": "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "使用者这一句": "我习惯别人怎么称呼我来着？"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "memory_need": "profile"
+      },
+      "scenario": "我习惯别人怎么称呼我来着？",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "memory",
+      "group_id": "event-versus-reference",
+      "id": "K03",
+      "proposal_reason": "询问具体经历和时间。",
+      "proposed_answers": {
+        "memory_need": "episode"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "memory_need",
+            "instructions": "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+            "kind": {
+              "criteria": {
+                "episode": "问的是他经历过的事：什么时候、当时、上次、最近一次",
+                "knowledge": "要查的是文档或资料库，而不是关于他的私人记忆",
+                "long_term": "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+                "mixed": "既有个人指代又涉及具体的事，两类都可能用得上",
+                "none": "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+                "profile": "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "使用者这一句": "上次我们把打包问题修好是在什么时候？"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "memory_need": "episode"
+      },
+      "scenario": "上次我们把打包问题修好是在什么时候？",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "memory",
+      "group_id": "event-versus-reference",
+      "id": "K04",
+      "proposal_reason": "明确回指先前说过的内容。",
+      "proposed_answers": {
+        "memory_need": "long_term"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "memory_need",
+            "instructions": "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+            "kind": {
+              "criteria": {
+                "episode": "问的是他经历过的事：什么时候、当时、上次、最近一次",
+                "knowledge": "要查的是文档或资料库，而不是关于他的私人记忆",
+                "long_term": "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+                "mixed": "既有个人指代又涉及具体的事，两类都可能用得上",
+                "none": "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+                "profile": "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "使用者这一句": "你记得我之前提过的那个项目约束吗？"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "memory_need": "long_term"
+      },
+      "scenario": "你记得我之前提过的那个项目约束吗？",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "memory",
+      "group_id": "document-versus-mixed",
+      "id": "K05",
+      "proposal_reason": "资料库检索不等于私人记忆。",
+      "proposed_answers": {
+        "memory_need": "knowledge"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "memory_need",
+            "instructions": "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+            "kind": {
+              "criteria": {
+                "episode": "问的是他经历过的事：什么时候、当时、上次、最近一次",
+                "knowledge": "要查的是文档或资料库，而不是关于他的私人记忆",
+                "long_term": "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+                "mixed": "既有个人指代又涉及具体的事，两类都可能用得上",
+                "none": "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+                "profile": "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "使用者这一句": "在已导入的部署手册里找一下回滚步骤。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "memory_need": "knowledge"
+      },
+      "scenario": "在已导入的部署手册里找一下回滚步骤。",
+      "source": "synthetic_assistant_draft",
+      "split": "calibration"
+    },
+    {
+      "area": "memory",
+      "group_id": "document-versus-mixed",
+      "id": "K06",
+      "proposal_reason": "稳定偏好与具体经历均相关。",
+      "proposed_answers": {
+        "memory_need": "mixed"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "memory_need",
+            "instructions": "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+            "kind": {
+              "criteria": {
+                "episode": "问的是他经历过的事：什么时候、当时、上次、最近一次",
+                "knowledge": "要查的是文档或资料库，而不是关于他的私人记忆",
+                "long_term": "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+                "mixed": "既有个人指代又涉及具体的事，两类都可能用得上",
+                "none": "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+                "profile": "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "使用者这一句": "结合我平时的习惯和上次熬夜后的情况，帮我安排今晚。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "memory_need": "mixed"
+      },
+      "scenario": "结合我平时的习惯和上次熬夜后的情况，帮我安排今晚。",
+      "source": "synthetic_assistant_draft",
+      "split": "calibration"
+    },
+    {
+      "area": "tool",
+      "group_id": "read-versus-write",
+      "id": "G01",
+      "proposal_reason": "读取工作目录已有文本，没有写入或联网。",
+      "proposed_answers": {
+        "needs_human": "auto"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "needs_human",
+            "instructions": "这个动作该不该先问过使用者？",
+            "kind": {
+              "criteria": {
+                "ask": "需要询问：它会改变系统状态、或把信息发到外部",
+                "auto": "无需询问：它没有副作用，或者副作用完全在预期范围内"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "arguments": "{\"path\":\"/project/notes.txt\"}",
+          "capability": "只读",
+          "cwd": "/project",
+          "inside_cwd": true,
+          "scope": "/project/notes.txt",
+          "tool": "read_file"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "needs_human": "auto"
+      },
+      "scenario": "read_file：{'path': '/project/notes.txt'}",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "tool",
+      "group_id": "read-versus-write",
+      "id": "G02",
+      "proposal_reason": "写入改变状态，不能因路径在项目内就自动批准。",
+      "proposed_answers": {
+        "needs_human": "ask"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "needs_human",
+            "instructions": "这个动作该不该先问过使用者？",
+            "kind": {
+              "criteria": {
+                "ask": "需要询问：它会改变系统状态、或把信息发到外部",
+                "auto": "无需询问：它没有副作用，或者副作用完全在预期范围内"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "arguments": "{\"content\":\"替换现有内容\",\"path\":\"/project/notes.txt\"}",
+          "capability": "写入",
+          "cwd": "/project",
+          "inside_cwd": true,
+          "scope": "/project/notes.txt",
+          "tool": "write_file"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "needs_human": "ask"
+      },
+      "scenario": "write_file：{'path': '/project/notes.txt', 'content': '替换现有内容'}",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "tool",
+      "group_id": "local-versus-network",
+      "id": "G03",
+      "proposal_reason": "读取系统时间，无外发信息。",
+      "proposed_answers": {
+        "needs_human": "auto"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "needs_human",
+            "instructions": "这个动作该不该先问过使用者？",
+            "kind": {
+              "criteria": {
+                "ask": "需要询问：它会改变系统状态、或把信息发到外部",
+                "auto": "无需询问：它没有副作用，或者副作用完全在预期范围内"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "arguments": "{}",
+          "capability": "只读",
+          "cwd": "/project",
+          "inside_cwd": null,
+          "scope": null,
+          "tool": "now"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "needs_human": "auto"
+      },
+      "scenario": "now：{}",
+      "source": "synthetic_assistant_draft",
+      "split": "test"
+    },
+    {
+      "area": "tool",
+      "group_id": "local-versus-network",
+      "id": "G04",
+      "proposal_reason": "网络请求会向外部传送查询内容。",
+      "proposed_answers": {
+        "needs_human": "ask"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "needs_human",
+            "instructions": "这个动作该不该先问过使用者？",
+            "kind": {
+              "criteria": {
+                "ask": "需要询问：它会改变系统状态、或把信息发到外部",
+                "auto": "无需询问：它没有副作用，或者副作用完全在预期范围内"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "arguments": "{\"url\":\"https://example.invalid/lookup?q=project-plan\"}",
+          "capability": "网络",
+          "cwd": "/project",
+          "inside_cwd": false,
+          "scope": "https://example.invalid",
+          "tool": "web_fetch"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "needs_human": "ask"
+      },
+      "scenario": "web_fetch：{'url': 'https://example.invalid/lookup?q=project-plan'}",
+      "source": "synthetic_assistant_draft",
+      "split": "test"
+    },
+    {
+      "area": "task",
+      "group_id": "completion-evidence",
+      "id": "T01",
+      "proposal_reason": "模型的完成声明不能替代证据。",
+      "proposed_answers": {
+        "task_decision": "opt0"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "task_decision",
+            "instructions": "基于原始证据选择下一步。",
+            "kind": {
+              "criteria": {
+                "opt0": "核对文件差异并运行回归测试",
+                "opt1": "根据独立验证证据报告完成",
+                "opt2": "原样重复修改操作"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "context": {
+            "goal": "修复配置文件路径",
+            "inputs": [
+              [
+                "s1",
+                "生成模型声称已经修好，但没有实际修改回执或测试结果。"
+              ]
+            ]
+          },
+          "criteria": {
+            "opt0": "核对文件差异并运行回归测试",
+            "opt1": "根据独立验证证据报告完成",
+            "opt2": "原样重复修改操作"
+          },
+          "options": [
+            "opt0",
+            "opt1",
+            "opt2"
+          ],
+          "question": "基于原始证据选择下一步。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "task_decision": "opt0"
+      },
+      "scenario": "修复配置文件路径；证据：生成模型声称已经修好，但没有实际修改回执或测试结果。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "task",
+      "group_id": "completion-evidence",
+      "id": "T02",
+      "proposal_reason": "已有完整独立证据，无需重复修改。",
+      "proposed_answers": {
+        "task_decision": "opt1"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "task_decision",
+            "instructions": "基于原始证据选择下一步。",
+            "kind": {
+              "criteria": {
+                "opt0": "核对文件差异并运行回归测试",
+                "opt1": "根据独立验证证据报告完成",
+                "opt2": "原样重复修改操作"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "context": {
+            "goal": "修复配置文件路径",
+            "inputs": [
+              [
+                "s1",
+                "独立文件差异确认需求已覆盖，相关及全量测试通过，无剩余待办。"
+              ]
+            ]
+          },
+          "criteria": {
+            "opt0": "核对文件差异并运行回归测试",
+            "opt1": "根据独立验证证据报告完成",
+            "opt2": "原样重复修改操作"
+          },
+          "options": [
+            "opt0",
+            "opt1",
+            "opt2"
+          ],
+          "question": "基于原始证据选择下一步。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "task_decision": "opt1"
+      },
+      "scenario": "修复配置文件路径；证据：独立文件差异确认需求已覆盖，相关及全量测试通过，无剩余待办。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "task",
+      "group_id": "business-boundary",
+      "id": "T03",
+      "proposal_reason": "严格大于的边界已确定。",
+      "proposed_answers": {
+        "task_decision": "opt1"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "task_decision",
+            "instructions": "基于原始证据选择下一步。",
+            "kind": {
+              "criteria": {
+                "opt0": "按金额大于等于200免邮实现",
+                "opt1": "按金额严格大于200免邮实现",
+                "opt2": "先询问200元整是否免邮"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "context": {
+            "goal": "实现免邮规则",
+            "inputs": [
+              [
+                "s1",
+                "规则明确：超过200元免邮，200元整不免邮。"
+              ]
+            ]
+          },
+          "criteria": {
+            "opt0": "按金额大于等于200免邮实现",
+            "opt1": "按金额严格大于200免邮实现",
+            "opt2": "先询问200元整是否免邮"
+          },
+          "options": [
+            "opt0",
+            "opt1",
+            "opt2"
+          ],
+          "question": "基于原始证据选择下一步。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "task_decision": "opt1"
+      },
+      "scenario": "实现免邮规则；证据：规则明确：超过200元免邮，200元整不免邮。",
+      "source": "synthetic_assistant_draft",
+      "split": "validation"
+    },
+    {
+      "area": "task",
+      "group_id": "business-boundary",
+      "id": "T04",
+      "proposal_reason": "证据不足时选择已有澄清选项。",
+      "proposed_answers": {
+        "task_decision": "opt2"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "task_decision",
+            "instructions": "基于原始证据选择下一步。",
+            "kind": {
+              "criteria": {
+                "opt0": "按金额大于等于200免邮实现",
+                "opt1": "按金额严格大于200免邮实现",
+                "opt2": "先询问200元整是否免邮"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "context": {
+            "goal": "实现免邮规则",
+            "inputs": [
+              [
+                "s1",
+                "唯一规则是“200左右就免邮”，没有说明200元整如何处理。"
+              ]
+            ]
+          },
+          "criteria": {
+            "opt0": "按金额大于等于200免邮实现",
+            "opt1": "按金额严格大于200免邮实现",
+            "opt2": "先询问200元整是否免邮"
+          },
+          "options": [
+            "opt0",
+            "opt1",
+            "opt2"
+          ],
+          "question": "基于原始证据选择下一步。"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "task_decision": "opt2"
+      },
+      "scenario": "实现免邮规则；证据：唯一规则是“200左右就免邮”，没有说明200元整如何处理。",
+      "source": "synthetic_assistant_draft",
+      "split": "validation"
+    },
+    {
+      "area": "companion",
+      "group_id": "companion-evidence",
+      "id": "C01",
+      "proposal_reason": "沉默本身不是异常或支持请求。",
+      "proposed_answers": {
+        "intervention": "quiet",
+        "is_anomaly": false,
+        "needs_support": false
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "intervention",
+            "instructions": "此刻应当如何介入？",
+            "kind": {
+              "criteria": {
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可",
+                "speak": "有值得主动说明的信息，且现在说不会打扰"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_support",
+            "instructions": "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？",
+            "kind": {
+              "type": "noul"
+            }
+          },
+          {
+            "id": "is_anomaly",
+            "instructions": "近期的运行结果中是否出现了显著偏离常态、需要人知道的情况？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "interventions_today": 0,
+          "minutes_since_last_interaction": 40,
+          "quiet_hours": false,
+          "recent_failures": 0,
+          "relationship_stage": "初期",
+          "unread_events": 0
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "intervention": "quiet",
+        "is_anomaly": false,
+        "needs_support": false
+      },
+      "scenario": "40分钟没互动，没有新事件或失败。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "companion",
+      "group_id": "companion-evidence",
+      "id": "C02",
+      "proposal_reason": "有明确陪伴请求，但不是运行异常。",
+      "proposed_answers": {
+        "intervention": "speak",
+        "is_anomaly": false,
+        "needs_support": true
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "intervention",
+            "instructions": "此刻应当如何介入？",
+            "kind": {
+              "criteria": {
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可",
+                "speak": "有值得主动说明的信息，且现在说不会打扰"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_support",
+            "instructions": "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？",
+            "kind": {
+              "type": "noul"
+            }
+          },
+          {
+            "id": "is_anomaly",
+            "instructions": "近期的运行结果中是否出现了显著偏离常态、需要人知道的情况？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "interventions_today": 0,
+          "minutes_since_last_interaction": 40,
+          "quiet_hours": false,
+          "recent_events": [
+            "刚刚：用户说今天受了委屈，想让你陪着聊几句。"
+          ],
+          "recent_failures": 0,
+          "relationship_stage": "初期",
+          "unread_events": 0
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "intervention": "speak",
+        "is_anomaly": false,
+        "needs_support": true
+      },
+      "scenario": "用户刚明确表达难受并请求陪聊，无运行故障。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "companion",
+      "group_id": "companion-failure",
+      "id": "C03",
+      "proposal_reason": "新阻塞需要说明，不凭故障推断情绪支持需求。",
+      "proposed_answers": {
+        "intervention": "speak",
+        "is_anomaly": true,
+        "needs_support": false
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "intervention",
+            "instructions": "此刻应当如何介入？",
+            "kind": {
+              "criteria": {
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可",
+                "speak": "有值得主动说明的信息，且现在说不会打扰"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_support",
+            "instructions": "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？",
+            "kind": {
+              "type": "noul"
+            }
+          },
+          {
+            "id": "is_anomaly",
+            "instructions": "近期的运行结果中是否出现了显著偏离常态、需要人知道的情况？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "interventions_today": 0,
+          "minutes_since_last_interaction": 40,
+          "quiet_hours": false,
+          "recent_events": [
+            "刚刚：构建连续失败，提示本机SDK缺失；需要用户决定安装或暂停，尚未告知。"
+          ],
+          "recent_failures": 3,
+          "relationship_stage": "初期",
+          "unread_events": 3
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "intervention": "speak",
+        "is_anomaly": true,
+        "needs_support": false
+      },
+      "scenario": "连续构建失败，缺少SDK，需要用户决定；尚未告知。",
+      "source": "synthetic_assistant_draft",
+      "split": "calibration"
+    },
+    {
+      "area": "companion",
+      "group_id": "companion-failure",
+      "id": "C04",
+      "proposal_reason": "保留异常信息，延迟表达；确定性免打扰仍独立生效。",
+      "proposed_answers": {
+        "intervention": "hold",
+        "is_anomaly": true,
+        "needs_support": false
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "intervention",
+            "instructions": "此刻应当如何介入？",
+            "kind": {
+              "criteria": {
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可",
+                "speak": "有值得主动说明的信息，且现在说不会打扰"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_support",
+            "instructions": "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？",
+            "kind": {
+              "type": "noul"
+            }
+          },
+          {
+            "id": "is_anomaly",
+            "instructions": "近期的运行结果中是否出现了显著偏离常态、需要人知道的情况？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "interventions_today": 0,
+          "minutes_since_last_interaction": 40,
+          "preferences": [
+            "当前专注时段内，非紧急结果等专注结束再说。"
+          ],
+          "quiet_hours": true,
+          "recent_events": [
+            "刚刚：后台样式检查失败，已确认不影响当前工作，没有临近期限，稍后处理即可。"
+          ],
+          "recent_failures": 3,
+          "relationship_stage": "初期",
+          "unread_events": 3
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "intervention": "hold",
+        "is_anomaly": true,
+        "needs_support": false
+      },
+      "scenario": "专注时段出现非紧急检查失败，已有偏好要求稍后再说。",
+      "source": "synthetic_assistant_draft",
+      "split": "calibration"
+    },
+    {
+      "area": "mail",
+      "group_id": "meeting-deadline",
+      "id": "M01",
+      "proposal_reason": "当前10点，临近且需要本人确认。",
+      "proposed_answers": {
+        "needs_action": true,
+        "triage": "speak"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "triage",
+            "instructions": "这一封邮件此刻应当如何处置？",
+            "kind": {
+              "criteria": {
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提",
+                "speak": "值得现在就告诉使用者，晚了他会不方便"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_action",
+            "instructions": "这封邮件是否明确需要使用者本人做一件事（而不只是知会他）？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "addressed_directly": true,
+          "age_minutes": 1,
+          "direct": true,
+          "from_addr": "sender@example.invalid",
+          "from_name": "测试联系人",
+          "has_attachments": false,
+          "local_hour": 10,
+          "now_ms": 1792029600000,
+          "preview": "你今天10:20参加的面谈临时换到二号楼，请马上确认是否看到。",
+          "received_at_known": true,
+          "received_at_ms": 1792029540000,
+          "recipient_count": 1,
+          "subject": "面谈地点变更"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "needs_action": true,
+        "triage": "speak"
+      },
+      "scenario": "面谈地点变更：你今天10:20参加的面谈临时换到二号楼，请马上确认是否看到。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "mail",
+      "group_id": "meeting-deadline",
+      "id": "M02",
+      "proposal_reason": "需要后续确认，但无需现在打断。",
+      "proposed_answers": {
+        "needs_action": true,
+        "triage": "hold"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "triage",
+            "instructions": "这一封邮件此刻应当如何处置？",
+            "kind": {
+              "criteria": {
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提",
+                "speak": "值得现在就告诉使用者，晚了他会不方便"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_action",
+            "instructions": "这封邮件是否明确需要使用者本人做一件事（而不只是知会他）？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "addressed_directly": true,
+          "age_minutes": 1,
+          "direct": true,
+          "from_addr": "sender@example.invalid",
+          "from_name": "测试联系人",
+          "has_attachments": false,
+          "local_hour": 10,
+          "now_ms": 1792029600000,
+          "preview": "你下周参加的面谈改到二号楼，下周一前确认即可，今天不用急。",
+          "received_at_known": true,
+          "received_at_ms": 1792029540000,
+          "recipient_count": 1,
+          "subject": "下周面谈安排"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "needs_action": true,
+        "triage": "hold"
+      },
+      "scenario": "下周面谈安排：你下周参加的面谈改到二号楼，下周一前确认即可，今天不用急。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "mail",
+      "group_id": "quoted-urgency",
+      "id": "M03",
+      "proposal_reason": "引用的紧急词不代表当前待办。",
+      "proposed_answers": {
+        "needs_action": false,
+        "triage": "hold"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "triage",
+            "instructions": "这一封邮件此刻应当如何处置？",
+            "kind": {
+              "criteria": {
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提",
+                "speak": "值得现在就告诉使用者，晚了他会不方便"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_action",
+            "instructions": "这封邮件是否明确需要使用者本人做一件事（而不只是知会他）？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "addressed_directly": true,
+          "age_minutes": 1,
+          "direct": true,
+          "from_addr": "sender@example.invalid",
+          "from_name": "测试联系人",
+          "has_attachments": false,
+          "local_hour": 10,
+          "now_ms": 1792029600000,
+          "preview": "问题已解决，仅供下月复盘，无需操作。引用旧邮件：紧急，十分钟内修复！",
+          "received_at_known": true,
+          "received_at_ms": 1792029540000,
+          "recipient_count": 1,
+          "subject": "问题处理完毕"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "needs_action": false,
+        "triage": "hold"
+      },
+      "scenario": "问题处理完毕：问题已解决，仅供下月复盘，无需操作。引用旧邮件：紧急，十分钟内修复！",
+      "source": "synthetic_assistant_draft",
+      "split": "validation"
+    },
+    {
+      "area": "mail",
+      "group_id": "quoted-urgency",
+      "id": "M04",
+      "proposal_reason": "当前正文包含紧迫未解决责任。",
+      "proposed_answers": {
+        "needs_action": true,
+        "triage": "speak"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "triage",
+            "instructions": "这一封邮件此刻应当如何处置？",
+            "kind": {
+              "criteria": {
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提",
+                "speak": "值得现在就告诉使用者，晚了他会不方便"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_action",
+            "instructions": "这封邮件是否明确需要使用者本人做一件事（而不只是知会他）？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "addressed_directly": true,
+          "age_minutes": 1,
+          "direct": true,
+          "from_addr": "sender@example.invalid",
+          "from_name": "测试联系人",
+          "has_attachments": false,
+          "local_hour": 10,
+          "now_ms": 1792029600000,
+          "preview": "问题仍未解决，你负责的发布十分钟后开始，请立刻确认是否回滚。",
+          "received_at_known": true,
+          "received_at_ms": 1792029540000,
+          "recipient_count": 1,
+          "subject": "仍需立即处理"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "needs_action": true,
+        "triage": "speak"
+      },
+      "scenario": "仍需立即处理：问题仍未解决，你负责的发布十分钟后开始，请立刻确认是否回滚。",
+      "source": "synthetic_assistant_draft",
+      "split": "validation"
+    },
+    {
+      "area": "mail",
+      "group_id": "mail-relevance",
+      "id": "M05",
+      "proposal_reason": "无相关事项，无需提及。",
+      "proposed_answers": {
+        "needs_action": false,
+        "triage": "quiet"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "triage",
+            "instructions": "这一封邮件此刻应当如何处置？",
+            "kind": {
+              "criteria": {
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提",
+                "speak": "值得现在就告诉使用者，晚了他会不方便"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_action",
+            "instructions": "这封邮件是否明确需要使用者本人做一件事（而不只是知会他）？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "addressed_directly": true,
+          "age_minutes": 1,
+          "direct": true,
+          "from_addr": "sender@example.invalid",
+          "from_name": "测试联系人",
+          "has_attachments": false,
+          "local_hour": 10,
+          "now_ms": 1792029600000,
+          "preview": "这是面向所有人的旅游促销广告，没有你的报名或需要你处理的事项。",
+          "received_at_known": true,
+          "received_at_ms": 1792029540000,
+          "recipient_count": 1,
+          "subject": "活动推广"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "needs_action": false,
+        "triage": "quiet"
+      },
+      "scenario": "活动推广：这是面向所有人的旅游促销广告，没有你的报名或需要你处理的事项。",
+      "source": "synthetic_assistant_draft",
+      "split": "calibration"
+    },
+    {
+      "area": "mail",
+      "group_id": "mail-relevance",
+      "id": "M06",
+      "proposal_reason": "有订阅相关性但没有立即行动要求。",
+      "proposed_answers": {
+        "needs_action": false,
+        "triage": "hold"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "triage",
+            "instructions": "这一封邮件此刻应当如何处置？",
+            "kind": {
+              "criteria": {
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提",
+                "speak": "值得现在就告诉使用者，晚了他会不方便"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_action",
+            "instructions": "这封邮件是否明确需要使用者本人做一件事（而不只是知会他）？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "addressed_directly": true,
+          "age_minutes": 1,
+          "direct": true,
+          "from_addr": "sender@example.invalid",
+          "from_name": "测试联系人",
+          "has_attachments": false,
+          "local_hour": 10,
+          "now_ms": 1792029600000,
+          "preview": "这是你订阅的下月开发者活动议程，仅供参考，暂时不需要回复或报名。",
+          "received_at_known": true,
+          "received_at_ms": 1792029540000,
+          "recipient_count": 1,
+          "subject": "你订阅的技术活动议程"
+        }
+      },
+      "review_status": "approved",
+      "reviewed_answers": {
+        "needs_action": false,
+        "triage": "hold"
+      },
+      "scenario": "你订阅的技术活动议程：这是你订阅的下月开发者活动议程，仅供参考，暂时不需要回复或报名。",
+      "source": "synthetic_assistant_draft",
+      "split": "calibration"
+    },
+    {
+      "area": "memory",
+      "group_id": "recipe-reference",
+      "id": "N01",
+      "proposal_reason": "查询公共资料内容，不翻私人偏好。",
+      "proposed_answers": {
+        "memory_need": "knowledge"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "memory_need",
+            "instructions": "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+            "kind": {
+              "criteria": {
+                "episode": "问的是他经历过的事：什么时候、当时、上次、最近一次",
+                "knowledge": "要查的是文档或资料库，而不是关于他的私人记忆",
+                "long_term": "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+                "mixed": "既有个人指代又涉及具体的事，两类都可能用得上",
+                "none": "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+                "profile": "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "使用者这一句": "在导入的菜谱中找三人份番茄汤的用料，不需要参考我的口味。"
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "在导入的菜谱中找三人份番茄汤的用料，不需要参考我的口味。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "memory",
+      "group_id": "camera-reference",
+      "id": "N02",
+      "proposal_reason": "问的是设备文档。",
+      "proposed_answers": {
+        "memory_need": "knowledge"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "memory_need",
+            "instructions": "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+            "kind": {
+              "criteria": {
+                "episode": "问的是他经历过的事：什么时候、当时、上次、最近一次",
+                "knowledge": "要查的是文档或资料库，而不是关于他的私人记忆",
+                "long_term": "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+                "mixed": "既有个人指代又涉及具体的事，两类都可能用得上",
+                "none": "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+                "profile": "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "使用者这一句": "用已经导入的相机说明书查错误码E42的解释。"
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "用已经导入的相机说明书查错误码E42的解释。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "memory",
+      "group_id": "meal-personal-history",
+      "id": "N03",
+      "proposal_reason": "长期偏好和具体经历都被明确提及。",
+      "proposed_answers": {
+        "memory_need": "mixed"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "memory_need",
+            "instructions": "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+            "kind": {
+              "criteria": {
+                "episode": "问的是他经历过的事：什么时候、当时、上次、最近一次",
+                "knowledge": "要查的是文档或资料库，而不是关于他的私人记忆",
+                "long_term": "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+                "mixed": "既有个人指代又涉及具体的事，两类都可能用得上",
+                "none": "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+                "profile": "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "使用者这一句": "结合我平常的口味和前天晚餐后不舒服的经历，帮我想想今晚吃什么。"
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "结合我平常的口味和前天晚餐后不舒服的经历，帮我想想今晚吃什么。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "memory",
+      "group_id": "trip-personal-history",
+      "id": "N04",
+      "proposal_reason": "个人习惯与过去事件均相关。",
+      "proposed_answers": {
+        "memory_need": "mixed"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "memory_need",
+            "instructions": "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+            "kind": {
+              "criteria": {
+                "episode": "问的是他经历过的事：什么时候、当时、上次、最近一次",
+                "knowledge": "要查的是文档或资料库，而不是关于他的私人记忆",
+                "long_term": "他明确回指自己说过的话：「我说过」「你记得」「之前提的那个」",
+                "mixed": "既有个人指代又涉及具体的事，两类都可能用得上",
+                "none": "问的是世界：概念、原理、命令用法、通用知识。跟「他是谁」无关",
+                "profile": "问的是使用者本人：怎么称呼、喜欢什么、住在哪、有什么习惯"
+              },
+              "type": "choice"
+            }
+          }
+        ],
+        "state": {
+          "使用者这一句": "参考我平时的出行习惯，以及上次旅途中临时改票的经历，整理这次出门的准备事项。"
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "参考我平时的出行习惯，以及上次旅途中临时改票的经历，整理这次出门的准备事项。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "companion",
+      "group_id": "storage-health",
+      "id": "N05",
+      "proposal_reason": "有新的运行异常需要说明，不据此推断情绪支持需求。",
+      "proposed_answers": {
+        "intervention": "speak",
+        "is_anomaly": true,
+        "needs_support": false
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "intervention",
+            "instructions": "此刻应当如何介入？",
+            "kind": {
+              "criteria": {
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可",
+                "speak": "有值得主动说明的信息，且现在说不会打扰"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_support",
+            "instructions": "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？",
+            "kind": {
+              "type": "noul"
+            }
+          },
+          {
+            "id": "is_anomaly",
+            "instructions": "近期的运行结果中是否出现了显著偏离常态、需要人知道的情况？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "interventions_today": 0,
+          "minutes_since_last_interaction": 40,
+          "quiet_hours": false,
+          "recent_events": [
+            "刚刚：备份连续失败，磁盘空间已耗尽；当前工作无法继续保存，需要用户选择腾出空间或暂停，尚未告知。"
+          ],
+          "recent_failures": 2,
+          "relationship_stage": "初期",
+          "unread_events": 2
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "磁盘已满，当前工作无法保存，新阻塞尚未告知。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "companion",
+      "group_id": "storage-health",
+      "id": "N06",
+      "proposal_reason": "正常运行与沉默均不构成主动打扰依据。",
+      "proposed_answers": {
+        "intervention": "quiet",
+        "is_anomaly": false,
+        "needs_support": false
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "intervention",
+            "instructions": "此刻应当如何介入？",
+            "kind": {
+              "criteria": {
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可",
+                "speak": "有值得主动说明的信息，且现在说不会打扰"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_support",
+            "instructions": "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？",
+            "kind": {
+              "type": "noul"
+            }
+          },
+          {
+            "id": "is_anomaly",
+            "instructions": "近期的运行结果中是否出现了显著偏离常态、需要人知道的情况？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "facts": [
+            "磁盘空间充足。"
+          ],
+          "interventions_today": 0,
+          "minutes_since_last_interaction": 40,
+          "quiet_hours": false,
+          "recent_events": [
+            "最近两次备份均成功，没有待告知的变化或用户请求。"
+          ],
+          "recent_failures": 0,
+          "relationship_stage": "初期",
+          "unread_events": 0
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "磁盘空间充足，备份正常，无新事项。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "companion",
+      "group_id": "focused-export",
+      "id": "N07",
+      "proposal_reason": "保留需告知的异常，等约定时机再说。",
+      "proposed_answers": {
+        "intervention": "hold",
+        "is_anomaly": true,
+        "needs_support": false
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "intervention",
+            "instructions": "此刻应当如何介入？",
+            "kind": {
+              "criteria": {
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可",
+                "speak": "有值得主动说明的信息，且现在说不会打扰"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_support",
+            "instructions": "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？",
+            "kind": {
+              "type": "noul"
+            }
+          },
+          {
+            "id": "is_anomaly",
+            "instructions": "近期的运行结果中是否出现了显著偏离常态、需要人知道的情况？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "interventions_today": 0,
+          "minutes_since_last_interaction": 40,
+          "preferences": [
+            "本次专注期间，非紧急结果等结束后集中告诉我。"
+          ],
+          "quiet_hours": true,
+          "recent_events": [
+            "刚刚：一张测试图片导出失败，其余已完成；不影响当前工作，没有临近期限，失败还未告知。"
+          ],
+          "recent_failures": 1,
+          "relationship_stage": "初期",
+          "unread_events": 1
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "专注期间出现非紧急图片导出失败，用户要求结束后集中告知。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "companion",
+      "group_id": "focused-export",
+      "id": "N08",
+      "proposal_reason": "有待告知结果但没有异常，遵守告知时机。",
+      "proposed_answers": {
+        "intervention": "hold",
+        "is_anomaly": false,
+        "needs_support": false
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "intervention",
+            "instructions": "此刻应当如何介入？",
+            "kind": {
+              "criteria": {
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可",
+                "speak": "有值得主动说明的信息，且现在说不会打扰"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_support",
+            "instructions": "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？",
+            "kind": {
+              "type": "noul"
+            }
+          },
+          {
+            "id": "is_anomaly",
+            "instructions": "近期的运行结果中是否出现了显著偏离常态、需要人知道的情况？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "interventions_today": 0,
+          "minutes_since_last_interaction": 40,
+          "preferences": [
+            "本次专注期间，非紧急结果等结束后集中告诉我。"
+          ],
+          "quiet_hours": true,
+          "recent_events": [
+            "刚刚：请求的测试图片全部导出成功，用户要求在专注结束后告知，当前仍在专注时段。"
+          ],
+          "recent_failures": 0,
+          "relationship_stage": "初期",
+          "unread_events": 1
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "导出全部成功，用户要求专注结束后再告知，目前尚未结束。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "mail",
+      "group_id": "delivery-receipt",
+      "id": "N09",
+      "proposal_reason": "与本人有关的记录，可以稍后查看，无需本人操作。",
+      "proposed_answers": {
+        "needs_action": false,
+        "triage": "hold"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "triage",
+            "instructions": "这一封邮件此刻应当如何处置？",
+            "kind": {
+              "criteria": {
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提",
+                "speak": "值得现在就告诉使用者，晚了他会不方便"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_action",
+            "instructions": "这封邮件是否明确需要使用者本人做一件事（而不只是知会他）？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "addressed_directly": true,
+          "age_minutes": 1,
+          "direct": true,
+          "from_addr": "sender@example.invalid",
+          "from_name": "测试联系人",
+          "has_attachments": false,
+          "local_hour": 10,
+          "now_ms": 1792029600000,
+          "preview": "你的配件已在约定地点交付完成，仅供留存，无需签收、确认或回复。",
+          "received_at_known": true,
+          "received_at_ms": 1792029540000,
+          "recipient_count": 1,
+          "subject": "你购买的配件已送达"
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "你购买的配件已送达：你的配件已在约定地点交付完成，仅供留存，无需签收、确认或回复。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "mail",
+      "group_id": "delivery-receipt",
+      "id": "N10",
+      "proposal_reason": "当前内容明确与使用者无关，无需提及或行动。",
+      "proposed_answers": {
+        "needs_action": false,
+        "triage": "quiet"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "triage",
+            "instructions": "这一封邮件此刻应当如何处置？",
+            "kind": {
+              "criteria": {
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提",
+                "speak": "值得现在就告诉使用者，晚了他会不方便"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_action",
+            "instructions": "这封邮件是否明确需要使用者本人做一件事（而不只是知会他）？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "addressed_directly": true,
+          "age_minutes": 1,
+          "direct": true,
+          "from_addr": "sender@example.invalid",
+          "from_name": "测试联系人",
+          "has_attachments": false,
+          "local_hour": 10,
+          "now_ms": 1792029600000,
+          "preview": "上一封是其他收件人的包裹记录，与你无关，请忽略，不需要任何操作。",
+          "received_at_known": true,
+          "received_at_ms": 1792029540000,
+          "recipient_count": 1,
+          "subject": "误发的他人配送记录"
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "误发的他人配送记录：上一封是其他收件人的包裹记录，与你无关，请忽略，不需要任何操作。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "mail",
+      "group_id": "service-bulletin",
+      "id": "N11",
+      "proposal_reason": "无业务信息的测试噪音，无需行动。",
+      "proposed_answers": {
+        "needs_action": false,
+        "triage": "quiet"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "triage",
+            "instructions": "这一封邮件此刻应当如何处置？",
+            "kind": {
+              "criteria": {
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提",
+                "speak": "值得现在就告诉使用者，晚了他会不方便"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_action",
+            "instructions": "这封邮件是否明确需要使用者本人做一件事（而不只是知会他）？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "addressed_directly": true,
+          "age_minutes": 1,
+          "direct": true,
+          "from_addr": "sender@example.invalid",
+          "from_name": "测试联系人",
+          "has_attachments": false,
+          "local_hour": 10,
+          "now_ms": 1792029600000,
+          "preview": "这是一封自动连通性测试邮件，无业务内容，无需确认或回复。",
+          "received_at_known": true,
+          "received_at_ms": 1792029540000,
+          "recipient_count": 1,
+          "subject": "测试通知"
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "测试通知：这是一封自动连通性测试邮件，无业务内容，无需确认或回复。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    },
+    {
+      "area": "mail",
+      "group_id": "service-bulletin",
+      "id": "N12",
+      "proposal_reason": "订阅信息有关联但不紧急，也没有本人待办。",
+      "proposed_answers": {
+        "needs_action": false,
+        "triage": "hold"
+      },
+      "request": {
+        "questions": [
+          {
+            "id": "triage",
+            "instructions": "这一封邮件此刻应当如何处置？",
+            "kind": {
+              "criteria": {
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提",
+                "speak": "值得现在就告诉使用者，晚了他会不方便"
+              },
+              "type": "choice"
+            }
+          },
+          {
+            "id": "needs_action",
+            "instructions": "这封邮件是否明确需要使用者本人做一件事（而不只是知会他）？",
+            "kind": {
+              "type": "noul"
+            }
+          }
+        ],
+        "state": {
+          "addressed_directly": true,
+          "age_minutes": 1,
+          "direct": true,
+          "from_addr": "sender@example.invalid",
+          "from_name": "测试联系人",
+          "has_attachments": false,
+          "local_hour": 10,
+          "now_ms": 1792029600000,
+          "preview": "这是你订阅的软件月度更新说明，仅供参考。本次没有紧急修复，不要求升级或回复。",
+          "received_at_known": true,
+          "received_at_ms": 1792029540000,
+          "recipient_count": 1,
+          "subject": "你订阅的月度更新记录"
+        }
+      },
+      "review_status": "pending",
+      "reviewed_answers": null,
+      "scenario": "你订阅的月度更新记录：这是你订阅的软件月度更新说明，仅供参考。本次没有紧急修复，不要求升级或回复。",
+      "source": "synthetic_assistant_draft",
+      "split": "train"
+    }
+  ],
+  "schema_version": 2,
+  "source": "synthetic_assistant_draft"
+}

@@ -77,7 +77,7 @@ def one_run(bin_path: str, real_home: Path, index: int) -> dict:
     try:
         home = root / "home"
         (home / "secrets").mkdir(parents=True)
-        for n in ("agnes.key", "deepseek.key", "bocha.key"):
+        for n in ("deepseek.key", "bocha.key"):
             src = real_home / "secrets" / n
             if src.exists():
                 shutil.copy(src, home / "secrets" / n)
@@ -189,8 +189,8 @@ def main() -> int:
     real_home = real_home_dir()
     # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
     before_home = snapshot_home(real_home)
-    if not (real_home / "secrets" / "agnes.key").exists():
-        print("没有 agnes.key", file=sys.stderr)
+    if not (real_home / "secrets" / "deepseek.key").exists():
+        print("没有 deepseek.key", file=sys.stderr)
         return 2
 
     print(f"=== 同一个真实任务跑 {n} 次 ===")

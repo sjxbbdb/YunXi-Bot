@@ -226,6 +226,7 @@ pub struct ToolRunner<'a> {
     ///
     /// `None` 表示不指定（不发这个字段），**不是"关"**。
     thinking: Option<crate::think::Thinking>,
+    defer_questions: bool,
     /// 工具调用的去处。`None` 表示不记录——**测试与纯计算场景的显式选择**。
     sink: Option<std::sync::Arc<dyn ToolCallSink>>,
     /// 正文增量的去处。`None` 表示不流式（一次性拿到完整正文）。
@@ -365,6 +366,7 @@ impl<'a> ToolRunner<'a> {
             decider: None,
             ctx,
             thinking: None,
+            defer_questions: false,
             sink: None,
             on_delta: None,
             // **不挂就是不记。** 默认塞一本"丢掉一切"的假台账会更坏：
@@ -373,6 +375,12 @@ impl<'a> ToolRunner<'a> {
             decision_ledger: None,
             max_rounds: DEFAULT_MAX_ROUNDS,
         }
+    }
+
+    /// 配合 AskUserTool::deferred 让出当前轮，同批动作不能使用尚未得到的答案。
+    pub fn with_deferred_questions(mut self) -> Self {
+        self.defer_questions = true;
+        self
     }
 
     /// 设定正文增量的去处。
@@ -464,7 +472,8 @@ impl<'a> ToolRunner<'a> {
                 req = req.with_thinking(t);
             }
             if !specs.is_empty() {
-                req = req.with_tools(specs.clone());
+                // 工具参数需要稳定；不沿用服务端面向自由生成的默认采样。
+                req = req.with_tools(specs.clone()).with_temperature(0.0);
             }
 
             // **走流式入口。** 不支持的 Thinker 会退化成一次性返回
@@ -527,8 +536,47 @@ impl<'a> ToolRunner<'a> {
             //
             // 判定必须串行：审批是 `&mut`，而且同时弹三个审批框
             // 使用者根本不知道自己在批哪一条。
-            let decided: Vec<Decided<'a>> = reqs.iter().map(|tr| self.decide_one(tr)).collect();
+            let question = self
+                .defer_questions
+                .then(|| reqs.iter().position(|tr| tr.name == "ask_user"))
+                .flatten();
+            let decided: Vec<Decided<'a>> = reqs
+                .iter()
+                .enumerate()
+                .map(|(index, tr)| {
+                    if question.is_some_and(|q| q != index) {
+                        Decided::Settled(ToolCallRecord {
+                            tool: tr.name.clone(),
+                            arguments: tr.arguments.clone(),
+                            capability: self
+                                .registry
+                                .get(&tr.name)
+                                .map_or(Capability::Unknown, |t| t.capability()),
+                            decision: GateDecision::Deny {
+                                reason: "本轮正在追问，其他工具等待用户回答后重新提出".into(),
+                            },
+                            output: None,
+                            started_at_ms: 0,
+                            duration_ms: 0,
+                        })
+                    } else {
+                        self.decide_one(tr)
+                    }
+                })
+                .collect();
             let records = self.execute_batch(decided);
+            let waiting = question
+                .and_then(|index| records.get(index))
+                .and_then(|r| r.output.as_ref())
+                .and_then(|out| out.as_ref().ok())
+                .and_then(|out| serde_json::from_str::<Value>(out).ok())
+                .filter(|out| out["waiting_for_user"] == true)
+                .and_then(|out| {
+                    out["display"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
+                });
 
             for (tr, record) in reqs.into_iter().zip(records) {
                 // **每一次调用都交给 sink。**
@@ -549,6 +597,18 @@ impl<'a> ToolRunner<'a> {
                 let text = render_tool_result(&record);
                 calls.push(record);
                 layout.push_raw(Message::tool_result(tr.id.clone(), text));
+            }
+            if let Some(text) = waiting {
+                layout.push_raw(Message::assistant(text.clone()));
+                if let Some(emit) = &self.on_delta {
+                    emit(&format!("\n{text}"));
+                }
+                return Ok(ToolRunOutcome {
+                    text,
+                    rounds: round,
+                    calls,
+                    model_calls: round,
+                });
             }
         }
 
@@ -1638,6 +1698,105 @@ mod tests {
     }
 
     // ---- 基本循环 ----
+
+    #[test]
+    fn deferred_question_yields_persists_and_blocks_even_preapproved_sibling_actions() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(super::super::system::AskUserTool::deferred()))
+            .unwrap();
+        let send = ScriptTool::new("send", Capability::Outbound);
+        reg.register(Arc::new(send.clone())).unwrap();
+        let mut ap = RefusingApprover;
+        let thinker = ScriptThinker::new(vec![ScriptThinker::tool_reply(vec![
+            call_json("write", "send", json!({})),
+            call_json(
+                "question",
+                "ask_user",
+                json!({"question":"明天15点的会开多久？","options":["30分钟","一个小时"]}),
+            ),
+        ])]);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("我明天下午三点有个会");
+        let policy = ToolPolicy {
+            allow: vec![super::super::Rule::tool("send")],
+            ..ToolPolicy::default()
+        };
+        let displayed = Arc::new(std::sync::Mutex::new(String::new()));
+        let screen = displayed.clone();
+        let out = runner(&reg, policy, &mut ap)
+            .with_deferred_questions()
+            .with_on_delta(Arc::new(move |part| screen.lock().unwrap().push_str(part)))
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+        assert_eq!(
+            out.model_calls, 1,
+            "不能把尚未回答的追问送回模型让它自行补答案"
+        );
+        assert_eq!(send.count(), 0);
+        assert!(!out.calls[0].executed());
+        assert!(out.calls[1].executed());
+        assert!(out.text.contains("开多久") && out.text.contains("2. 一个小时"));
+        assert!(
+            displayed.lock().unwrap().contains(&out.text),
+            "流式界面也必须显示等待的问题"
+        );
+        let mut restored: PromptLayout =
+            serde_json::from_str(&serde_json::to_string(&layout).unwrap()).unwrap();
+        assert!(restored.history_mentions("waiting_for_user"));
+        restored.ask("一个小时");
+        let next = ScriptThinker::new(vec![
+            ScriptThinker::tool_reply(vec![call_json("next", "send", json!({}))]),
+            ScriptThinker::text_reply("仍需批准"),
+        ]);
+        let out = runner(&reg, ToolPolicy::default(), &mut ap)
+            .with_deferred_questions()
+            .run(&next, &mut restored, 512)
+            .unwrap();
+        assert_eq!(send.count(), 0, "回答信息不能变成动作授权");
+        assert!(!out.calls[0].executed());
+        assert!(
+            next.requests()[0]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("一个小时"))
+        );
+    }
+
+    #[test]
+    fn denied_or_invalid_deferred_questions_never_fabricate_a_user_answer() {
+        for denied in [false, true] {
+            let mut reg = ToolRegistry::new();
+            reg.register(Arc::new(super::super::system::AskUserTool::deferred()))
+                .unwrap();
+            let mut ap = RefusingApprover;
+            let policy = ToolPolicy {
+                deny: if denied {
+                    vec![super::super::Rule::tool("ask_user")]
+                } else {
+                    vec![]
+                },
+                ..ToolPolicy::default()
+            };
+            let thinker = ScriptThinker::new(vec![
+                ScriptThinker::tool_reply(vec![call_json(
+                    "q",
+                    "ask_user",
+                    json!({"question":if denied {"开多久？"} else {""}}),
+                )]),
+                ScriptThinker::text_reply("请补充会议时长"),
+            ]);
+            let mut layout = PromptLayout::new("S");
+            layout.ask("有个会");
+            let out = runner(&reg, policy, &mut ap)
+                .with_deferred_questions()
+                .run(&thinker, &mut layout, 512)
+                .unwrap();
+            assert_eq!(out.model_calls, 2);
+            assert!(!out.calls[0].executed());
+            assert!(!layout.history_mentions("waiting_for_user"));
+            assert!(!layout.history_mentions("使用者回答："));
+        }
+    }
 
     #[test]
     fn a_reply_without_tool_calls_finishes_immediately() {

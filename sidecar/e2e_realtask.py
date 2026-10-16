@@ -67,9 +67,9 @@ def main() -> int:
     real_home = real_home_dir()
     # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
     before_home = snapshot_home(real_home)
-    key = real_home / "secrets" / "agnes.key"
+    key = real_home / "secrets" / "deepseek.key"
     if not key.exists():
-        print("没有 agnes.key，这个验证需要真模型", file=sys.stderr)
+        print("没有 deepseek.key，这个验证需要真模型", file=sys.stderr)
         return 2
 
     with tempfile.TemporaryDirectory(prefix="yunxi-rt-") as tmp:
@@ -79,13 +79,13 @@ def main() -> int:
         # **密钥要备齐。**
         #
         # 复杂任务会路由到 DeepSeek（多轮任务省 RPM），而第一次跑的时候
-        # 这里只复制了 agnes.key——任务连拆解都没开始就报
+        # 这里只复制了 deepseek.key——任务连拆解都没开始就报
         # "无法初始化 deepseek 的客户端"。
         #
         # 那**不是产品的问题**（报错清楚，指了缺什么），是脚本没准备齐。
         # 所以按"有哪些就复制哪些"来，缺的那个仍然会被如实报出来。
         copied = []
-        for name in ("agnes.key", "deepseek.key", "bocha.key"):
+        for name in ("deepseek.key", "bocha.key"):
             src = real_home / "secrets" / name
             if src.exists():
                 shutil.copy(src, home / "secrets" / name)
@@ -93,7 +93,7 @@ def main() -> int:
         print(f"  已准备密钥：{copied}")
         if "deepseek.key" not in copied:
             print("  注意：没有 deepseek.key，复杂任务的路由会失败")
-        assert (home / "secrets" / "agnes.key").exists()
+        assert (home / "secrets" / "deepseek.key").exists()
         work = root / "proj"
         (work / "src").mkdir(parents=True)
         (work / "notes").mkdir()

@@ -561,12 +561,17 @@ pub type AskFn = Box<dyn Fn(&str, &[String]) -> Option<String> + Send + Sync>;
 /// 依赖注入而不是直接读 stdin：前端可能是 CLI、桌面通知、Web 面板，
 /// 而守护进程里根本没有可读的输入；测试也只需要一个闭包。
 pub struct AskUserTool {
-    ask: AskFn,
+    ask: Option<AskFn>,
 }
 
 impl AskUserTool {
     pub fn new(ask: AskFn) -> Self {
-        Self { ask }
+        Self { ask: Some(ask) }
+    }
+
+    /// 对话的答案来自下一条消息，不在工具内抢读输入。
+    pub fn deferred() -> Self {
+        Self { ask: None }
     }
 }
 
@@ -576,6 +581,9 @@ impl Tool for AskUserTool {
     }
 
     fn description(&self) -> &str {
+        if self.ask.is_none() {
+            return "缺少信息时向用户提问，挂起本轮，等待下一条用户消息回答。不会读取stdin，也不会得到即时答案。一次只问一个关键缺项，问题带上已知的事项、日期和时间。会议没有时长必须先问，禁止按30/60分钟猜测。回答只补信息，不替代工具审批。";
+        }
         "向使用者问一句话并拿到他的回答。缺关键信息（选哪个文件、几点提醒、要不要覆盖）\
          而猜错代价又高时，用它问——不要编一个像样的答案顶上去，也不要就此放弃。\
          给了 options 就是选择题，使用者从里面挑一个；不给则是自由回答。\
@@ -614,7 +622,14 @@ impl Tool for AskUserTool {
         let question = question_arg(args)?;
         let options = options_arg(args)?;
 
-        match (self.ask)(&question, &options) {
+        let Some(ask) = &self.ask else {
+            let mut display = question.clone();
+            for (i, option) in options.iter().enumerate() {
+                display.push_str(&format!("\n{}. {}", i + 1, option));
+            }
+            return Ok(ToolOutput::read(json!({"waiting_for_user":true,"question":question,"options":options,"display":display}).to_string()));
+        };
+        match ask(&question, &options) {
             Some(answer) if !answer.trim().is_empty() => Ok(ToolOutput::read(format!(
                 "使用者回答：{}\n\
                  （这是他给的信息，直接用它推进任务。它只回答你问的这一件事，\

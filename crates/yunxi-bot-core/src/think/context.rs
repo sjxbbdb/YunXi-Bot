@@ -95,8 +95,6 @@ impl ContextBudget {
         let window = if m.contains("deepseek") {
             // DeepSeek 系列目前是 64k 上下文
             65_536
-        } else if m.contains("agnes") {
-            32_768
         } else {
             // 认不出：按最小的一档猜
             16_384
@@ -303,8 +301,8 @@ mod tests {
             65_536
         );
         assert_eq!(
-            ContextBudget::for_model("agnes-3.0-flash").window_tokens,
-            32_768
+            ContextBudget::for_model("gemma-4-26B-A4B-it-qat-4bit").window_tokens,
+            16_384
         );
     }
 

@@ -1,0 +1,525 @@
+{
+  "schema_version": 1,
+  "source": "synthetic_assistant_draft",
+  "purpose": "human_review_only",
+  "created_on": "2026-10-15",
+  "notes": [
+    "全部情景为合成草案，不是使用者真实行为或偏好记录。",
+    "request 沿用现有 DecisionRequest 的问题结构；review_scenario 是审核阶段的文字情景，不表示生产 state 已有此字段。",
+    "proposed_label 是待审核目标，不是模型输出或已校准概率；noul 使用布尔事实标签。",
+    "同 group_id 的原始样例、改写和选项打乱版本未来必须进入同一数据划分。",
+    "本文件不属于运行台账，也不改变审批或策略词汇表。"
+  ],
+  "samples": [
+    {
+      "id": "C01",
+      "group_id": "idle-new-evidence",
+      "area": "companion",
+      "review_status": "pending",
+      "scenario": "下午三点，使用者二十分钟没有发消息。后台任务正常，没有新结果、待办期限或新的求助；没有证据表明他遇到了困难。",
+      "request": {
+        "state": {
+          "review_scenario": "下午三点，使用者二十分钟没有发消息。后台任务正常，没有新结果、待办期限或新的求助；没有证据表明他遇到了困难。"
+        },
+        "questions": [
+          {
+            "id": "intervention",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "speak": "有值得主动说明的信息，且现在说不会打扰",
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可"
+              }
+            },
+            "instructions": "此刻应当如何介入？"
+          }
+        ]
+      },
+      "proposed_label": "quiet",
+      "reviewed_label": null,
+      "proposal_reason": "沉默本身不是需要打扰的证据。",
+      "review_label": "保持安静"
+    },
+    {
+      "id": "C02",
+      "group_id": "idle-new-evidence",
+      "area": "companion",
+      "review_status": "pending",
+      "scenario": "下午三点，使用者二十分钟没有发消息。他正在等的构建首次失败，日志明确缺少本机 SDK，重试不能解决，需要他选择安装或暂停；此故障尚未通知。使用者没有要求免打扰。",
+      "request": {
+        "state": {
+          "review_scenario": "下午三点，使用者二十分钟没有发消息。他正在等的构建首次失败，日志明确缺少本机 SDK，重试不能解决，需要他选择安装或暂停；此故障尚未通知。使用者没有要求免打扰。"
+        },
+        "questions": [
+          {
+            "id": "intervention",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "speak": "有值得主动说明的信息，且现在说不会打扰",
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可"
+              }
+            },
+            "instructions": "此刻应当如何介入？"
+          }
+        ]
+      },
+      "proposed_label": "speak",
+      "reviewed_label": null,
+      "proposal_reason": "出现了新的、阻塞用户目标且需要他决定的事实。",
+      "review_label": "现在说明阻塞"
+    },
+    {
+      "id": "C03",
+      "group_id": "focus-and-result",
+      "area": "companion",
+      "review_status": "pending",
+      "scenario": "使用者请助手在后台跑测试，说“我这半小时专心写代码，结束后告诉我结果”。测试已通过，仍在这半小时内，没有新的问题。",
+      "request": {
+        "state": {
+          "review_scenario": "使用者请助手在后台跑测试，说“我这半小时专心写代码，结束后告诉我结果”。测试已通过，仍在这半小时内，没有新的问题。"
+        },
+        "questions": [
+          {
+            "id": "intervention",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "speak": "有值得主动说明的信息，且现在说不会打扰",
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可"
+              }
+            },
+            "instructions": "此刻应当如何介入？"
+          }
+        ]
+      },
+      "proposed_label": "hold",
+      "reviewed_label": null,
+      "proposal_reason": "结果有用，但使用者已经给出了合适的告知时机。",
+      "review_label": "留到专注结束"
+    },
+    {
+      "id": "C04",
+      "group_id": "focus-and-result",
+      "area": "companion",
+      "review_status": "pending",
+      "scenario": "使用者请助手在后台跑测试，说“我这半小时专心写代码，结束后告诉我结果”。测试已通过，约定的半小时已经结束，结果尚未告知。",
+      "request": {
+        "state": {
+          "review_scenario": "使用者请助手在后台跑测试，说“我这半小时专心写代码，结束后告诉我结果”。测试已通过，约定的半小时已经结束，结果尚未告知。"
+        },
+        "questions": [
+          {
+            "id": "intervention",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "speak": "有值得主动说明的信息，且现在说不会打扰",
+                "hold": "有信息但现在不适合说，应留到合适时机",
+                "quiet": "没有需要主动说明的信息，保持静默即可"
+              }
+            },
+            "instructions": "此刻应当如何介入？"
+          }
+        ]
+      },
+      "proposed_label": "speak",
+      "reviewed_label": null,
+      "proposal_reason": "约定的告知时机已到，结果尚未重复发送。",
+      "review_label": "现在告知结果"
+    },
+    {
+      "id": "C05",
+      "group_id": "support-evidence",
+      "area": "companion",
+      "review_status": "pending",
+      "scenario": "使用者一小时没有说话；没有情绪表达或求助，任务正常进行。",
+      "request": {
+        "state": {
+          "review_scenario": "使用者一小时没有说话；没有情绪表达或求助，任务正常进行。"
+        },
+        "questions": [
+          {
+            "id": "needs_support",
+            "kind": {
+              "type": "noul"
+            },
+            "instructions": "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？"
+          }
+        ]
+      },
+      "proposed_label": false,
+      "reviewed_label": null,
+      "proposal_reason": "不能仅凭没说话推断需要情绪支持。",
+      "review_label": "没有明确支持需求"
+    },
+    {
+      "id": "C06",
+      "group_id": "support-evidence",
+      "area": "companion",
+      "review_status": "pending",
+      "scenario": "使用者刚说：“今天被批评以后很难受，想找人聊两句，不用替我解决问题。”",
+      "request": {
+        "state": {
+          "review_scenario": "使用者刚说：“今天被批评以后很难受，想找人聊两句，不用替我解决问题。”"
+        },
+        "questions": [
+          {
+            "id": "needs_support",
+            "kind": {
+              "type": "noul"
+            },
+            "instructions": "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？"
+          }
+        ]
+      },
+      "proposed_label": true,
+      "reviewed_label": null,
+      "proposal_reason": "有明确的情绪表达和陪伴请求；标签不授权其他行动。",
+      "review_label": "需要情绪支持"
+    },
+    {
+      "id": "M01",
+      "group_id": "meeting-deadline",
+      "area": "mail",
+      "review_status": "pending",
+      "scenario": "现在上午十点。一位同事单独来信：“十点半的面谈临时改到另一栋楼，请确认是否看到。”使用者要参加这场面谈，通知真实且尚未读。",
+      "request": {
+        "state": {
+          "review_scenario": "现在上午十点。一位同事单独来信：“十点半的面谈临时改到另一栋楼，请确认是否看到。”使用者要参加这场面谈，通知真实且尚未读。"
+        },
+        "questions": [
+          {
+            "id": "triage",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "speak": "值得现在就告诉使用者，晚了他会不方便",
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提"
+              }
+            },
+            "instructions": "这一封邮件此刻应当如何处置？"
+          }
+        ]
+      },
+      "proposed_label": "speak",
+      "reviewed_label": null,
+      "proposal_reason": "临近安排发生变化，延迟告知会妨碍使用者到场。",
+      "review_label": "现在提醒"
+    },
+    {
+      "id": "M02",
+      "group_id": "meeting-deadline",
+      "area": "mail",
+      "review_status": "pending",
+      "scenario": "现在上午十点。一位同事单独来信：“下周三的面谈临时改到另一栋楼，周二前确认即可。”使用者要参加这场面谈，通知真实且尚未读。",
+      "request": {
+        "state": {
+          "review_scenario": "现在上午十点。一位同事单独来信：“下周三的面谈临时改到另一栋楼，周二前确认即可。”使用者要参加这场面谈，通知真实且尚未读。"
+        },
+        "questions": [
+          {
+            "id": "triage",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "speak": "值得现在就告诉使用者，晚了他会不方便",
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提"
+              }
+            },
+            "instructions": "这一封邮件此刻应当如何处置？"
+          }
+        ]
+      },
+      "proposed_label": "hold",
+      "reviewed_label": null,
+      "proposal_reason": "有明确相关性，但当前没有紧迫到必须打断的期限。",
+      "review_label": "攒着稍后看"
+    },
+    {
+      "id": "M03",
+      "group_id": "quoted-urgency",
+      "area": "mail",
+      "review_status": "pending",
+      "scenario": "同事单独转来项目记录。当前正文写“已处理完，仅供下周复盘，无需你操作”；引用的旧邮件写“紧急！今天十五点前处理”，该期限已过去且问题已解决。",
+      "request": {
+        "state": {
+          "review_scenario": "同事单独转来项目记录。当前正文写“已处理完，仅供下周复盘，无需你操作”；引用的旧邮件写“紧急！今天十五点前处理”，该期限已过去且问题已解决。"
+        },
+        "questions": [
+          {
+            "id": "triage",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "speak": "值得现在就告诉使用者，晚了他会不方便",
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提"
+              }
+            },
+            "instructions": "这一封邮件此刻应当如何处置？"
+          }
+        ]
+      },
+      "proposed_label": "hold",
+      "reviewed_label": null,
+      "proposal_reason": "引用中的紧急词不代表当前仍有紧急任务；保留复盘信息。",
+      "review_label": "保留但不立即提醒"
+    },
+    {
+      "id": "M04",
+      "group_id": "quoted-urgency",
+      "area": "mail",
+      "review_status": "pending",
+      "scenario": "同事单独转来项目记录。当前正文写“尚未处理完，需要你今天十五点前确认方案”；现在十四点四十五分，使用者负责确认，尚未读。",
+      "request": {
+        "state": {
+          "review_scenario": "同事单独转来项目记录。当前正文写“尚未处理完，需要你今天十五点前确认方案”；现在十四点四十五分，使用者负责确认，尚未读。"
+        },
+        "questions": [
+          {
+            "id": "triage",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "speak": "值得现在就告诉使用者，晚了他会不方便",
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提"
+              }
+            },
+            "instructions": "这一封邮件此刻应当如何处置？"
+          }
+        ]
+      },
+      "proposed_label": "speak",
+      "reviewed_label": null,
+      "proposal_reason": "当前正文明确有未解决的责任和临近期限。",
+      "review_label": "现在提醒确认"
+    },
+    {
+      "id": "M05",
+      "group_id": "personal-relevance",
+      "area": "mail",
+      "review_status": "pending",
+      "scenario": "一位普通联系人单独推荐一个下月活动。使用者明确表示不关注该主题，也未报名；邮件没有需要本人处理的事项。联系人未被屏蔽，也未列为重要联系人。",
+      "request": {
+        "state": {
+          "review_scenario": "一位普通联系人单独推荐一个下月活动。使用者明确表示不关注该主题，也未报名；邮件没有需要本人处理的事项。联系人未被屏蔽，也未列为重要联系人。"
+        },
+        "questions": [
+          {
+            "id": "triage",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "speak": "值得现在就告诉使用者，晚了他会不方便",
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提"
+              }
+            },
+            "instructions": "这一封邮件此刻应当如何处置？"
+          }
+        ]
+      },
+      "proposed_label": "quiet",
+      "reviewed_label": null,
+      "proposal_reason": "这是与使用者无关的信息；此标签不产生永久屏蔽规则。",
+      "review_label": "不主动提及"
+    },
+    {
+      "id": "M06",
+      "group_id": "personal-relevance",
+      "area": "mail",
+      "review_status": "pending",
+      "scenario": "一位普通联系人单独推荐一个下月活动。使用者此前说正在了解该主题；邮件包含有用议程，但未报名、近期无截止日期，也无需现在回复。联系人未被屏蔽，也未列为重要联系人。",
+      "request": {
+        "state": {
+          "review_scenario": "一位普通联系人单独推荐一个下月活动。使用者此前说正在了解该主题；邮件包含有用议程，但未报名、近期无截止日期，也无需现在回复。联系人未被屏蔽，也未列为重要联系人。"
+        },
+        "questions": [
+          {
+            "id": "triage",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "speak": "值得现在就告诉使用者，晚了他会不方便",
+                "hold": "有内容但不必现在说，攒着等他自己看",
+                "quiet": "与使用者无关或纯噪音，不值得提"
+              }
+            },
+            "instructions": "这一封邮件此刻应当如何处置？"
+          }
+        ]
+      },
+      "proposed_label": "hold",
+      "reviewed_label": null,
+      "proposal_reason": "信息相关，但适合集中浏览，不必立即打断。",
+      "review_label": "保留稍后看"
+    },
+    {
+      "id": "T01",
+      "group_id": "completion-evidence",
+      "area": "task",
+      "review_status": "pending",
+      "scenario": "任务是修复路径兼容问题。上一轮模型写“已经修好了”，但没有任何文件修改回执、文件差异或测试结果。",
+      "request": {
+        "state": {
+          "question": "任务是修复路径兼容问题。上一轮模型写“已经修好了”，但没有任何文件修改回执、文件差异或测试结果。\n下一步最合适的处理是什么？",
+          "options": [
+            "opt0",
+            "opt1",
+            "opt2"
+          ],
+          "criteria": {
+            "opt0": "先独立读取实际修改并运行相关测试，核对是否满足目标",
+            "opt1": "依据已核实的修改和测试结果报告完成",
+            "opt2": "重复执行原来的修改命令"
+          }
+        },
+        "questions": [
+          {
+            "id": "next_step",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "opt0": "先独立读取实际修改并运行相关测试，核对是否满足目标",
+                "opt1": "依据已核实的修改和测试结果报告完成",
+                "opt2": "重复执行原来的修改命令"
+              }
+            },
+            "instructions": "任务是修复路径兼容问题。上一轮模型写“已经修好了”，但没有任何文件修改回执、文件差异或测试结果。\n下一步最合适的处理是什么？"
+          }
+        ]
+      },
+      "proposed_label": "opt0",
+      "reviewed_label": null,
+      "proposal_reason": "模型自己的完成声明不等于已验证的完成证据。",
+      "review_label": "先核对修改与测试"
+    },
+    {
+      "id": "T02",
+      "group_id": "completion-evidence",
+      "area": "task",
+      "review_status": "pending",
+      "scenario": "任务是修复路径兼容问题。已经独立检查文件差异，确认修复覆盖用户要求；相关回归测试和全量测试通过，无剩余待办，报告中有对应结果。",
+      "request": {
+        "state": {
+          "question": "任务是修复路径兼容问题。已经独立检查文件差异，确认修复覆盖用户要求；相关回归测试和全量测试通过，无剩余待办，报告中有对应结果。\n下一步最合适的处理是什么？",
+          "options": [
+            "opt0",
+            "opt1",
+            "opt2"
+          ],
+          "criteria": {
+            "opt0": "先独立读取实际修改并运行相关测试，核对是否满足目标",
+            "opt1": "依据已核实的修改和测试结果报告完成",
+            "opt2": "重复执行原来的修改命令"
+          }
+        },
+        "questions": [
+          {
+            "id": "next_step",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "opt0": "先独立读取实际修改并运行相关测试，核对是否满足目标",
+                "opt1": "依据已核实的修改和测试结果报告完成",
+                "opt2": "重复执行原来的修改命令"
+              }
+            },
+            "instructions": "任务是修复路径兼容问题。已经独立检查文件差异，确认修复覆盖用户要求；相关回归测试和全量测试通过，无剩余待办，报告中有对应结果。\n下一步最合适的处理是什么？"
+          }
+        ]
+      },
+      "proposed_label": "opt1",
+      "reviewed_label": null,
+      "proposal_reason": "已有可核实的完成证据，无需重复改动。",
+      "review_label": "报告已验证的完成"
+    },
+    {
+      "id": "T03",
+      "group_id": "boundary-ambiguity",
+      "area": "task",
+      "review_status": "pending",
+      "scenario": "用户要求实现免邮判断。唯一依据是“超过 100 元免邮，100 元整不免邮”；金额计算方式已确定，无其他冲突要求。",
+      "request": {
+        "state": {
+          "question": "用户要求实现免邮判断。唯一依据是“超过 100 元免邮，100 元整不免邮”；金额计算方式已确定，无其他冲突要求。\n应选择哪种处理？",
+          "options": [
+            "opt0",
+            "opt1",
+            "opt2"
+          ],
+          "criteria": {
+            "opt0": "按订单金额大于等于 100 元免邮实现",
+            "opt1": "按订单金额严格大于 100 元免邮实现",
+            "opt2": "先向使用者确认 100 元整是否免邮，暂不实现有歧义的条件"
+          }
+        },
+        "questions": [
+          {
+            "id": "next_step",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "opt0": "按订单金额大于等于 100 元免邮实现",
+                "opt1": "按订单金额严格大于 100 元免邮实现",
+                "opt2": "先向使用者确认 100 元整是否免邮，暂不实现有歧义的条件"
+              }
+            },
+            "instructions": "用户要求实现免邮判断。唯一依据是“超过 100 元免邮，100 元整不免邮”；金额计算方式已确定，无其他冲突要求。\n应选择哪种处理？"
+          }
+        ]
+      },
+      "proposed_label": "opt1",
+      "reviewed_label": null,
+      "proposal_reason": "明确的边界是严格大于，不能把它改成大于等于。",
+      "review_label": "按严格大于实现"
+    },
+    {
+      "id": "T04",
+      "group_id": "boundary-ambiguity",
+      "area": "task",
+      "review_status": "pending",
+      "scenario": "用户要求实现免邮判断。唯一依据是“100 元附近就免邮吧”；没有说明 100 元整是否免邮，也没有可查的业务规则。",
+      "request": {
+        "state": {
+          "question": "用户要求实现免邮判断。唯一依据是“100 元附近就免邮吧”；没有说明 100 元整是否免邮，也没有可查的业务规则。\n应选择哪种处理？",
+          "options": [
+            "opt0",
+            "opt1",
+            "opt2"
+          ],
+          "criteria": {
+            "opt0": "按订单金额大于等于 100 元免邮实现",
+            "opt1": "按订单金额严格大于 100 元免邮实现",
+            "opt2": "先向使用者确认 100 元整是否免邮，暂不实现有歧义的条件"
+          }
+        },
+        "questions": [
+          {
+            "id": "next_step",
+            "kind": {
+              "type": "choice",
+              "criteria": {
+                "opt0": "按订单金额大于等于 100 元免邮实现",
+                "opt1": "按订单金额严格大于 100 元免邮实现",
+                "opt2": "先向使用者确认 100 元整是否免邮，暂不实现有歧义的条件"
+              }
+            },
+            "instructions": "用户要求实现免邮判断。唯一依据是“100 元附近就免邮吧”；没有说明 100 元整是否免邮，也没有可查的业务规则。\n应选择哪种处理？"
+          }
+        ]
+      },
+      "proposed_label": "opt2",
+      "reviewed_label": null,
+      "proposal_reason": "缺少边界定义时先澄清，不替用户猜业务规则。",
+      "review_label": "先澄清边界"
+    }
+  ]
+}

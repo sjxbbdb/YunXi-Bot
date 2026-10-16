@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>local.yunxi.bot.native</string>
+  <key>CFBundleName</key><string>云熙本机助理</string>
+  <key>CFBundleExecutable</key><string>YunXiNative</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSCalendarsFullAccessUsageDescription</key><string>云熙读取已有日程以避免冲突，并在你已同意使用的 iCloud“云熙”日历中保存和调整安排。</string>
+  <key>NSRemindersFullAccessUsageDescription</key><string>云熙读取待办进度，并在你已同意使用的 iCloud“云熙”列表中保存、调整和完成待办。</string>
+  <key>NSContactsUsageDescription</key><string>云熙按姓名和公司查找联系人、区分同名人并确认邮箱，不修改通讯录。</string>
+  <key>NSAppleEventsUsageDescription</key><string>云熙通过本机邮件App读取和管理邮件、起草回复；发送仍需由工具审批确认。</string>
+</dict></plist>

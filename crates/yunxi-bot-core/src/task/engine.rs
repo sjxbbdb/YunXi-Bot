@@ -362,9 +362,9 @@ pub struct Engine<'a, H: TaskHandler, S: TaskStore> {
     /// 所以 CLI 那几条真会发请求的路（`do` / `resume` / 守护的任务回合）
     /// **每一处都必须挂**；漏挂一处，那条路上的简单步骤就又会直直打到
     /// 一个可能没人监听的 17872 上——那正是这次要堵的洞。
-    /// `a_degraded_local_sidecar_moves_a_task_step_to_agnes` 钉着这件事。
+    /// `a_degraded_local_sidecar_keeps_the_task_step_local` 钉着这件事。
     local_probe: Option<Probe>,
-    /// 决策留痕的出口：本地槽位不可用而改走 Agnes 时，往这本台账写一条
+    /// 决策留痕的出口：本地槽位不可用时，往这本台账写一条
     /// [`DecisionClass::Route`] 决策事件；任务决策点的判断
     /// （[`super::decide::decision_point_with_ledger`]）也走这一本。
     /// `None` = **不记，一个字节的 I/O 都没有**。
@@ -384,25 +384,8 @@ pub struct Engine<'a, H: TaskHandler, S: TaskStore> {
     /// **"谁持有这本台账"只能有一个答案**。所以这里走和 [`Self::local_probe`]
     /// 完全同一条路：默认 `None`，由真正知道自己跑在哪的调用方显式挂上。
     ///
-    /// ## 为什么是决策事件，而不是只靠 `routing.reason`
-    ///
-    /// 回落的理由**已经**进了 `TaskPlanned` / `StepRouted` 的 `routing.reason`，
-    /// 所以"这一步为什么走了 Agnes"查得出来。但那两个事件回答的是
-    /// "这一步的路由长什么样"，**回答不了"这一轮到底有没有回落"**：
-    /// 一份写着 `provider: agnes` 的路由记录，和"本来就要走 Agnes"长得一模一样。
-    ///
-    /// 对话那条链路（`ChatHandler::apply_local_fallback`）记的是一条
-    /// `DecisionClass::Route` 决策事件——D129 加这一类就是为了这件事。
-    /// 引擎这条不记的话，同一个动作在两条链路上留下两种形状的痕，
-    /// 而"有一条链路悄悄不回落了"正是 D128 的形状：功能还在，只是退化了，
-    /// 且退化之后每一处显示都正常。**两边共用同一类，查法才只有一种。**
-    ///
-    /// 代价写明白：**没挂 = 回落只在 stderr 上出现、决策点只在步骤事件里出现**，
-    /// 和加这一层之前一样。所以 CLI 那几条真会发请求的路每一处都必须挂
-    /// （`do` / 干跑 / `resume` / 守护的任务回合）；
-    /// `a_local_fallback_is_recorded_as_a_route_decision` 钉着"挂上就得记下来"，
-    /// `an_engine_without_a_ledger_keeps_todays_behaviour`
-    /// 钉着"不挂就一个字节都不多"。
+    /// 与对话链路共用 Route 事件记录本地健康问题，便于按 degraded 检索。
+    /// CLI 的 do/resume/daemon 入口都必须挂接；否则只有 stderr 提示。
     route_ledger: Option<&'a mut Ledger>,
 }
 
@@ -437,25 +420,26 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
     }
 
     /// 挂上本地槽位探测器：路由落在 `127.0.0.1:17872` 上时先探一次
-    /// `/health`，不是"就绪"就改走 Agnes（判定见 [`local_health::decide`]）。
+    /// `/health`，不是"就绪"就记录原因并预热（判定见 [`local_health::decide`]）。
     ///
     /// **不挂 = 没有这一层**，行为与加它之前逐字节相同。
-    /// CLI 那几条真的会发请求的路必须挂 [`Probe::real`]——理由见
+    /// 显式限定本地模型时传 `None`，请求失败直接报错，不允许远端回落。
+    /// 默认自动路由的 CLI 入口必须挂 [`Probe::real`]——理由见
     /// [`Self::local_probe`] 的字段文档。
-    pub fn with_local_probe(mut self, probe: Probe) -> Self {
-        self.local_probe = Some(probe);
+    pub fn with_local_probe(mut self, probe: impl Into<Option<Probe>>) -> Self {
+        self.local_probe = probe.into();
         self
     }
 
     /// 挂上台账（见 [`Self::route_ledger`] 的字段文档）。它现在是**两个**决策
     /// 事件的出口：
     ///
-    /// 1. 本地槽位不可用而改走 Agnes 时，记一条 `Route` 决策事件
+    /// 1. 本地槽位不可用时，记一条 `Route` 决策事件
     ///    （和对话那条链路同一个写法）
     /// 2. 任务决策点问过本地决策模型之后，记一条 `Escalate` 决策事件——
     ///    包括**它弃权**那一种
     ///
-    /// **不挂 = 不记**，行为与加它之前逐字节相同——回落本身照旧发生、
+    /// **不挂 = 不记**，健康检查和预热照旧发生、
     /// 决策点照旧拍板或弃权、stderr 照旧说该说的话，
     /// 只是台账里没有那两条决策事件。
     /// CLI 那几条真会发请求的路必须挂。
@@ -464,27 +448,18 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
         self
     }
 
-    /// 把一条路由过一道本地槽位的健康：**没挂探测器就立刻返回**。
-    ///
-    /// 判据、催热、改写全在 [`local_health::apply_fallback`] 里——
-    /// **这里不重新实现一遍**。两份判据必然漂移，而漂移的方向是
-    /// "有一条链路悄悄不回落了"（D128 的形状：功能还在，只是退化了）。
-    ///
-    /// 留痕也收在这一处，而不是三个调用点各写一遍：`plan_task`、
-    /// `run_step`、`run_decision` 三条路都从这里出去，所以
-    /// **回落一次就恰好记一条**，不会漏、也不会重。
-    fn apply_local_fallback(&mut self, routing: &mut Routing) {
+    /// 共用健康判据与预热逻辑，并为规划、执行和决策路径统一留痕。
+    fn prepare_local_model(&mut self, routing: &mut Routing) {
         let Some(probe) = self.local_probe.as_ref() else {
             return;
         };
-        if let Some(reason) = local_health::apply_fallback(routing, probe) {
-            // **回落必须看得见。** 终端上这一行是使用者唯一会主动看的地方，
-            // 而"这一轮其实没走本地那个模型"只有这里说得清。
+        if let Some(reason) = local_health::prepare_local(routing, probe) {
+            // 未就绪原因同时提供给终端和台账。
             eprintln!("  [本地模型] {reason}。");
 
             // 终端那一行只活在这次运行里，**台账那一份才留得下来**。
             //
-            // 字段全部逐字对齐对话那条链路（`ChatHandler::apply_local_fallback`）：
+            // 字段全部逐字对齐对话那条链路（`ChatHandler::prepare_local_model`）：
             // `DecisionClass::Route` + `degraded = true` + 同一句 action。
             // 两边各编一套说法的话，"查台账"这件事就得按链路分两遍做，
             // 而两条链路迟早会有一边少填一个字段。
@@ -500,13 +475,13 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
                     ledger,
                     DecisionClass::Route,
                     true,
-                    "改走 Agnes（远端）",
+                    "本地模型未就绪，保留本地端点",
                     &reason,
                     None,
                     &[],
                 )
             {
-                eprintln!("⚠ 回落留痕写入失败（不影响任务）: {e}");
+                eprintln!("⚠ 本地健康留痕写入失败（不影响任务）: {e}");
             }
         }
     }
@@ -542,8 +517,23 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             let mut task = self.load(task_id)?;
 
             // 拆解阶段
-            if task.state == TaskState::Planning {
-                self.plan_task(&mut task, ledger, records)?;
+            if task.state == TaskState::Planning
+                || (task.state == TaskState::Running && task.steps.is_empty())
+            {
+                match self.plan_task(&mut task, ledger, records) {
+                    Ok(()) => {}
+                    Err(e @ TaskError::NeedsHuman { .. }) => {
+                        self.set_state(task_id, TaskState::AwaitingHuman)?;
+                        return Ok(EngineOutcome {
+                            task: self.load(task_id)?,
+                            used_model_calls: ledger.used(),
+                            advance: Advance::Waiting {
+                                reason: e.to_string(),
+                            },
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
                 continue;
             }
 
@@ -743,10 +733,10 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
         let mut routing =
             self.router
                 .route(&task.goal, kind, &profile, self.effort, Some(self.decider));
-        // 本地槽位不可用就改走 Agnes。**引擎不走 `ChatHandler::route_for`**，
+        // 本地槽位不可用时保留端点并报告原因。**引擎不走 `ChatHandler::route_for`**，
         // 它自己调 `router.route`，所以这一层兜底要在这里补上——
         // 否则 `do` 里的简单步骤还是会直直打到 17872 上。
-        self.apply_local_fallback(&mut routing);
+        self.prepare_local_model(&mut routing);
         ledger.try_charge()?;
         let req = PlanRequest {
             task_id: task.id.clone(),
@@ -890,7 +880,7 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
         // 它就是这次要堵的那个洞：`do` 里的简单步骤判成轻量、落在本地槽位上，
         // 而 sidecar 没起来时这一跳必然失败——对话那条链路接上了兜底，
         // 这条没有。
-        self.apply_local_fallback(&mut routing);
+        self.prepare_local_model(&mut routing);
         self.store.write(
             task_id,
             EventKind::StepRouted,
@@ -1067,10 +1057,10 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             self.router
                 .route(question, TaskKind::Analysis, &profile, self.effort, None);
         // 决策点这里按现规格**落不到本地槽位**（分析类要推理 → DeepSeek），
-        // 所以这一行今天不改变任何行为。写上是因为它便宜：`apply_fallback`
+        // 所以这一行今天不改变任何行为。写上是因为它便宜：`prepare_local`
         // 对非本地槽位连探都不探，而少了它，将来档位规则一改，
         // 这条路上就会悄没声地多出一个"直连 17872"的口子。
-        self.apply_local_fallback(&mut routing);
+        self.prepare_local_model(&mut routing);
 
         ledger.try_charge()?;
         let raw = self.handler.observe(
@@ -1108,11 +1098,15 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
-        match super::decide::decision_point_with_ledger(
+        match super::decide::decision_point_with_context(
             decider,
             "task_decision",
             &q,
             &criteria_ref,
+            serde_json::json!({
+                "goal": self.load(task_id)?.goal,
+                "inputs": self.collect_inputs(task_id, &step.id)?,
+            }),
             // **决策点的留痕走同一本台账**（CLI 已经用 `with_ledger` 挂上了）。
             // 不挂的后果和回落那条一样：模型拍了板、任务照着做了，
             // 而"这一步问过模型没有、它是不是弃权"在台账里查不出来。
@@ -1721,13 +1715,14 @@ mod tests {
     /// 剧本化 handler：按调用顺序返回预设回复，全程不碰网络。
     #[derive(Debug, Default)]
     struct ScriptedHandler {
+        plan_needs_human: bool,
         plans: Vec<String>,
         steps: Vec<Result<String, TaskError>>,
         observes: Vec<String>,
         plan_calls: usize,
         step_calls: usize,
         observe_calls: usize,
-        /// 记录每次调用拿到的路由，用来断言"复杂走 DeepSeek、简单走 Agnes"
+        /// 记录每次调用拿到的路由，用来断言"复杂走 DeepSeek、简单走本地模型"
         seen_providers: Vec<String>,
         seen_thinking: Vec<bool>,
         seen_kinds: Vec<TaskKind>,
@@ -1756,6 +1751,11 @@ mod tests {
             _run: &PlanRequest,
             records: &mut Vec<CallRecord>,
         ) -> Result<String, TaskError> {
+            if std::mem::take(&mut self.plan_needs_human) {
+                return Err(TaskError::NeedsHuman {
+                    reason: "上下文不可用".into(),
+                });
+            }
             self.plan_calls += 1;
             self.seen_providers.push(routing.spec.provider.to_string());
             self.seen_thinking.push(routing.thinking);
@@ -1840,6 +1840,45 @@ mod tests {
         budget: Budget,
     ) -> Engine<'a, ScriptedHandler, MemoryTaskStore> {
         Engine::new(router, decider, handler, store, budget)
+    }
+
+    #[test]
+    fn unavailable_planning_context_waits_and_resume_replans_without_empty_task_stall() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[])]));
+        handler.plan_needs_human = true;
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "context", "一步").unwrap();
+        let result = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("context")
+        .unwrap();
+        assert_eq!(result.task.state, TaskState::AwaitingHuman);
+        assert_eq!(handler.plan_calls, 0);
+        store
+            .write(
+                "context",
+                EventKind::TaskStateChanged,
+                serde_json::json!({"task":"context","state":"running"}),
+            )
+            .unwrap();
+        let result = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("context")
+        .unwrap();
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(handler.plan_calls, 1);
     }
 
     #[test]
@@ -2219,6 +2258,49 @@ mod tests {
             TaskState::Stalled,
             "有步骤失败就不叫完成——就算别的步骤都尘埃落定了"
         );
+    }
+
+    #[test]
+    fn decision_model_receives_original_goal_and_predecessor_evidence() {
+        struct EvidenceDecider;
+        impl Decider for EvidenceDecider {
+            fn decide(
+                &self,
+                req: &crate::decide::DecisionRequest,
+            ) -> Result<crate::decide::DecisionResult, crate::decide::DecisionError> {
+                assert_eq!(req.state["context"]["goal"], "依据原始规则筛选");
+                assert!(
+                    req.state["context"]["inputs"]
+                        .to_string()
+                        .contains("只保留红色")
+                );
+                StubDecider::succeeding()
+                    .with_choice("task_decision", "opt0")
+                    .decide(req)
+            }
+        }
+        let router = ModelRouter::default();
+        let mut handler = ScriptedHandler::with_plan(
+            &serde_json::json!({"steps": [
+                {"id":"read", "instruction":"读取规则", "kind":"lookup"},
+                {"id":"choose", "instruction":"decide: 红色还是蓝色", "depends_on":["read"]}
+            ]})
+            .to_string(),
+        );
+        handler.observes =
+            vec![r#"{"question":"保留哪种颜色？","options":["红色","蓝色"]}"#.into()];
+        handler.steps.push(Ok("OK: 只保留红色".into()));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "evidence", "依据原始规则筛选").unwrap();
+        Engine::new(
+            &router,
+            &EvidenceDecider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("evidence")
+        .unwrap();
     }
 
     #[test]
@@ -2852,8 +2934,8 @@ mod tests {
     // ---- 路由在任务框架里的接线 ----
 
     #[test]
-    fn simple_steps_go_to_the_local_model_complex_steps_go_to_deepseek() {
-        // 使用者的要求：复杂任务给 DeepSeek，简单任务给 Agnes
+    fn simple_and_complex_task_steps_both_go_to_deepseek() {
+        // 所有助理步骤统一远端；类型只决定思考模式。
         let router = ModelRouter::default();
         let decider = StubDecider::succeeding();
         let plan = serde_json::json!({
@@ -2880,17 +2962,9 @@ mod tests {
         // 第一次调用是拆解，之后依次是 s1、s2
         assert_eq!(handler.seen_kinds[1], TaskKind::Lookup);
         assert_eq!(handler.seen_kinds[2], TaskKind::Analysis);
-        // **这个断言改过两次，每次都跟着规格走。**
-        //
-        // 原来是 `"agnes"`（简单步骤省钱）。后来改成 `"deepseek"`
-        // （真实任务一律走 DeepSeek——因为 Agnes 10 RPM 会把任务拖死，
-        // `e2e_allmodules` 那次连续 9 次"等 N ms 后重发"之后卡在 s10）。
-        //
-        // 现在是 `"local"`：**s1 是查找类、判得出轻量，所以走本地模型。**
-        // 分界从"是不是任务"变成了"这件事有多重"。
         assert_eq!(
-            handler.seen_providers[1], "local",
-            "简单步骤走本地模型（{:?}）",
+            handler.seen_providers[1], "deepseek",
+            "简单步骤也走 DeepSeek（{:?}）",
             handler.seen_providers
         );
         assert!(!handler.seen_thinking[1], "查找类不该开思考");
@@ -2940,34 +3014,28 @@ mod tests {
         );
         eng.run("t1").unwrap();
         assert_eq!(
-            handler.seen_providers[1], "local",
+            handler.seen_providers[1], "deepseek",
             "没挂探测器时路由一个字节都不该变（{:?}）",
             handler.seen_providers
         );
     }
 
     #[test]
-    fn a_degraded_local_sidecar_moves_a_task_step_to_agnes() {
-        // **这是"任务那条路也接了兜底"的唯一钉子。**
-        //
-        // 任务引擎不走 `ChatHandler::route_for`——它自己调 `router.route`，
-        // 把 `Routing` 交给 handler。所以对话那条接上了兜底，`do` 这条还是
-        // 直直打到 `127.0.0.1:17872` 上：sidecar 没起来时，一个简单步骤
-        // 必然失败，而失败的理由（连接被拒绝）和执行本身毫无关系。
-        //
-        // 用假探测器（**不连端口**）：真起一个 4B sidecar 要几十秒和几 GB 内存，
-        // 那种测试没人会跑第二遍——于是接线断掉也没人知道。
-        //
-        // **引擎默认不挂探测器**（`None` = 和加这一层之前逐字节相同），
-        // 所以哪天有人把 `.with_local_probe` 漏掉，这条测试就会红：
-        // s1 会重新落回 `"local"`。
-        let router = ModelRouter::default();
+    fn a_degraded_local_sidecar_keeps_the_task_step_local() {
+        // 显式对话型测试步骤验证 core 的本地健康审计；CLI 助理路由只含 DeepSeek。
+        let router = ModelRouter::new(
+            vec![
+                crate::think::ModelSpec::LOCAL,
+                crate::think::ModelSpec::DEEPSEEK_FLASH,
+            ],
+            crate::think::router::Tier::Cheap,
+        );
         let decider = StubDecider::succeeding();
         // 和 `simple_steps_go_to_the_local_model_complex_steps_go_to_deepseek`
         // 里同一个指令：查找类、判得出轻量，也就是**会落在本地槽位上**的那一种。
         let plan = serde_json::json!({
             "steps": [
-                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "lookup" }
+                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "conversation" }
             ]
         })
         .to_string();
@@ -3006,11 +3074,11 @@ mod tests {
             handler.seen_providers
         );
         assert_eq!(
-            handler.seen_providers[1], "agnes",
-            "本地槽位 degraded 时，简单步骤该改走 Agnes（{:?}）",
+            handler.seen_providers[1], "local",
+            "本地槽位 degraded 时，简单步骤仍保留本地端点（{:?}）",
             handler.seen_providers
         );
-        assert_ne!(handler.seen_providers[1], "local");
+        assert_ne!(handler.seen_providers[1], "agnes");
 
         // 这次替换还得**能查出来**：`StepRouted` 记的那份路由要带着理由。
         // 静默的替换就是 D128 那一类——事后翻台账只会看到一次普普通通的
@@ -3029,31 +3097,20 @@ mod tests {
 
     #[test]
     fn a_local_fallback_is_recorded_as_a_route_decision() {
-        // **这条钉的是"引擎那条回落也留痕"，也是这次补的那个洞。**
-        //
-        // 回落本来存在两处：对话（`ChatHandler::route_for`）和任务引擎。
-        // 对话那条记一条 `DecisionClass::Route` 决策事件，引擎这条**不记**——
-        // 它只把理由放进 `routing.reason`（进了 `TaskPlanned` / `StepRouted`），
-        // 于是 `do` 里一步一步从本地槽位挪到 Agnes，台账里**一条 `route`
-        // 决策事件都没有**。而一份写着 `provider: agnes` 的路由记录，和
-        // "本来就要走 Agnes"长得一模一样——D128 那一类"显示正常、实际退化"。
-        //
-        // 少了这条测试，将来谁把 `.with_ledger` 拆掉、或者把这一行挪到一个
-        // 不常走的分支里，都不会有东西变红——**那正是这个洞藏了一轮的原因**。
-        //
-        // 用**真台账**（临时文件）而不是一个假 sink：留痕这件事的器件必须是
-        // 生产那一套。假 sink 只能回答"有人调过我"，而"记的是 `route` 类、
-        // `degraded` 是 true、理由是那句 degraded 原文、而且落在边界里"
-        // 这四条全在 `record_decision` 那一层——**换掉器件就等于把要验的
-        // 那一层换掉了**（D90 / D93 两次栽的都是"测试和生产用了两套器件"）。
-        // 对话那边同一条测试（`the_fallback_is_visible_in_the_ledger`）也是这么写的。
-        let router = ModelRouter::default();
+        // 显式对话型测试步骤验证 core 的本地健康审计；CLI 助理路由只含 DeepSeek。
+        let router = ModelRouter::new(
+            vec![
+                crate::think::ModelSpec::LOCAL,
+                crate::think::ModelSpec::DEEPSEEK_FLASH,
+            ],
+            crate::think::router::Tier::Cheap,
+        );
         let decider = StubDecider::succeeding();
-        // 和 `a_degraded_local_sidecar_moves_a_task_step_to_agnes` 同一个指令：
+        // 和 `a_degraded_local_sidecar_keeps_the_task_step_local` 同一个指令：
         // 查找类、判得出轻量，也就是**会落在本地槽位上**的那一种。
         let plan = serde_json::json!({
             "steps": [
-                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "lookup" }
+                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "conversation" }
             ]
         })
         .to_string();
@@ -3092,8 +3149,8 @@ mod tests {
         // 回落**真的发生了**（不然下面那条断言验的是一个没发生的事）：
         // 拆解走 DeepSeek，只有 s1 落在本地槽位上。
         assert_eq!(
-            handler.seen_providers[1], "agnes",
-            "本地槽位 degraded 时，简单步骤该改走 Agnes（{:?}）",
+            handler.seen_providers[1], "local",
+            "本地槽位 degraded 时，简单步骤仍保留本地端点（{:?}）",
             handler.seen_providers
         );
 
@@ -3135,23 +3192,18 @@ mod tests {
 
     #[test]
     fn an_engine_without_a_ledger_keeps_todays_behaviour() {
-        // **默认必须是"什么都不记"。**
-        //
-        // 引擎是 core 里的东西，被近千条测试、干跑、端到端脚本反复构造。
-        // 默认去开一本台账（或者写进 `store`）的话，**每条引擎测试都会
-        // 凭空多出一批审计事件**，而那只会在有人正好在查留痕时被发现。
-        //
-        // 这里把三件事分开钉住：
-        //
-        // 1. 默认字段就是 `None`（私有字段，测试模块看得到）
-        // 2. 挂了探测器时**回落本身照旧发生**——不记不等于不回落
-        // 3. **任务 store 里一条决策事件都不多**：留痕只能走注入的那本台账，
-        //    顺手写进 `store` 会让"没挂台账"和"挂了台账"在投影上分不开
-        let router = ModelRouter::default();
+        // 显式对话型测试步骤验证 core 的本地健康审计；CLI 助理路由只含 DeepSeek。
+        let router = ModelRouter::new(
+            vec![
+                crate::think::ModelSpec::LOCAL,
+                crate::think::ModelSpec::DEEPSEEK_FLASH,
+            ],
+            crate::think::router::Tier::Cheap,
+        );
         let decider = StubDecider::succeeding();
         let plan = serde_json::json!({
             "steps": [
-                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "lookup" }
+                { "id": "s1", "instruction": "查一下今天的日程", "depends_on": [], "kind": "conversation" }
             ]
         })
         .to_string();
@@ -3182,7 +3234,7 @@ mod tests {
         let outcome = eng.run("t1").unwrap();
 
         assert_eq!(
-            handler.seen_providers[1], "agnes",
+            handler.seen_providers[1], "local",
             "没挂台账不影响回落本身（{:?}）",
             handler.seen_providers
         );

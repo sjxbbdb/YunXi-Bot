@@ -80,6 +80,8 @@ def main() -> int:
     rc = 0
 
     for entry in manifest["models"]:
+        if not entry.get("archive"):
+            continue  # 直接按 HF revision 分发的模型不重新打包。
         name = entry["name"]
         print(f"=== {name} ===")
 

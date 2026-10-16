@@ -1,0 +1,2 @@
+# 历史 Verdict 基线；需要对比时再安装。
+verdictml @ https://api.github.com/repos/Manavarya09/verdict/tarball/76bc1fe9ba87ec5b746ed33faac48812f1d1a4ca

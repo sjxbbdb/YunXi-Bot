@@ -30,6 +30,8 @@
 //! 想细看再单独取（[`InfoSource::read`]）。这条和模型路由同一条纪律：
 //! **先便宜地筛，再花代价地看**。
 
+#[cfg(target_os = "macos")]
+pub mod mac_mail;
 pub mod mail;
 
 use serde::{Deserialize, Serialize};
@@ -129,6 +131,16 @@ pub trait InfoSource: Send + Sync {
 
     /// 取未读。**按时间从新到旧。**
     fn fetch(&self, limit: usize) -> Result<FetchBatch, String>;
+
+    /// 新信检测不能依赖未读标志；不支持的源必须显式拒绝。
+    fn snapshot(&self) -> Result<Vec<InfoItem>, String> {
+        Err("此信息源不支持新信快照".into())
+    }
+
+    /// 用于只读分析的完整正文和元信息；读取失败不得以摘要代替。
+    fn read_for_review(&self, item: &InfoItem) -> Result<(InfoItem, String), String> {
+        Ok((item.clone(), self.read(&item.id)?))
+    }
 
     /// 取一条的正文。摘要不够判断时才调。
     fn read(&self, id: &str) -> Result<String, String>;

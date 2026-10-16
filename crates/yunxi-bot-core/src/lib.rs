@@ -33,9 +33,13 @@ pub mod info;
 pub mod instance;
 pub mod job;
 pub mod ledger;
+pub mod mail_reply;
+pub mod mail_review;
 pub mod mcp;
 pub mod memory;
 pub mod notify;
+#[cfg(target_os = "macos")]
+pub mod notify_macos;
 /// Windows toast 后端。**不在非 Windows 平台上编译**——它依赖 PowerShell + WinRT，
 /// 在没有它们的平台上放一个永远返回失败的实现只会制造噪音。
 #[cfg(windows)]
@@ -44,6 +48,7 @@ pub mod persona;
 pub mod policy;
 pub mod profile;
 pub mod recall_gate;
+pub mod retrieval;
 pub mod rules;
 pub mod runner;
 pub mod task;

@@ -46,7 +46,7 @@ echo   installing deps (about 1 GB, pulls torch, slow) ...
 "%VENV%\Scripts\python.exe" -m pip install -r "%ROOT%sidecar\requirements.txt"
 if errorlevel 1 (
   echo.
-  echo   install failed. Usually the network -- verdictml comes
+  echo   install failed. Usually the network -- laya comes
   echo   from GitHub. Just run this script again; pip resumes.
   exit /b 2
 )
@@ -56,7 +56,7 @@ rem  CUDA build of torch -- NOT optional for the local model.
 rem
 rem  requirements.txt pulls plain "torch" from PyPI, and on Windows
 rem  that wheel is the CPU-only build. The decision model
-rem  (verdict-small) is happy on CPU, so the decision side works and
+rem  (laya-multilingual) is happy on CPU, so the decision side works and
 rem  nothing looks broken -- but the local model (Qwen3-4B) is
 rem  useless there: roughly 1-2 tokens/second. And
 rem  local_llm_server.py is started with --device cuda, so it would

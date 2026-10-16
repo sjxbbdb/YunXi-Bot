@@ -247,6 +247,25 @@ pub fn decision_point_with_ledger(
     criteria: &[(&str, &str)],
     decision_sink: crate::decide::DecisionSink<'_>,
 ) -> Result<TaskDecision, TaskError> {
+    decision_point_with_context(
+        decider,
+        key,
+        question,
+        criteria,
+        serde_json::Value::Null,
+        decision_sink,
+    )
+}
+
+/// 原始目标和前置证据直接给决策模型，不能仅靠方案生成器在问题里转述。
+pub(super) fn decision_point_with_context(
+    decider: &dyn Decider,
+    key: &str,
+    question: &str,
+    criteria: &[(&str, &str)],
+    context: serde_json::Value,
+    decision_sink: crate::decide::DecisionSink<'_>,
+) -> Result<TaskDecision, TaskError> {
     // 判据不合法就不该问模型：问出来的答案没有意义，却会被当成一次真实判断记进台账。
     if criteria.len() < MIN_OPTIONS {
         return Err(TaskError::NeedsHuman {
@@ -288,6 +307,7 @@ pub fn decision_point_with_ledger(
         "question": question,
         "options": options,
         "criteria": criteria_map,
+        "context": context,
     });
     let req = DecisionRequest::new(state, vec![Question::choice(key, question, criteria)]);
 

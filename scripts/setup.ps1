@@ -5,8 +5,8 @@
 # 做三件事：建 venv、装依赖、拉决策模型权重（校验 SHA256）。
 # 跑完就能直接 `cargo run -- agent`。
 #
-# 为什么权重不放在 git 里：单个 model.safetensors 有 448.8 MB，超过 GitHub 的
-# 100 MiB 单文件硬上限，推不上去。所以走 Release 资产 + 本仓库的拉取脚本。
+# 为什么权重不放在 git 里：单个 model.safetensors 约 644 MB，超过 GitHub 的
+# 100 MiB 单文件硬上限，推不上去。所以用固定 HF revision + 本仓库的拉取脚本。
 
 [CmdletBinding()]
 param(
@@ -47,14 +47,14 @@ Ok "依赖就绪"
 # —— 3. 决策模型权重 ——
 if ($SkipModel) {
     Step 3 "跳过模型权重（-SkipModel）"
-    Warn "sidecar 会回落到 HuggingFace 下载，首次启动慢，且需要联网"
+    Warn "缺少本地权重时 sidecar 会报告 degraded；请稍后运行 scripts/fetch_model.py"
 } else {
-    Step 3 "拉取决策模型权重（约 350 MB，校验 SHA256）"
+    Step 3 "拉取决策模型权重（约 678 MB，校验 SHA256）"
     $fetchArgs = @("scripts\fetch_model.py")
     if ($Force) { $fetchArgs += "--force" }
     & $venvPy @fetchArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "权重拉取失败。可直接用 HuggingFace 兜底：删掉 models/manifest.json 里的 sha256_archive 再试"
+        throw "权重拉取或校验失败；检查网络后重试，不要移除哈希校验。"
     }
     Ok "决策模型就绪"
 }
@@ -62,8 +62,8 @@ if ($SkipModel) {
 Write-Host "`n完成。下一步：" -ForegroundColor Cyan
 Write-Host "    cargo build"
 Write-Host "    cargo run -- isolation-check          # 验证写入隔离真的生效"
-Write-Host "    .venv\Scripts\python.exe sidecar\verdict_server.py --port 17870"
+Write-Host "    .venv\Scripts\python.exe sidecar\laya_server.py --port 17870"
 Write-Host "    cargo run -- agent                    # 跑一个 Agent 回合"
 Write-Host ""
-Write-Host "Agnes 密钥放在（仓库外）：$env:LOCALAPPDATA\YunXiBot\secrets\agnes.key"
-Write-Host "或用环境变量 YUNXI_BOT_AGNES_KEY 覆盖。"
+Write-Host "DeepSeek 密钥（仅远端任务需要）放在（仓库外）：$env:LOCALAPPDATA\YunXiBot\secrets\deepseek.key"
+Write-Host "或用环境变量 YUNXI_BOT_DEEPSEEK_KEY 覆盖。"

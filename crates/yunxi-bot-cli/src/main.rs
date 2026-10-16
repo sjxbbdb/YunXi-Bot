@@ -9,6 +9,8 @@
 //! 以及**工具层**：模型能读文件、跑命令、抓网页，每个动作都过审批门禁。
 
 mod approval;
+#[cfg(target_os = "macos")]
+mod autostart_macos;
 mod chat;
 mod chat_handler;
 mod detach;
@@ -19,7 +21,6 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use yunxi_bot_core::decide::Decider;
 use yunxi_bot_core::job::{JobId, JobSpec, JobState, Trigger};
 use yunxi_bot_core::ledger::{EventKind, Ledger};
 use yunxi_bot_core::task::engine::{LedgerTaskStore, TaskStore};
@@ -64,6 +65,9 @@ const USAGE: &str = "\
 YunXi Bot —— 陪伴型通用常驻 Agent 助理
 
 用法:
+  yunxi-bot mac status       检查本机日历、提醒事项、通讯录、邮件和通知权限
+  yunxi-bot mac authorize calendar|reminders|contacts|mail|notifications  申请对应系统权限
+
   yunxi-bot add <名称> [选项] -- <命令...>   创建任务
       --every <秒>          固定间隔触发
       --cron \"分 时 日 月 周\"   cron 触发（本地时间）
@@ -77,6 +81,8 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
   yunxi-bot daemon [选项]     常驻循环
       --interval <毫秒>     每轮间隔（默认 5000）
       --max-ticks <n>       跑够 n 轮就停（便于演示，默认无限）
+      --mail-source mac|imap  邮件来源（Mac默认本机Mail，其他平台默认IMAP）
+      --assistant-interval <秒>  邮件巡检周期（默认300，0关闭）
       --require-os-isolation  要求 OS 级写入隔离，拿不到就拒绝执行
 
   yunxi-bot install-autostart    注册当前用户登录时自启
@@ -84,12 +90,17 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
   yunxi-bot autostart-status     查看自启注册状态
 
   yunxi-bot isolation-check      隔离自检：真起受限子进程验证写入隔离是否生效
-  yunxi-bot think <提示词>     调一次思考模型（Agnes），验证连通性与用量
+  yunxi-bot think <提示词>     调一次生成模型（默认 DeepSeek），验证连通性与用量
   yunxi-bot agent [选项]      跑一个完整的 Agent 回合（判断 + 表达）
       --hour <0-23>         假定当前小时（用于观察安静时段的影响）
       --no-think            只判断不表达（不消耗远端配额）
   yunxi-bot remember <内容>   记一条记忆
       --kind <类别>         fact / preference / relationship / event（默认 fact）
+  yunxi-bot knowledge add <文件>   导入 UTF-8 .md/.txt 副本
+  yunxi-bot knowledge list         列出已导入的知识文档
+  yunxi-bot knowledge search <问题> 语义检索（自动启动本地编码器）
+  yunxi-bot knowledge remove <id>  删除导入副本，保留原文件
+  yunxi-bot knowledge reindex      清除派生向量，下次检索自动重建
   yunxi-bot journal [-n N]    查看最近的决策记录（默认 10）
   yunxi-bot supervise [选项]   监督模式：daemon 异常退出时自动重启
       --interval <毫秒>     传给 daemon 的轮间隔（默认 5000）
@@ -107,24 +118,31 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --yes                 自动批准全部工具调用（危险，只给自动化用）
       --allow <工具[:粒度]>  预批准，可重复。例：--allow read_file:D:\\notes
       --deny <工具[:粒度]>   拒绝，优先级高于 --allow，可重复
-      --provider <名>       强制全程用一个模型：agnes / deepseek
+      --provider <名>       助理任务只使用 deepseek
       --thinking <模式>      auto（默认，按任务类型）/ on / off
       --id <名字>           指定任务 id（默认自动生成）
   yunxi-bot notify \"<标题>\" [\"<正文>\"]  发一条桌面通知（同时验证通知出口通不通）
-      --tag <标签>          替换同类通知而不是堆积
+      --tag <标签>          按标签去重或替换（Mac相同标签、相同内容不重复投递）
       --console             强制走控制台出口（验证出口可换）
   yunxi-bot check [选项]      看信息源 -> 判断 -> 该通知你的就通知你（落台账）
+      --mail-source mac|imap  与daemon共用信息源选择
       --limit <n>           判定几封（默认 20）
       --dry-run             只判定不真发通知（台账照记）
       --no-notify           完全不出通知，只看判定结果
       --console             通知打到终端
   yunxi-bot feedback [选项]   表个态：--last --never / --read / --ignored
-  yunxi-bot mail [选项]       看未读邮件（只读，不会标成已读）
+  yunxi-bot mail [选项]       看邮件与代回复设置（不会标成已读）
+      --reply-mode review|off|status  开关/查看自动拟回复（发送仍需确认）
+      --replies             查看回复建议与待确认问题
+      --reply-id <id>       配合--replies查看某条完整建议
+      --pending             查看分析后待处理/暂缓邮件、摘要和未通知原因
+      --include-notified    配合--pending同时查看已通知邮件，以继续处理
       --limit <n>           取几封（默认 20）
-      --read <uid>          看某封的正文
-      --port <n>            sidecar 端口（默认 17871）
+      --read <id>           看某封的正文（Mac使用列表中的完整JSON定位）
+      --mail-source mac|imap  mac读取数据目录mac-mail.json中的收件箱
+      --port <n>            显式选择IMAP sidecar端口（默认17871）
   yunxi-bot chat [选项]       交互式会话（通用 agent 的入口）
-      --resume [--id <名字>]  接着上次聊；不给 --id 就接最近那个
+      --resume [名字]       接着指定会话，也可用 --resume --id <名字>；不指定则接最近那个
       chat list             看有哪些会话
       --thinking auto|on|off 思考模式
       --context-window <n>   上下文窗口（token，默认按模型定）
@@ -134,6 +152,8 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
   yunxi-bot tasks             列出执行框架里的任务及其步骤
   yunxi-bot tasks <id>        看一个任务的步骤明细
   yunxi-bot resume <id>       续跑一个停在半路的任务
+      --provider <名>       续跑只使用 deepseek
+      --answer <内容>       回答当前待决步骤
 
   yunxi-bot approve <id>      批准待批准任务
   yunxi-bot log [-n N]        显示最近 N 条台账事件（默认 20）
@@ -206,12 +226,13 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "agent" => cmd_agent(rest),
         "remember" => cmd_remember(rest),
         "memory" => cmd_memory(rest),
+        "knowledge" => cmd_knowledge(rest),
         "profile" => cmd_profile(rest),
         "persona" => cmd_persona(rest),
         "journal" => cmd_journal(rest),
-        "install-autostart" => cmd_autostart(AutostartAction::Install),
-        "uninstall-autostart" => cmd_autostart(AutostartAction::Uninstall),
-        "autostart-status" => cmd_autostart(AutostartAction::Status),
+        "install-autostart" => cmd_autostart(AutostartAction::Install, rest),
+        "uninstall-autostart" => cmd_autostart(AutostartAction::Uninstall, rest),
+        "autostart-status" => cmd_autostart(AutostartAction::Status, rest),
         "tick" => cmd_tick(),
         "daemon" => cmd_daemon(rest),
         "supervise" => cmd_supervise(rest),
@@ -219,6 +240,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "do" => cmd_do(rest),
         "tasks" => cmd_tasks(rest),
         "tools" => cmd_tools(rest),
+        "mac" => cmd_mac(rest),
         "notify" => cmd_notify(rest),
         "mail" => cmd_mail(rest),
         "chat" => cmd_chat(rest),
@@ -237,6 +259,48 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 }
 
 // ——————————————————— 展示辅助 ———————————————————
+
+fn cmd_mac(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    {
+        use yunxi_bot_core::tool::macos::{bundled_app, request};
+        let (action, params) = match args {
+            [] => ("mac_status", serde_json::json!({})),
+            [status] if status == "status" => ("mac_status", serde_json::json!({})),
+            [authorize, target]
+                if authorize == "authorize"
+                    && matches!(
+                        target.as_str(),
+                        "calendar" | "reminders" | "contacts" | "mail" | "notifications"
+                    ) =>
+            {
+                ("authorize", serde_json::json!({"target":target}))
+            }
+            _ => {
+                eprintln!(
+                    "用法：yunxi-bot mac status | mac authorize calendar|reminders|contacts|mail|notifications"
+                );
+                return Ok(2);
+            }
+        };
+        let result = request(&bundled_app(), action, &params)?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        if action == "authorize" {
+            let field = params["target"].as_str().ok_or("缺少授权目标")?;
+            if result[field] != "full_access"
+                && !(field == "contacts" && result[field] == "limited")
+            {
+                return Ok(1);
+            }
+        }
+        Ok(0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = args;
+        Err("mac 命令只适用于 macOS".into())
+    }
+}
 
 fn state_tag(s: JobState) -> &'static str {
     match s {
@@ -596,14 +660,99 @@ struct TaskRound {
     dry_run: bool,
 }
 
-/// 助理回合的固定配置。启动时定好，每轮不变。
-///
-/// 打包成一个结构不是为了少敲几个字，而是因为**这五项是一组**：
-/// 它们共同定义"看哪个源、怎么通知、按谁的规则"。
-/// 散成五个参数时，调用点很容易把 `limit` 和 `dry_run` 传反——
-/// 而那样的错误不会编译失败，只会让行为悄悄不对。
+fn open_mail_source(
+    args: &[String],
+) -> Result<Box<dyn yunxi_bot_core::info::InfoSource>, Box<dyn std::error::Error>> {
+    if args.iter().any(|a| a == "--mail-source") && flag(args, "--mail-source").is_none() {
+        return Err("--mail-source 需要 mac 或 imap".into());
+    }
+    let default = if cfg!(target_os = "macos") && flag(args, "--port").is_none() {
+        "mac"
+    } else {
+        "imap"
+    };
+    match flag(args, "--mail-source").unwrap_or(default) {
+        "imap" => {
+            let port = flag(args, "--port")
+                .map(str::parse)
+                .transpose()?
+                .unwrap_or(yunxi_bot_core::info::mail::DEFAULT_PORT);
+            Ok(Box::new(yunxi_bot_core::info::mail::MailSource::new(port)))
+        }
+        #[cfg(target_os = "macos")]
+        "mac" => {
+            if flag(args, "--port").is_some() {
+                return Err("Mac Mail来源不接受IMAP端口；请明确选择一种来源".into());
+            }
+            Ok(Box::new(
+                yunxi_bot_core::info::mac_mail::MacMailSource::from_home(&default_home())?,
+            ))
+        }
+        _ => Err("--mail-source 仅接受 mac（Mac本机）或 imap".into()),
+    }
+}
+
+fn run_mail_pass<
+    D: yunxi_bot_core::decide::Decider,
+    N: yunxi_bot_core::notify::Notifier + ?Sized,
+>(
+    home: &std::path::Path,
+    ledger: &mut Ledger,
+    input: &mut yunxi_bot_core::assistant::PassInput<'_, D, N>,
+) -> Result<yunxi_bot_core::assistant::PassResult, String> {
+    let initialized = (|| {
+        if !yunxi_bot_core::mail_review::enabled(home)? {
+            return Ok(None);
+        }
+        if !input.source.name().starts_with("Mac Mail") {
+            return Err("只读邮件分析当前只支持Mac Mail来源".to_string());
+        }
+        yunxi_bot_core::mail_review::MailReview::open(home).map(Some)
+    })();
+    let mut review = match initialized {
+        Ok(Some(review)) => review,
+        Ok(None) => return yunxi_bot_core::assistant::run_pass(ledger, input),
+        Err(error) => {
+            ledger.append(yunxi_bot_core::EventKind::InfoFetched, None,
+                serde_json::json!({"source":input.source.name(),"ok":false,"error":error,"at_ms":input.now_ms}))
+                .map_err(|e| e.to_string())?;
+            return Err(error);
+        }
+    };
+    let mut cfg = ModelSpec::DEEPSEEK_FLASH.thinker_config();
+    cfg.timeout = std::time::Duration::from_secs(90);
+    let thinker = yunxi_bot_core::think::OpenAiThinker::from_home(home, cfg);
+    let borrowed = thinker
+        .as_ref()
+        .map(|t| t as &dyn yunxi_bot_core::think::Thinker)
+        .map_err(|_| "DeepSeek不可用");
+    let result =
+        yunxi_bot_core::assistant::run_reviewed_pass(ledger, input, &mut review, borrowed)?;
+    if !input.dry_run {
+        let mut reply_cfg = ModelSpec::DEEPSEEK_FLASH.thinker_config();
+        reply_cfg.timeout = std::time::Duration::from_secs(45);
+        let writer = yunxi_bot_core::think::OpenAiThinker::from_home(home, reply_cfg);
+        let writer = writer
+            .as_ref()
+            .map(|t| t as &dyn yunxi_bot_core::think::Thinker)
+            .map_err(|_| "DeepSeek不可用");
+        if let Err(error) = yunxi_bot_core::mail_reply::run(
+            home,
+            &review,
+            writer,
+            ledger,
+            yunxi_bot_core::now_millis().map_err(|e| e.to_string())?,
+        ) {
+            eprintln!("代回复暂缓（不影响已完成的收件通知）：{error}");
+            ledger.append(yunxi_bot_core::EventKind::InfoTriaged, None, serde_json::json!({"source":"mail_reply","action":"Hold","degraded":true,"reason":error,"at_ms":input.now_ms})).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(result)
+}
+
+/// 启动时固定信息源、通知出口与策略位置，避免巡检期间配置漂移。
 struct AssistantRound<'a> {
-    source: &'a yunxi_bot_core::info::mail::MailSource,
+    source: &'a dyn yunxi_bot_core::info::InfoSource,
     notifier: &'a dyn yunxi_bot_core::notify::Notifier,
     home: &'a std::path::Path,
     limit: usize,
@@ -638,9 +787,8 @@ fn run_assistant_round(
     health_ok: &mut Option<bool>,
 ) {
     use chrono::Timelike;
-    use yunxi_bot_core::assistant::{PassInput, run_pass};
+    use yunxi_bot_core::assistant::PassInput;
     use yunxi_bot_core::companion::CompanionPolicy;
-    use yunxi_bot_core::info::InfoSource;
     use yunxi_bot_core::memory::Situation;
     use yunxi_bot_core::triage::load_policy;
 
@@ -718,7 +866,7 @@ fn run_assistant_round(
         dry_run,
     };
 
-    match run_pass(ledger, &mut input) {
+    match run_mail_pass(home, ledger, &mut input) {
         Ok(r) => {
             // **无事发生就不吭声。** 见上面第 3 条。
             if r.is_quiet() && r.held == 0 && r.silent == 0 {
@@ -775,6 +923,12 @@ fn interventions_today(ledger: &Ledger, now_ms: u64) -> u32 {
         .iter()
         .filter(|e| e.kind == EventKind::NoticeSent && e.at >= day_start)
         .filter(|e| e.data.get("dry_run").and_then(|v| v.as_bool()) != Some(true))
+        .filter(|e| {
+            matches!(
+                e.data["result"].as_str(),
+                Some("已确认送达" | "已交给系统（未确认可见）")
+            )
+        })
         .count() as u32
 }
 
@@ -809,10 +963,6 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         .transpose()?
         .unwrap_or(120);
     let task_dry: bool = args.iter().any(|a| a == "--assistant-dry-run");
-    let mail_port: u16 = flag(args, "--port")
-        .map(str::parse)
-        .transpose()?
-        .unwrap_or(yunxi_bot_core::info::mail::DEFAULT_PORT);
 
     let opts = TickOptions {
         require_os_isolation: args.iter().any(|a| a == "--require-os-isolation"),
@@ -872,6 +1022,13 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     // 然后两秒一轮跑了 25 秒，一封邮件都没发现。
     let need_engine = agent_on || assistant_secs > 0;
 
+    // launchd 登录启动没有交互式 chat 帮忙预热；使用默认本地服务时自行拉起。
+    // 自定义端点由用户管理，不启动一个无关的默认服务。
+    #[cfg(target_os = "macos")]
+    if (need_engine || task_secs > 0) && flag(args, "--endpoint").is_none() {
+        ensure_decider_running();
+    }
+
     let mut engine = if need_engine {
         use yunxi_bot_core::agent::agent_engine;
         use yunxi_bot_core::decide::LayaDecider;
@@ -885,9 +1042,9 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         None
     };
     let thinker = if agent_on {
-        match yunxi_bot_core::think::agnes::OpenAiThinker::from_home(
+        match yunxi_bot_core::think::client::OpenAiThinker::from_home(
             &agent_home,
-            ThinkerConfig::agnes(),
+            ModelSpec::DEEPSEEK_FLASH.thinker_config(),
         ) {
             Ok(t) => {
                 use yunxi_bot_core::think::Thinker as _;
@@ -895,7 +1052,7 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 Some(t)
             }
             Err(_) => {
-                println!("  表达   : 不可用（没配密钥）——仍会判断与记账，但开不了口");
+                println!("  表达   : 不可用——仍会判断与记账，但开不了口");
                 None
             }
         }
@@ -911,31 +1068,14 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     //   助理回合：看**外部信息**（邮件），决定要不要把事告诉你
     //
     // 两者共用同一个决策引擎——都是 Interrupt 类，降级方向都是不打扰。
-    let assistant_source: Option<yunxi_bot_core::info::mail::MailSource> = if assistant_secs > 0 {
-        use yunxi_bot_core::info::InfoSource as _;
-        let src = yunxi_bot_core::info::mail::MailSource::new(mail_port);
-        // **启动时探一次只为把话说清楚，不决定要不要用它。**
-        //
-        // 最初这里写的是"探不到就设成 None，永不启用"——端到端测试立刻
-        // 抓到了它的后果：sidecar 只是还没起来，而守护进程从此再也不看邮件。
-        // 对一个要跑几天的进程，任何"启动时的一次失败决定长期行为"都是错的。
+    let assistant_source = if assistant_secs > 0 {
+        let src = open_mail_source(args)?;
         match src.health() {
-            Ok(()) => {
-                println!(
-                    "  信件   : 每 {} 秒看一次{}",
-                    assistant_secs,
-                    src.describe()
-                        .map(|w| format!("（{w}）"))
-                        .unwrap_or_default()
-                );
-            }
-            Err(e) => {
-                // 说清楚它**还会再试**，不然使用者会以为这条通道废了
-                println!(
-                    "  信件   : 每 {} 秒试一次（现在还连不上：{e}）",
-                    assistant_secs
-                );
-            }
+            Ok(()) => println!("  信件   : 每 {assistant_secs} 秒巡检{}", src.name()),
+            Err(e) => println!(
+                "  信件   : 每 {assistant_secs} 秒重试{}（当前不可用：{e}）",
+                src.name()
+            ),
         }
         Some(src)
     } else {
@@ -947,14 +1087,7 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         if args.iter().any(|a| a == "--console") {
             Box::new(yunxi_bot_core::notify::ConsoleNotifier)
         } else {
-            #[cfg(windows)]
-            {
-                Box::new(yunxi_bot_core::notify_windows::WindowsToast::new())
-            }
-            #[cfg(not(windows))]
-            {
-                Box::new(yunxi_bot_core::notify::NullNotifier)
-            }
+            yunxi_bot_core::notify::platform_notifier()
         };
 
     let assistant_limit: usize = flag(args, "--limit")
@@ -1025,16 +1158,9 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         if args.iter().any(|a| a == "--console") {
             Box::new(yunxi_bot_core::notify::ConsoleNotifier)
         } else {
-            #[cfg(windows)]
-            {
-                Box::new(yunxi_bot_core::notify_windows::WindowsToast::new())
-            }
-            #[cfg(not(windows))]
-            {
-                Box::new(yunxi_bot_core::notify::NullNotifier)
-            }
+            yunxi_bot_core::notify::platform_notifier()
         };
-    let task_router = yunxi_bot_core::think::ModelRouter::default();
+    let task_router = task_router(None)?;
     let task_decider = yunxi_bot_core::decide::LayaDecider::new(
         flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
     );
@@ -1087,13 +1213,13 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             // **这一段就是"常驻"两个字的落点。** 在此之前整条助理链路
             // 只能靠人手敲 `check` 触发——那不叫常驻，叫"你问我答"。
             if let Some(src) = assistant_source.as_ref() {
-                let now = now_millis().unwrap_or(0);
+                let now = now_millis()?;
                 let due = last_assistant_ms == 0
                     || now.saturating_sub(last_assistant_ms) >= assistant_secs * 1000;
                 if due {
                     last_assistant_ms = now;
                     let cfg = AssistantRound {
-                        source: src,
+                        source: src.as_ref(),
                         notifier: assistant_notifier.as_ref(),
                         home: &agent_home,
                         limit: assistant_limit,
@@ -1179,7 +1305,7 @@ fn run_agent_round<D, T>(
             if let Some(text) = &out.spoken {
                 println!("[{tick_no:>3}] ◆ 它开口了: {text}");
             } else if out.throttled {
-                println!("[{tick_no:>3}] Agent：本地限流，本轮未调用远端模型");
+                println!("[{tick_no:>3}] Agent：本地限流，本轮未调用生成模型");
             } else if out.decision.degraded {
                 // 降级会每轮都发生（Laya 没跑），只在首次提示一次
                 static WARNED: std::sync::Once = std::sync::Once::new();
@@ -1237,8 +1363,17 @@ fn startup_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 ///
 /// 为什么用 VBS：`.cmd` 会弹出控制台窗口。VBS 的 `Run(..., 0, False)` 以
 /// **隐藏窗口**方式拉起常驻进程，用户登录后不会看到一个黑框。
-fn cmd_autostart(action: AutostartAction) -> Result<i32, Box<dyn std::error::Error>> {
-    #[cfg(not(windows))]
+fn cmd_autostart(
+    action: AutostartAction,
+    args: &[String],
+) -> Result<i32, Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    {
+        autostart_macos::run(action, args)
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = args;
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = action;
         eprintln!("当前平台未实现自启注册。");
@@ -1441,18 +1576,11 @@ fn cmd_isolation_check() -> Result<i32, Box<dyn std::error::Error>> {
     Ok(2)
 }
 
-/// 调一次思考模型，验证连通性与用量。
-///
-/// 这个命令存在的意义：**接入层的真伪只能靠真实调用验证**。
-/// 单测能证明错误映射、限流、密钥不泄露，但证明不了"这台机器此刻真的能连上
-/// Agnes 并拿到回复"。
-use yunxi_bot_core::think::ThinkerConfig;
-
 /// 把一次 `think` 的用量记进台账。
 ///
 /// 抽成函数是为了**只写一处**：成功和失败两条路都要记，
 /// 两处各写一遍的话，"某个分支忘了记"迟早发生——而那种漏记不会报错。
-fn record_think_cost(resp: &yunxi_bot_core::think::ThinkResponse) {
+fn record_think_cost(provider: &str, resp: &yunxi_bot_core::think::ThinkResponse) {
     let Ok(mut l) = Ledger::open(ledger_path()) else {
         // 台账打不开不该让命令失败——它只是个记录。
         // 但要说一声：**"这次没留下记录"本身就是需要人知道的事。**
@@ -1460,7 +1588,7 @@ fn record_think_cost(resp: &yunxi_bot_core::think::ThinkResponse) {
         return;
     };
     let rec = yunxi_bot_core::costlog::CallRecord::new(
-        resp.model.split('-').next().unwrap_or("unknown"),
+        provider,
         &resp.model,
         yunxi_bot_core::costlog::peak_now(),
     )
@@ -1472,14 +1600,18 @@ fn record_think_cost(resp: &yunxi_bot_core::think::ThinkResponse) {
 }
 
 fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
-    use yunxi_bot_core::think::{Message, ModelSpec, ThinkRequest, Thinker, agnes::OpenAiThinker};
+    use yunxi_bot_core::think::{Message, ModelSpec, ThinkRequest, Thinker, client::OpenAiThinker};
 
     let positional: Vec<String> = args
         .iter()
         .enumerate()
         .filter(|(i, a)| {
             !a.starts_with("--")
-                && !(*i > 0 && args.get(i - 1).map(String::as_str) == Some("--provider"))
+                && !(*i > 0
+                    && matches!(
+                        args.get(i - 1).map(String::as_str),
+                        Some("--provider" | "--thinking")
+                    ))
         })
         .map(|(_, a)| a.clone())
         .collect();
@@ -1490,19 +1622,15 @@ fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     };
 
     let home = default_home();
-    // --provider 让同一套代码在 Agnes 与 DeepSeek 之间切换。
-    // 两者都是 OpenAI 兼容，差别只在 base_url / model / 密钥文件 / 思考模式。
-    //
-    // **配置从 `ModelSpec` 取，不在这里重抄一遍端点参数。**
-    // 这里原来各写一份 `ThinkerConfig::agnes()` / `::deepseek()`，
-    // 于是这个命令报的端点可以和路由实际用的那个不一样——
-    // 而"命令说测的是 Agnes、实际发去别处"正是刚修掉的那类 bug
-    // （路由说本地模型、请求发给 Agnes）。同一个事实只留一份数据。
-    let config = match flag(args, "--provider").unwrap_or("agnes") {
-        "agnes" => ModelSpec::AGNES_FLASH.thinker_config(),
+    let provider = flag(args, "--provider").unwrap_or("deepseek");
+    let config = match provider {
+        "local" => {
+            ensure_local_model_running();
+            ModelSpec::LOCAL.thinker_config()
+        }
         "deepseek" => ModelSpec::DEEPSEEK_FLASH.thinker_config(),
         other => {
-            eprintln!("未知 provider {other}，可用: agnes / deepseek");
+            eprintln!("未知 provider {other}，可用: local / deepseek");
             return Ok(2);
         }
     };
@@ -1510,16 +1638,15 @@ fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         Ok(t) => t,
         Err(e) => {
             eprintln!("无法初始化思考模型: {e}");
-            eprintln!();
-            eprintln!(
-                "密钥应放在: {}",
-                home.join("secrets").join("agnes.key").display()
-            );
-            eprintln!("或用环境变量 YUNXI_BOT_AGNES_KEY 覆盖。");
             return Ok(2);
         }
     };
 
+    let thinking = if parse_effort(args)? == ReasoningEffort::Always {
+        yunxi_bot_core::think::Thinking::Enabled
+    } else {
+        yunxi_bot_core::think::Thinking::Disabled
+    };
     println!("模型      : {}", thinker.model());
     println!("Base URL  : {}", thinker.config().base_url);
     println!(
@@ -1528,7 +1655,7 @@ fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         thinker.min_interval()
     );
     println!("超时      : {:?}", thinker.config().timeout);
-    println!("思考模式  : {}", thinker.config().thinking.label());
+    println!("思考模式  : {}", thinking.label());
     println!("提示词    : {prompt}");
     println!();
 
@@ -1537,6 +1664,7 @@ fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         Message::user(prompt),
     ])
     .with_max_tokens(256)
+    .with_thinking(thinking)
     .with_temperature(0.3);
 
     let started = std::time::Instant::now();
@@ -1550,7 +1678,7 @@ fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             //
             // **失败了也要记**：一次失败的网络请求可能照样花了 token，
             // 而"花了钱却没记录"正是最该避免的事。所以记在 Err 那边也有一份。
-            record_think_cost(&resp);
+            record_think_cost(provider, &resp);
             println!("耗时     : {} ms", started.elapsed().as_millis());
             println!("模型回执 : {}", resp.model);
             println!(
@@ -1637,23 +1765,29 @@ fn cmd_agent(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "当前小时 : {hour}   安静时段: {}:00–{}:00",
         policy.quiet_start_hour, policy.quiet_end_hour
     );
-    println!("表达模型 : {}", if no_think { "（跳过）" } else { "Agnes" });
+    println!(
+        "表达模型 : {}",
+        if no_think {
+            "（跳过）"
+        } else {
+            ModelSpec::DEEPSEEK_FLASH.model
+        }
+    );
     println!();
 
-    // 思考层是可选的：没配密钥也能跑判断
+    // 只判断时不加载生成模型。
     let home = default_home();
     let thinker = if no_think {
         None
     } else {
-        yunxi_bot_core::think::agnes::OpenAiThinker::from_home(&home, ThinkerConfig::agnes()).ok()
+        yunxi_bot_core::think::client::OpenAiThinker::from_home(
+            &home,
+            ModelSpec::DEEPSEEK_FLASH.thinker_config(),
+        )
+        .ok()
     };
     if !no_think && thinker.is_none() {
-        println!("提示：没有可用的思考模型（密钥缺失），本轮只判断不表达。");
-        println!(
-            "      密钥位置: {}",
-            home.join("secrets").join("agnes.key").display()
-        );
-        println!();
+        println!("提示：DeepSeek 初始化失败，本轮只判断不表达。");
     }
 
     match thinker.as_ref() {
@@ -1662,7 +1796,7 @@ fn cmd_agent(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             print_cycle(&out);
         }
         None => {
-            let out = run_cycle::<_, yunxi_bot_core::think::agnes::StubThinker>(
+            let out = run_cycle::<_, yunxi_bot_core::think::client::StubThinker>(
                 &mut ledger,
                 &mut engine,
                 None,
@@ -1687,7 +1821,7 @@ fn print_cycle(out: &yunxi_bot_core::agent::CycleOutcome) {
             println!("--- 它开口了 ---");
             println!("{text}");
         }
-        (None, true) => println!("（被本地限流挡下，本轮没去打远端模型，也没说话）"),
+        (None, true) => println!("（被本地限流挡下，本轮未调用生成模型，也没说话）"),
         (None, false) => println!("（本轮选择不开口）"),
     }
 }
@@ -1914,7 +2048,7 @@ fn cmd_profile(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     //
     // 这里做的是前半句：**判完只提议，不直接改档案**（§4.6）。
     if args.iter().any(|a| a == "--learn") {
-        use yunxi_bot_core::think::{Message, ThinkRequest, Thinker, agnes::OpenAiThinker};
+        use yunxi_bot_core::think::{Message, ThinkRequest, Thinker, client::OpenAiThinker};
 
         let store = yunxi_bot_core::think::session::SessionStore::new(&home);
         let Some(session) = store.latest()? else {
@@ -1936,7 +2070,7 @@ fn cmd_profile(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         }
         let transcript = said.join("\n---\n");
 
-        let config = ThinkerConfig::agnes();
+        let config = ModelSpec::DEEPSEEK_FLASH.thinker_config();
         let thinker = match OpenAiThinker::from_home(&home, config) {
             Ok(t) => t,
             Err(e) => {
@@ -1951,6 +2085,7 @@ fn cmd_profile(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             Message::user(format!("最近的对话：\n{transcript}")),
         ])
         .with_max_tokens(400)
+        .with_thinking(yunxi_bot_core::think::Thinking::Disabled)
         .with_temperature(0.2);
 
         let resp = match thinker.think(&req) {
@@ -1970,8 +2105,9 @@ fn cmd_profile(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         }
         let mut ledger = Ledger::open(ledger_path())?;
         println!("提炼出 {} 条，**都还没进画像**：", proposals.len());
-        for (text, reason) in proposals {
-            let id = format!("pp{}", yunxi_bot_core::now_millis()?);
+        for (index, (text, reason)) in proposals.into_iter().enumerate() {
+            // 本地模型一次常返回多条，同一毫秒内也必须能逐条审核。
+            let id = format!("pp{}-{index}", yunxi_bot_core::now_millis()?);
             ledger.append(
                 yunxi_bot_core::EventKind::ProfileProposed,
                 None,
@@ -2143,6 +2279,50 @@ fn cmd_profile(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 /// - "它怎么不记得了"无从查起
 ///
 /// 分层对不对也得靠这个命令核对（比如"这条明明是偏好，怎么归到事实了"）。
+fn cmd_knowledge(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::retrieval;
+    let home = default_home();
+    match args.first().map(String::as_str) {
+        Some("add") if args.len() == 2 => {
+            let id = retrieval::import_document(&home, std::path::Path::new(&args[1]))?;
+            println!("已导入 {id}；原文件更新后需再次 add，向量在下次检索时更新。");
+        }
+        Some("list") if args.len() == 1 => {
+            for (id, doc) in retrieval::documents(&home)? {
+                println!("{id}\t{}\t{} 字", doc.source, doc.text.chars().count());
+            }
+        }
+        Some("search") if args.len() >= 2 => {
+            let passages = retrieval::knowledge_passages(&home)?;
+            if !passages.is_empty() {
+                ensure_embedding_running()?;
+            }
+            let hits = retrieval::search(
+                &home,
+                "knowledge",
+                &passages,
+                &args[1..].join(" "),
+                &retrieval::endpoint(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&hits)?);
+        }
+        Some("remove") if args.len() == 2 => {
+            retrieval::remove_document(&home, &args[1])?;
+            println!("已删除知识副本 {}，原文件未改动。", args[1]);
+        }
+        Some("reindex") if args.len() == 1 => {
+            retrieval::clear_cache(&home, "knowledge")?;
+            retrieval::clear_cache(&home, "memory")?;
+            println!("已清除派生向量；下次检索按当前文档和台账重建。");
+        }
+        _ => {
+            eprintln!("用法：knowledge add <文件> | list | search <问题> | remove <id> | reindex");
+            return Ok(2);
+        }
+    }
+    Ok(0)
+}
+
 fn cmd_memory(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::memory::Memory;
 
@@ -2162,6 +2342,7 @@ fn cmd_memory(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             None,
             serde_json::json!({ "id": id }),
         )?;
+        yunxi_bot_core::retrieval::clear_cache(&default_home(), "memory")?;
         println!("已忘记：{id}");
         println!("  （台账里保留了这条记录——**忘记是可追溯的**，不是抹掉）");
         return Ok(0);
@@ -2397,24 +2578,24 @@ fn open_decider(args: &[String]) -> (Ledger, yunxi_bot_core::decide::LayaDecider
     let endpoint = flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide");
     let decider = yunxi_bot_core::decide::LayaDecider::new(endpoint);
     let ledger = Ledger::open(ledger_path()).expect("无法打开台账");
-    let alive = decider
-        .decide(&yunxi_bot_core::decide::DecisionRequest::new(
-            serde_json::json!({}),
-            vec![],
-        ))
-        .is_ok();
+    let alive = decider.is_ready();
     (ledger, decider, alive)
 }
 
 /// 决策模型的默认端口。
 const DECIDER_PORT: u16 = 17870;
 
-/// 本地小模型的端口。**和 `ModelSpec::LOCAL_QWEN` 的 base_url 必须一致**——
+/// 本地小模型的端口。**和 `ModelSpec::LOCAL` 的 base_url 必须一致**——
 /// 两处写死是隐患，所以这里也留一条注释指回去（改一处要改两处）。
 const LOCAL_MODEL_PORT: u16 = 17872;
 
-/// 本地槽位用的模型名。同样要和 `ModelSpec::LOCAL_QWEN` 对齐。
-const LOCAL_MODEL_NAME: &str = "Qwen3-4B-Instruct-2507";
+/// 本地槽位用的模型名。同样要和 `ModelSpec::LOCAL` 对齐。
+const LOCAL_MODEL_NAME: &str = ModelSpec::LOCAL.model;
+
+#[cfg(target_os = "macos")]
+const LOCAL_MODEL_DEVICE: &str = "mlx";
+#[cfg(not(target_os = "macos"))]
+const LOCAL_MODEL_DEVICE: &str = "auto";
 
 /// **确保决策模型在跑；不在就拉起来。**
 ///
@@ -2439,22 +2620,24 @@ fn ensure_decider_running() {
     use std::time::Duration;
 
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, DECIDER_PORT));
-    // 已经在跑就别动它——**不重启一个健康的东西**（重启要重新加载
-    // 465 MB 权重，几十秒）。
+    // 监听不代表权重加载完成；复用进程时也必须等待健康检查。
     if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
+        if !wait_for_decider_ready("http://127.0.0.1:17870/decide", Duration::from_secs(60)) {
+            eprintln!("  [决策模型] 服务未就绪；本轮分类会停止，请检查 /health 后重试。");
+        }
         return;
     }
 
-    let Some(script) = sidecar_script("verdict_server.py") else {
-        eprintln!(
-            "  [决策模型] 端口 {DECIDER_PORT} 没人监听，而且找不到 sidecar/verdict_server.py。"
-        );
-        eprintln!("             分类会退回\"永远是闲聊\"，任务中途的决策会退回\"总是问人\"。");
+    let Some(script) = sidecar_script("laya_server.py") else {
+        eprintln!("  [决策模型] 端口 {DECIDER_PORT} 没人监听，而且找不到 sidecar/laya_server.py。");
+        eprintln!("             本轮输入分类会停止，任务中的决策交由人工处理。");
         return;
     };
     let Some(python) = sidecar_python(&script) else {
         eprintln!("  [决策模型] 没找到可用的 Python，起不来。先跑一次：");
-        eprintln!("             scripts/setup.ps1   （或 安装Python环境.cmd）");
+        eprintln!(
+            "             按 README 的对应平台步骤创建 .venv 并安装 sidecar/requirements.txt"
+        );
         return;
     };
 
@@ -2485,66 +2668,82 @@ fn ensure_decider_running() {
         return;
     }
 
-    // 等它起来。**模型加载要几十秒**，所以这里只等"端口开始监听"——
-    // 那之后 /decide 可能还会 503 一阵，但那是它自己的事，
-    // 调用方拿不到答案时会按"弃权"处理，方向是安全的。
-    for _ in 0..40 {
-        std::thread::sleep(Duration::from_millis(250));
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
-            eprintln!("  [决策模型] 已就绪（端口 {DECIDER_PORT}）。");
-            return;
-        }
+    if wait_for_decider_ready("http://127.0.0.1:17870/decide", Duration::from_secs(60)) {
+        eprintln!("  [决策模型] 已加载并完成预热。");
+    } else {
+        eprintln!("  [决策模型] 60 秒内未就绪；本轮分类会停止，请检查 /health 后重试。");
     }
-    eprintln!("  [决策模型] 拉起来了但端口一直没监听——它可能起失败了。");
-    eprintln!("             先跑一次 `yunxi-bot decide` 看它报什么。");
 }
 
-/// **确保本地小模型在跑；不在就拉起来。**
-///
-/// ## 为什么只在 `chat` 里调它，不在 `do` 里
-///
-/// 本地模型是 4B、占 8 GB 显存、加载要几十秒。而 `do` 跑的任务
-/// **多数是复杂的**——它们走 DeepSeek，根本碰不到本地这条路。
-/// 为每次 `do` 白等几十秒，是拿最常走的路去补贴最少走的路。
-///
-/// **代价要说清楚**：不预热意味着 `do` 里那些"简单任务"一开始会打到
-/// 一个没人监听的端口上。这曾经是个真实的洞——`do` 的简单步骤直接失败。
-/// 现在由回落链兜住了：探到不是"就绪"就这一轮改走 Agnes，并顺手催一次
-/// `/warmup` 把冷启动摊到下一轮（见 `think::local_health`）。
-///
-/// ## 为什么等这么久
-///
-/// 决策模型是几百 MB，10 秒足够；这个是 8 GB，**加载完要几十秒**。
-/// 用同一个超时会把它误判成"起失败了"——而那个误判的后果是
-/// 每次调用都重新拉一遍，越拉越慢。
-///
-/// ## 为什么先看权重在不在，再决定启不启动
-///
-/// sidecar 是按 `YUNXI_BOT_HOME` 去找 `<home>/models/<名字>/` 的
-/// （`sidecar/local_llm_server.py` 的 `resolve_model_dir`，和
-/// `verdict_server.py` 里那套同一份规则）。而它继承的环境**就是跑 `chat`
-/// 那个环境**——所以"权重在不在它要去找的地方"，只有这里能提前算出来。
-///
-/// 不算会怎样（实测出来的）：拿一个临时 home 跑 `chat`，它照样会把 sidecar
-/// 拉起来；那个进程找不到权重，`/health` 报
-/// `degraded + OSError: Can't load the configuration of 'Qwen3-4B-Instruct-2507'`，
-/// 然后——**它永远不重试，也永远不放开 17872**。于是本地槽位整条死掉，
-/// 每一轮都安静地改走 Agnes，而每一处显示都正常。
-///
-/// 也就是说：**启动一个注定失败的 sidecar，比不启动更坏。** 不启动只是这一轮
-/// 没有本地模型；启动了是把本地槽位锁死，而且锁它的那个进程看着还挺健康
-/// （端口是开着的）。所以这里的判据只有一条：**它要去找的那个目录里有没有
-/// 权重**，没有就如实说、不启动。
-///
-/// ## 端口开着不等于它在干活
-///
-/// sidecar 是"先 bind 端口（`main()` 里 `ThreadingHTTPServer(...)`）、
-/// 再加载权重"的顺序，而加载失败之后它**照样占着端口**：
-/// `_load_once` 见到 `_model_error` 就立刻返回，`/warmup` 也一样不重试。
-/// 所以这里看到"有人在"就掉头走，会把一个**永远不会好**的进程当成"已经在跑"。
-/// 这种情况下要说话（[`warn_if_squatting`]），但**只认它自己说的 `degraded`**：
-/// 「正在加载」和「已经废了」在这一眼里长得一样，猜错的方向是让人去查一个
-/// 没坏的东西。
+fn wait_for_decider_ready(endpoint: &str, timeout: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    let decider = yunxi_bot_core::decide::LayaDecider::new(endpoint).with_timeout_ms(500);
+    loop {
+        if decider.is_ready() {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// 编码器无用户状态，可跨 home 复用；自定义端点由调用者管理，故障不擅自替换。
+fn ensure_embedding_running() -> Result<(), String> {
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+    if std::env::var_os("YUNXI_BOT_EMBEDDING_ENDPOINT").is_some() {
+        return Ok(());
+    }
+    let healthy = || -> bool {
+        yunxi_bot_core::decide::http::get_json("http://127.0.0.1:17873/health", 1000)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .is_some_and(|v| {
+                v["status"] == "ok"
+                    && v["model"] == yunxi_bot_core::retrieval::MODEL
+                    && v["dimension"] == 768
+            })
+    };
+    if healthy() {
+        return Ok(());
+    }
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 17873));
+    if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err() {
+        let script =
+            sidecar_script("embedding_server.py").ok_or("找不到 sidecar/embedding_server.py")?;
+        let python = sidecar_python(&script).ok_or("找不到向量模型的 Python 环境")?;
+        let weights = default_home().join("models/embeddinggemma-2");
+        if !weights.join("config.json").is_file() {
+            return Err(format!("向量权重缺失：{}", weights.display()));
+        }
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(default_home().join("embedding-sidecar.log"))
+            .map_err(|e| e.to_string())?;
+        let mut cmd = std::process::Command::new(python);
+        cmd.arg(script)
+            .arg("--model-dir")
+            .arg(weights)
+            .env("HF_HUB_OFFLINE", "1")
+            .env("TRANSFORMERS_OFFLINE", "1")
+            .stdout(log.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log);
+        detach::spawn_detached(&mut cmd).map_err(|e| e.to_string())?;
+        eprintln!("[向量检索] 正在加载 EmbeddingGemma 2 文本编码器（CPU）");
+    }
+    for _ in 0..20 {
+        if healthy() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Err("向量服务未就绪或模型身份不符；检查 embedding-sidecar.log 与 17873 端口".into())
+}
+
+/// 显式使用本地生成的入口共用启动逻辑；失败报告原因，不切换远端。
 fn ensure_local_model_running() {
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};
     use std::time::Duration;
@@ -2558,11 +2757,13 @@ fn ensure_local_model_running() {
         eprintln!(
             "  [本地模型] 端口 {LOCAL_MODEL_PORT} 没人监听，而且找不到 sidecar/local_llm_server.py。"
         );
-        eprintln!("             这一轮会自动改走 Agnes（回落链会处理），只是不再免费。");
+        eprintln!("             本地请求会明确失败，不会自动切换远端。");
         return;
     };
     let Some(python) = sidecar_python(&script) else {
-        eprintln!("  [本地模型] 没找到可用的 Python，起不来。先跑一次 安装Python环境.cmd。");
+        eprintln!(
+            "  [本地模型] 没找到推理环境。Mac 请运行 安装Mac环境.command --local-model（.venv-mlx）；其他平台按 README 准备 .venv。"
+        );
         return;
     };
 
@@ -2589,7 +2790,7 @@ fn ensure_local_model_running() {
         eprintln!("             OSError: Can't load the configuration of '{LOCAL_MODEL_NAME}'。");
         eprintln!("             所以**这次不启动**它——启动了只会留下一个端口开着、");
         eprintln!("             `/health` 永远 degraded、而且不会重试的进程占着本地槽位。");
-        eprintln!("             这一轮会自动改走 Agnes（回落链会处理），只是不再免费。");
+        eprintln!("             本地请求会明确失败，不会自动切换远端。");
         eprintln!(
             "             要让它回来：把权重放到上面那个路径（scripts/fetch_local_model.py），"
         );
@@ -2597,7 +2798,7 @@ fn ensure_local_model_running() {
         return;
     }
 
-    eprintln!("  [本地模型] 不在跑，正在拉起……（4B 要几十秒）");
+    eprintln!("  [本地模型] 正在加载 {LOCAL_MODEL_NAME}（首次加载需要等待）……");
     let mut cmd = std::process::Command::new(&python);
     cmd.arg(&script)
         .arg("--model")
@@ -2605,7 +2806,7 @@ fn ensure_local_model_running() {
         .arg("--port")
         .arg(LOCAL_MODEL_PORT.to_string())
         .arg("--device")
-        .arg("cuda")
+        .arg(LOCAL_MODEL_DEVICE)
         // **先热起来**：不然第一个使用者的第一句话要等一次完整加载，
         // 而那正是"第一印象"那一句。
         .arg("--warmup")
@@ -2630,8 +2831,7 @@ fn ensure_local_model_running() {
         }
     };
 
-    // 8 GB 的模型，给足 3 分钟。**宁可多等，也不要误判成失败**——
-    // 误判之后每次调用都会再拉一遍。
+    // 等待模型就绪，而不把 bind 端口误认为加载成功。
     for _ in 0..180 {
         std::thread::sleep(Duration::from_millis(1000));
         // **先看它还在不在。** 参数写错、缺个包、端口被别的进程占了……
@@ -2641,19 +2841,29 @@ fn ensure_local_model_running() {
             eprintln!("  [本地模型] 刚起来就退了（{status}），没有监听端口 {LOCAL_MODEL_PORT}。");
             eprintln!("             手动跑一次看它报什么：");
             eprintln!(
-                "               .venv\\Scripts\\python.exe sidecar\\local_llm_server.py --model {LOCAL_MODEL_NAME}"
+                "               {:?} {:?} --model {LOCAL_MODEL_NAME} --device {LOCAL_MODEL_DEVICE}",
+                python, script
             );
             return;
         }
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
-            eprintln!("  [本地模型] 已就绪（端口 {LOCAL_MODEL_PORT}）。");
-            return;
+        use yunxi_bot_core::think::local_health::{LocalHealth, health_endpoint, probe};
+        match probe(&health_endpoint(ModelSpec::LOCAL.base_url)) {
+            LocalHealth::Ready => {
+                eprintln!("  [本地模型] 已就绪（端口 {LOCAL_MODEL_PORT}）。");
+                return;
+            }
+            LocalHealth::Degraded(_) => {
+                warn_if_squatting();
+                return;
+            }
+            _ => {}
         }
     }
-    eprintln!("  [本地模型] 拉起来了但端口一直没监听——多半是显卡被占了或权重不全。");
+    eprintln!("  [本地模型] 等待 180 秒后仍未就绪，请检查 /health 和模型加载日志。");
     eprintln!("             手动跑一次看它报什么：");
     eprintln!(
-        "               .venv\\Scripts\\python.exe sidecar\\local_llm_server.py --model {LOCAL_MODEL_NAME}"
+        "               {:?} {:?} --model {LOCAL_MODEL_NAME} --device {LOCAL_MODEL_DEVICE}",
+        python, script
     );
 }
 
@@ -2704,7 +2914,7 @@ fn warn_if_squatting() {
 
     // 端点从 `LOCAL_QWEN.base_url` 推——**端口号不在这里再写一遍**
     // （理由见 `think::local_health::health_endpoint` 的文档）。
-    let endpoint = health_endpoint(ModelSpec::LOCAL_QWEN.base_url);
+    let endpoint = health_endpoint(ModelSpec::LOCAL.base_url);
     let LocalHealth::Degraded(detail) = probe(&endpoint) else {
         return;
     };
@@ -2713,12 +2923,20 @@ fn warn_if_squatting() {
     );
     eprintln!("             {detail}");
     eprintln!("             它不会自愈——不管它的话，本地槽位会一直是死的，而每一轮都");
-    eprintln!("             安静地改走 Agnes（功能还在，只是不再免费）。");
-    eprintln!("             看是谁占着： netstat -ano | findstr {LOCAL_MODEL_PORT}");
-    eprintln!("             收拾掉之后重开 chat 会重新拉一个： taskkill /PID <上面那个 pid> /F");
+    eprintln!("             本地调用会失败；请先释放内存并恢复本地服务。");
+    #[cfg(windows)]
+    {
+        eprintln!("             看是谁占着： netstat -ano | findstr {LOCAL_MODEL_PORT}");
+        eprintln!("             确认是本项目的 sidecar 后关闭： taskkill /PID <pid> /F");
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("             看是谁占着： lsof -nP -iTCP:{LOCAL_MODEL_PORT} -sTCP:LISTEN");
+        eprintln!("             确认是本项目的 sidecar 后关闭： kill <pid>，再重开 chat");
+    }
 }
 
-/// 找 `sidecar/verdict_server.py`。
+/// 找 `sidecar/laya_server.py`。
 ///
 /// **从可执行文件的位置往上找**，不读当前工作目录：
 /// 人在别的目录里跑 `yunxi-bot` 是常事，而 sidecar 永远在仓库里。
@@ -2730,16 +2948,21 @@ fn sidecar_script(file: &str) -> Option<std::path::PathBuf> {
     p.is_file().then_some(p)
 }
 
-/// 找能跑 sidecar 的 Python。
-///
-/// 三种布局都试，顺序就是"最可能对的先试"：
-/// 1. 开发检出：`<repo>/.venv/Scripts/python.exe`
-/// 2. 便携版：`<repo>/python/Scripts/python.exe`
-/// 3. PATH 上的 `python`
+/// 优先使用仓库 .venv，再试便携 python 目录，最后从 PATH 找解释器。
+/// 只选择本平台的布局，防止迁移后误执行从另一平台复制的虚拟环境。
 fn sidecar_python(script: &std::path::Path) -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    let candidates = ["Scripts/python.exe"].as_slice();
+    #[cfg(not(windows))]
+    let candidates = ["bin/python3", "bin/python"].as_slice();
     if let Some(repo) = script.parent()?.parent() {
+        #[cfg(target_os = "macos")]
+        if script.file_name()? == "local_llm_server.py" {
+            let python = repo.join(".venv-mlx/bin/python");
+            return python.is_file().then_some(python);
+        }
         for cand in [".venv", "python"] {
-            for exe in ["Scripts/python.exe", "bin/python"] {
+            for exe in candidates {
                 let p = repo.join(cand).join(exe);
                 if p.is_file() {
                     return Some(p);
@@ -2747,7 +2970,29 @@ fn sidecar_python(script: &std::path::Path) -> Option<std::path::PathBuf> {
             }
         }
     }
-    Some(std::path::PathBuf::from("python"))
+    Some(std::path::PathBuf::from(if cfg!(windows) {
+        "python"
+    } else {
+        "python3"
+    }))
+}
+
+// do 和 resume 共用，避免续跑重新加载本地生成权重。
+fn task_router(provider: Option<&str>) -> Result<yunxi_bot_core::think::ModelRouter, String> {
+    use yunxi_bot_core::think::ModelRouter;
+    let spec = match provider {
+        None | Some("deepseek") => ModelSpec::DEEPSEEK_FLASH,
+        Some("local") => {
+            return Err(
+                "任务统一使用 DeepSeek；本地生成仅保留 think --provider local 实验入口。".into(),
+            );
+        }
+        Some(other) => {
+            return Err(format!("未知任务 provider {other}，可用: deepseek"));
+        }
+    };
+    let tier = spec.tier;
+    Ok(ModelRouter::new(vec![spec], tier))
 }
 
 fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
@@ -2755,7 +3000,6 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     ensure_decider_running();
     use yunxi_bot_core::task::Budget;
     use yunxi_bot_core::task::engine::{Engine, LedgerTaskStore, create_task, summarize};
-    use yunxi_bot_core::think::ModelRouter;
 
     let goal: String = args
         .iter()
@@ -2801,25 +3045,11 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         return Ok(0);
     }
 
-    let router = ModelRouter::default();
-    // `--provider` 强制全程用一个模型。做法是**换掉整张档位表**，
-    // 而不是在路由里加特例——路由只有一套判据，别为调试口子fork 一份逻辑。
-    let router = match flag(args, "--provider") {
-        None => router,
-        Some(p) => {
-            let spec = match p {
-                "deepseek" => ModelSpec::DEEPSEEK_FLASH,
-                "agnes" => ModelSpec::AGNES_FLASH,
-                other => {
-                    eprintln!("未知 provider {other}，可用: agnes / deepseek");
-                    return Ok(2);
-                }
-            };
-            let tier = spec.tier;
-            println!("注意      : --provider 强制全程用 {p}，已关闭自动选择");
-            ModelRouter::new(vec![spec], tier)
-        }
-    };
+    let provider = flag(args, "--provider");
+    let router = task_router(provider)?;
+    if let Some(p) = provider {
+        println!("注意      : --provider 强制本次运行用 {p}，已关闭自动选择");
+    }
     // **这本句柄留着做回落留痕**（引擎的 `with_ledger`），任务 store 另开一本
     // 指向同一个文件：引擎已经可变借着 store，同一个台账对象借不出第二个
     // 可变引用——而那个限制是对的，谁持有台账只能有一个答案。
@@ -2859,7 +3089,7 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     if !decider_alive {
         println!();
         println!("⚠ 本地决策模型连不上：需要它拍板的步骤会全部升级为人工介入。");
-        println!("  启动 sidecar（python sidecar/verdict_server.py）后重跑即可。");
+        println!("  启动 sidecar（python sidecar/laya_server.py）后重跑即可。");
     }
     if dry_run {
         println!("（--dry-run：不调用任何模型）");
@@ -2881,7 +3111,7 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         // 比没有预览更糟（上面那行注释就是这个意思）。
         let out = Engine::new(&router, &decider, &mut handler, &mut store, budget)
             .with_effort(effort)
-            .with_local_probe(yunxi_bot_core::think::local_health::Probe::real())
+            .with_local_probe(None)
             // **干跑也要留痕。** 干跑算出来的路由就是真跑时会走的路由，
             // 回落了却不记的话，事后翻台账只会看到"这一步路由选了 Agnes"——
             // 而"它其实是被回落过去的"就看不出（D128 的形状）。
@@ -2927,7 +3157,7 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             // `Engine::local_probe` 的字段文档），而这一条路真的会花钱：
             // 不挂的话，一个判成轻量的步骤会直直打到 `127.0.0.1:17872` 上，
             // 而 sidecar 没起来时那一跳必然失败，失败理由和执行毫无关系。
-            .with_local_probe(yunxi_bot_core::think::local_health::Probe::real())
+            .with_local_probe(None)
             // **回落也要真的记。** 只探不记的话，这一步悄悄从本地槽位挪到
             // Agnes，而台账里一条 `route` 决策事件都没有——对话那条链路
             // 有、这条没有，"本地到底有没有被用上"就还是查不出来。
@@ -2958,7 +3188,10 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             println!("结果      : 停下等人");
             println!("原因      : {reason}");
             println!();
-            println!("处理完之后用 `yunxi-bot resume {task_id}` 续跑。");
+            let provider_arg = provider
+                .map(|p| format!(" --provider {p}"))
+                .unwrap_or_default();
+            println!("处理完之后用 `yunxi-bot resume {task_id}{provider_arg}` 续跑。");
             Ok(3)
         }
         yunxi_bot_core::task::Advance::Progress { settled, total, .. } => {
@@ -2966,6 +3199,20 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             Ok(1)
         }
     }
+}
+
+fn requested_chat_session_id(args: &[String]) -> Result<Option<&str>, &'static str> {
+    let explicit = flag(args, "--id").filter(|s| !s.starts_with("--"));
+    if args.iter().any(|s| s == "--id") && explicit.is_none() {
+        return Err("--id 后必须提供会话ID");
+    }
+    let positional = flag(args, "--resume").filter(|s| !s.starts_with("--"));
+    if let (Some(a), Some(b)) = (explicit, positional)
+        && a != b
+    {
+        return Err("--resume 与 --id 指向不同会话，拒绝猜测");
+    }
+    Ok(explicit.or(positional))
 }
 
 /// 交互式会话。**通用 agent 的核心入口。**
@@ -2980,11 +3227,6 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 /// 底下走的是同一个 `converse`：工具循环、审批门禁、台账留痕、
 /// 缓存前缀全都照旧。**另开一条的话，那条路迟早会绕开审批。**
 fn cmd_chat(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
-    // **每次跑之前先保证决策模型在跑**——它不在时整条链路会静默降级。
-    ensure_decider_running();
-    // 本地模型比决策模型重得多（8 GB / 几十秒），**所以只在 chat 里拉**——
-    // `do` 跑的多是复杂任务，走 DeepSeek，为它们白等不值得。
-    ensure_local_model_running();
     use yunxi_bot_core::think::ReasoningEffort;
     use yunxi_bot_core::think::session::SessionStore;
 
@@ -2995,9 +3237,12 @@ fn cmd_chat(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     if args.first().map(String::as_str) == Some("list") {
         return chat::list_sessions(&store);
     }
+    if flag(args, "--endpoint").is_none() {
+        ensure_decider_running();
+    }
 
     let resume = args.iter().any(|a| a == "--resume");
-    let session_id = match flag(args, "--id") {
+    let session_id = match requested_chat_session_id(args)? {
         Some(id) => id.to_string(),
         None => {
             // 不给 id 时：`--resume` 接最近那个，否则按时间新建一个。
@@ -3068,7 +3313,8 @@ fn cmd_chat(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     // 而那个在每一轮才知道；用最保守的一档起步，宁可早压。
     // `--context-window` 让使用者能自己调，也让端到端验证能在合理的
     // 时间内触发压缩（不然要聊几十轮才到 32k）。
-    let mut budget = yunxi_bot_core::think::context::ContextBudget::for_model("agnes");
+    let mut budget =
+        yunxi_bot_core::think::context::ContextBudget::for_model(ModelSpec::DEEPSEEK_FLASH.model);
     if let Some(w) = flag(args, "--context-window") {
         let w: usize = w.parse()?;
         if w < 512 {
@@ -3269,14 +3515,7 @@ fn cmd_notify(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let backend: Box<dyn Notifier> = if args.iter().any(|a| a == "--console") {
         Box::new(ConsoleNotifier)
     } else {
-        #[cfg(windows)]
-        {
-            Box::new(yunxi_bot_core::notify_windows::WindowsToast::new())
-        }
-        #[cfg(not(windows))]
-        {
-            Box::new(yunxi_bot_core::notify::NullNotifier)
-        }
+        yunxi_bot_core::notify::platform_notifier()
     };
 
     println!("出口      : {}", backend.name());
@@ -3460,18 +3699,12 @@ fn cmd_feedback(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 ///    "为什么这封没告诉我"时，答案必须在台账里，不能靠重跑一遍猜。
 fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::Ledger;
-    use yunxi_bot_core::assistant::{PassInput, run_pass};
+    use yunxi_bot_core::assistant::PassInput;
     use yunxi_bot_core::companion::{CompanionPolicy, companion_engine};
-    use yunxi_bot_core::info::InfoSource;
-    use yunxi_bot_core::info::mail::{MailSource, credentials_path};
     use yunxi_bot_core::memory::Situation;
     use yunxi_bot_core::notify::Notifier;
     use yunxi_bot_core::triage::load_policy;
 
-    let port: u16 = flag(args, "--port")
-        .map(str::parse)
-        .transpose()?
-        .unwrap_or(yunxi_bot_core::info::mail::DEFAULT_PORT);
     let limit: usize = flag(args, "--limit")
         .map(str::parse)
         .transpose()?
@@ -3479,10 +3712,10 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let dry_run = args.iter().any(|a| a == "--dry-run");
     let no_notify = args.iter().any(|a| a == "--no-notify");
 
-    let src = MailSource::new(port);
+    let src = open_mail_source(args)?;
     if let Err(e) = src.health() {
         eprintln!("信息源不可用: {e}");
-        eprintln!("配置文件: {}", credentials_path(&default_home()).display());
+
         return Ok(1);
     }
 
@@ -3501,14 +3734,7 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     } else if args.iter().any(|a| a == "--console") {
         Box::new(yunxi_bot_core::notify::ConsoleNotifier)
     } else {
-        #[cfg(windows)]
-        {
-            Box::new(yunxi_bot_core::notify_windows::WindowsToast::new())
-        }
-        #[cfg(not(windows))]
-        {
-            Box::new(yunxi_bot_core::notify::NullNotifier)
-        }
+        yunxi_bot_core::notify::platform_notifier()
     };
 
     // 判定引擎：优先本地 Verdict。连不上就是降级——而降级方向是不打扰，
@@ -3519,7 +3745,7 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let now = now_millis()?;
     use chrono::Timelike;
     let mut input = PassInput {
-        source: &src,
+        source: src.as_ref(),
         engine: &mut engine,
         notifier: notifier.as_ref(),
         policy: triage_policy,
@@ -3537,7 +3763,9 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     };
 
     let mut ledger = Ledger::open(ledger_path())?;
-    let r = match run_pass(&mut ledger, &mut input) {
+    let first_event = ledger.events().len();
+    input.ctx.interventions_today = interventions_today(&ledger, now);
+    let r = match run_mail_pass(&default_home(), &mut ledger, &mut input) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("取信息失败: {e}");
@@ -3546,9 +3774,6 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     };
 
     println!("信息源    : {}", src.name());
-    if let Some(who) = src.describe() {
-        println!("账号      : {who}");
-    }
     if !input.policy.allow_senders.is_empty() || !input.policy.block_senders.is_empty() {
         println!(
             "策略      : 白名单 {} 条 · 黑名单 {} 条（{}）",
@@ -3559,7 +3784,7 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 .display()
         );
     }
-    println!("未读总数  : {} 封", r.total_unseen);
+    println!("待判断总数: {} 封", r.total_unseen);
     println!("本次判定  : {} 封", r.fetched);
     if r.skipped > 0 {
         println!("取不到    : {} 封（这些没被看到）", r.skipped);
@@ -3569,8 +3794,7 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     // **逐条回放这一轮的判定**，让使用者能核对每一项决定。
     // 从台账读回来而不是在内存里传：这样回放的就是**真正记下来的东西**，
     // 不是"我以为记下来的东西"。
-    let start_seq = ledger.events().len() as u64;
-    for ev in ledger.events() {
+    for ev in ledger.events().iter().skip(first_event) {
         if ev.kind != yunxi_bot_core::EventKind::InfoTriaged {
             continue;
         }
@@ -3586,11 +3810,9 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         );
         println!("        {}", ev.data["reason"].as_str().unwrap_or(""));
     }
-    let _ = start_seq;
-
     println!();
     println!(
-        "通知 {} 条 · 攒着 {} 条 · 不提 {} 条",
+        "尝试通知 {} 条 · 攒着 {} 条 · 不提 {} 条（送达结果见台账）",
         r.notified, r.held, r.silent
     );
     if r.already_seen > 0 {
@@ -3605,14 +3827,36 @@ fn cmd_check(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 /// sidecar 没起来 / 起来了但没配邮箱 / 配好了但取不到。
 /// 第三种会转述 sidecar 的原话（比如"QQ 用的是授权码不是登录密码"）。
 fn cmd_mail(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
-    use yunxi_bot_core::info::InfoSource;
-    use yunxi_bot_core::info::mail::{MailSource, credentials_path};
-
-    let port: u16 = flag(args, "--port")
-        .map(str::parse)
-        .transpose()?
-        .unwrap_or(yunxi_bot_core::info::mail::DEFAULT_PORT);
-    let src = MailSource::new(port);
+    if let Some(mode) = flag(args, "--reply-mode") {
+        let value = yunxi_bot_core::mail_reply::set_mode(
+            &default_home(),
+            mode,
+            yunxi_bot_core::now_millis()?,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(0);
+    }
+    if args.iter().any(|a| a == "--replies") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&yunxi_bot_core::mail_reply::recent(
+                &default_home(),
+                flag(args, "--reply-id")
+            )?)?
+        );
+        return Ok(0);
+    }
+    if args.iter().any(|a| a == "--pending") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&yunxi_bot_core::mail_review::recent(
+                &default_home(),
+                args.iter().any(|a| a == "--include-notified")
+            )?)?
+        );
+        return Ok(0);
+    }
+    let src = open_mail_source(args)?;
 
     // `--read <uid>` 看一封的正文
     if let Some(uid) = flag(args, "--read") {
@@ -3635,27 +3879,10 @@ fn cmd_mail(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     }
 
     // 先报健康状态：把"没配"和"连不上"分开说清
-    let cfg_path = credentials_path(&default_home());
     match src.health() {
-        Ok(()) => {
-            // **说清读的是哪个邮箱。** 使用者看到"未读 12 封"时得能确认
-            // 读的是对的地方——一个报数字却不说从哪读的助理没法核实。
-            match src.describe() {
-                Some(who) => println!("sidecar   : 正常（端口 {port}，账号 {who}）"),
-                None => println!("sidecar   : 正常（端口 {port}）"),
-            }
-        }
+        Ok(()) => println!("信息源    : {}", src.name()),
         Err(e) => {
-            eprintln!("不可用    : {e}");
-            eprintln!("配置文件  : {}", cfg_path.display());
-            eprintln!();
-            eprintln!("需要这样一份 JSON（IMAP 密码填邮箱的**授权码**，不是登录密码）：");
-            eprintln!("  {{");
-            eprintln!("    \"imap_host\": \"imap.qq.com\",");
-            eprintln!("    \"imap_port\": 993,");
-            eprintln!("    \"username\": \"you@qq.com\",");
-            eprintln!("    \"password\": \"授权码\"");
-            eprintln!("  }}");
+            eprintln!("信息源不可用: {e}");
             return Ok(1);
         }
     }
@@ -3864,14 +4091,14 @@ fn cmd_tasks(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::task::engine::{Engine, LedgerTaskStore, summarize};
     use yunxi_bot_core::task::{Budget, TaskState};
-    use yunxi_bot_core::think::ModelRouter;
 
     let Some(id) = args.first().filter(|s| !s.starts_with("--")) else {
         eprintln!("缺少任务 id。用法: yunxi-bot resume <id>");
         return Ok(2);
     };
 
-    let router = ModelRouter::default();
+    let provider = flag(args, "--provider");
+    let router = task_router(provider)?;
     // **这本句柄原来被丢掉了（`_`）。留着它**：引擎要用它把回落记成
     // `Route` 决策事件（`Engine::with_ledger`）——续跑和 `do` 是同一个任务的
     // 同一批步骤，留痕的形状也得一样。store 那本照旧另开（下面那一行）。
@@ -3986,6 +4213,8 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     };
     let effort = parse_effort(args)?;
 
+    ensure_decider_running();
+
     let mut handler = chat_handler::ChatHandler::new(
         default_home(),
         "云熙",
@@ -4012,7 +4241,7 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             .with_effort(effort)
             // 续跑和 `do` 是**同一个任务的同一批步骤**，所以兜底也得一模一样：
             // 少了它，"这一步在哪条命令下跑"会决定它走不走本地槽位。
-            .with_local_probe(yunxi_bot_core::think::local_health::Probe::real())
+            .with_local_probe(None)
             // 留痕同理：漏了这一处，同一步在 `do` 里回落有记录、在 `resume`
             // 里没有——两条路看同一本台账，却给出两套答案。
             .with_ledger(&mut route_ledger)
@@ -4454,12 +4683,215 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn invalid_mail_analysis_configuration_is_audited_without_falling_back() {
+        use yunxi_bot_core::{
+            assistant::PassInput, companion, decide::StubDecider, info::NoSource,
+            memory::Situation, notify::NullNotifier, triage::TriagePolicy,
+        };
+        let home = tmp("mail-analysis-config-error");
+        std::fs::write(home.join("mail-analysis.json"), "{}").unwrap();
+        let mut ledger = Ledger::open(home.join("ledger")).unwrap();
+        let mut engine = companion::companion_engine(StubDecider::succeeding());
+        let mut input = PassInput {
+            source: &NoSource,
+            engine: &mut engine,
+            notifier: &NullNotifier,
+            policy: TriagePolicy::default(),
+            companion: companion::CompanionPolicy::default(),
+            ctx: Situation::default(),
+            local_hour: 10,
+            now_ms: 1_792_200_000_000,
+            limit: 100,
+            dry_run: true,
+        };
+        assert!(run_mail_pass(&home, &mut ledger, &mut input).is_err());
+        let failures: Vec<_> = ledger
+            .events()
+            .iter()
+            .filter(|e| e.kind == yunxi_bot_core::EventKind::InfoFetched)
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].data["ok"], false);
+        assert!(
+            !ledger
+                .events()
+                .iter()
+                .any(|e| e.kind == yunxi_bot_core::EventKind::NoticeSent)
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn invalid_mail_source_and_mixed_backends_are_rejected() {
+        for argv in [
+            vec!["--mail-source"],
+            vec!["--mail-source", "other"],
+            vec!["--mail-source", "mac", "--port", "17871"],
+        ] {
+            let args = argv.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(open_mail_source(&args).is_err());
+        }
+        assert!(open_mail_source(&["--mail-source".into(), "imap".into()]).is_ok());
+    }
+
+    #[test]
+    fn blocked_failed_and_dry_notifications_do_not_use_daily_quota() {
+        let dir = tmp("notice-quota");
+        let mut ledger = Ledger::open(dir.join("ledger.jsonl")).unwrap();
+        for (result, dry) in [
+            ("被系统阻止", false),
+            ("发送失败", false),
+            ("已确认送达", true),
+            ("已确认送达", false),
+            ("已交给系统（未确认可见）", false),
+        ] {
+            ledger
+                .append(
+                    EventKind::NoticeSent,
+                    None,
+                    serde_json::json!({"result":result,"dry_run":dry}),
+                )
+                .unwrap();
+        }
+        assert_eq!(interventions_today(&ledger, now_millis().unwrap()), 2);
+        drop(ledger);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn named_resume_cannot_silently_select_the_latest_other_session() {
+        for argv in [
+            vec!["--resume", "trip"],
+            vec!["--resume", "--id", "trip"],
+            vec!["--id", "trip"],
+        ] {
+            let args = argv.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(requested_chat_session_id(&args), Ok(Some("trip")));
+        }
+        let args = ["--resume", "--thinking", "off"].map(str::to_owned);
+        assert_eq!(requested_chat_session_id(&args), Ok(None));
+        for argv in [
+            vec!["--resume", "trip", "--id", "other"],
+            vec!["--id"],
+            vec!["--id", "--resume"],
+        ] {
+            let args = argv.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(requested_chat_session_id(&args).is_err());
+        }
+    }
+
+    #[test]
+    fn a_listening_decider_must_finish_loading_before_the_first_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/decide", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for status in ["degraded", "ok"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut buffer = [0; 2048];
+                let size = stream.read(&mut buffer).unwrap();
+                assert!(String::from_utf8_lossy(&buffer[..size]).starts_with("GET /health "));
+                let body = format!("{{\"status\":\"{status}\"}}");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        assert!(wait_for_decider_ready(
+            &endpoint,
+            std::time::Duration::from_secs(2)
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn decider_readiness_has_a_finite_wait_on_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/decide", listener.local_addr().unwrap());
+        drop(listener);
+        assert!(!wait_for_decider_ready(
+            &endpoint,
+            std::time::Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn task_commands_use_deepseek_for_every_phase_including_conversation_steps() {
+        for provider in [None, Some("deepseek")] {
+            let router = super::task_router(provider).unwrap();
+            for kind in [
+                TaskKind::Conversation,
+                TaskKind::Lookup,
+                TaskKind::Generation,
+                TaskKind::Planning,
+                TaskKind::Execution,
+                TaskKind::Analysis,
+            ] {
+                let route = router.route(
+                    "测试任务",
+                    kind,
+                    &TaskProfile::default(),
+                    ReasoningEffort::Auto,
+                    None,
+                );
+                assert_eq!(route.spec.provider, "deepseek");
+                assert_eq!(route.thinking, kind.needs_reasoning());
+            }
+        }
+        for provider in ["local", "typo", "agnes"] {
+            assert!(super::task_router(Some(provider)).is_err());
+        }
+    }
+
     /// 一个干净的临时目录（跑完自己删）。
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("yunxi-cli-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).expect("建临时目录");
         d
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn sidecar_uses_native_python_even_when_windows_venv_was_copied() {
+        let repo = tmp("native-python");
+        let script = repo.join("sidecar/laya_server.py");
+        let foreign = repo.join(".venv/Scripts/python.exe");
+        let native = repo.join(".venv/bin/python");
+        std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&foreign, "").unwrap();
+        std::fs::write(&native, "").unwrap();
+        let chosen = sidecar_python(&script);
+        std::fs::remove_file(&native).unwrap();
+        let fallback = sidecar_python(&script);
+        std::fs::remove_dir_all(&repo).unwrap();
+        assert_eq!(chosen, Some(native));
+        assert_eq!(fallback, Some(PathBuf::from("python3")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma_uses_its_mlx_environment_and_never_falls_back_to_laya_python() {
+        let repo = tmp("mlx-python");
+        let script = repo.join("sidecar/local_llm_server.py");
+        let laya = repo.join(".venv/bin/python");
+        let mlx = repo.join(".venv-mlx/bin/python");
+        for path in [&laya, &mlx] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        assert_eq!(sidecar_python(&script), Some(mlx.clone()));
+        std::fs::remove_file(mlx).unwrap();
+        assert_eq!(sidecar_python(&script), None);
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     /// **判据必须和 sidecar 一模一样。**

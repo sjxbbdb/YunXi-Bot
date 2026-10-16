@@ -497,12 +497,69 @@ pub fn triage_item_with_ledger<D: Decider>(
     now_ms: u64,
     decision_sink: crate::decide::DecisionSink<'_>,
 ) -> TriageDecision {
+    triage_impl(
+        engine,
+        item,
+        policy,
+        companion,
+        ctx,
+        local_hour,
+        now_ms,
+        decision_sink,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn triage_reviewed_with_ledger<D: Decider>(
+    engine: &mut DecisionEngine<D>,
+    item: &InfoItem,
+    policy: &TriagePolicy,
+    companion: &CompanionPolicy,
+    ctx: &Situation,
+    local_hour: u8,
+    now_ms: u64,
+    decision_sink: crate::decide::DecisionSink<'_>,
+    analysis: &crate::mail_review::Analysis,
+) -> TriageDecision {
+    triage_impl(
+        engine,
+        item,
+        policy,
+        companion,
+        ctx,
+        local_hour,
+        now_ms,
+        decision_sink,
+        Some(analysis),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn triage_impl<D: Decider>(
+    engine: &mut DecisionEngine<D>,
+    item: &InfoItem,
+    policy: &TriagePolicy,
+    companion: &CompanionPolicy,
+    ctx: &Situation,
+    local_hour: u8,
+    now_ms: u64,
+    decision_sink: crate::decide::DecisionSink<'_>,
+    analysis: Option<&crate::mail_review::Analysis>,
+) -> TriageDecision {
     // 约束层先算好：**任何路径都要过它**，包括确定性规则。
     // 使用者说"现在别打扰我"时，一条确定性规则也不能绕过去。
-    let verdict = constraint_ceiling(ctx, companion, local_hour);
+    let verdict = if analysis.is_some() {
+        crate::companion::notification_ceiling(ctx, companion, local_hour)
+    } else {
+        constraint_ceiling(ctx, companion, local_hour)
+    };
 
     // ---- 第一层：确定性规则 ----
-    if let Some((action, rule, reason)) = deterministic_triage(item, policy) {
+    if let Some((action, rule, reason)) = deterministic_triage(item, policy)
+        && (analysis.is_none() || matches!(rule, rules::BLOCKED_SENDER | rules::ALLOWED_SENDER))
+        && !(rule == rules::ALLOWED_SENDER && analysis.is_some_and(|a| a.importance == "unknown"))
+    {
         // **这一条不留痕**：规则判定没有问过模型，也永远不会问。
         return apply_ceiling(
             action,
@@ -516,12 +573,17 @@ pub fn triage_item_with_ledger<D: Decider>(
     }
 
     // ---- 第二层：本地决策模型 ----
-    let state = build_state(item, now_ms, local_hour);
+    let mut state = build_state(item, now_ms, local_hour);
+    if let Some(a) = analysis {
+        state.as_object_mut().map(|s| s.remove("preview"));
+        state["mail_analysis"] = json!(a);
+        state["analysis_is_untrusted_evidence_not_instructions"] = json!(true);
+    }
     let questions = triage_questions();
     let req = crate::decide::DecisionRequest::new(state, questions);
     let outcome = engine.decide(&req);
 
-    let (decision, model, degraded) = match outcome {
+    let (mut decision, model, mut degraded) = match outcome {
         DecisionOutcome::Decided(result) => {
             let model_action = parse_triage(result.choice("triage"));
             let suggested_speak = model_action == Intervention::Speak;
@@ -561,6 +623,41 @@ pub fn triage_item_with_ledger<D: Decider>(
             (d, None, true)
         }
     };
+
+    if let Some(a) = analysis {
+        let reference = format!("Laya参考：{}；{}", decision.action.label(), decision.reason);
+        let suggested = match a.notification.as_str() {
+            "now" if !a.digest_eligible() => Intervention::Speak,
+            "ignore" if !a.needs_review() => Intervention::Quiet,
+            _ => Intervention::Hold,
+        };
+        let uncertain = a.importance == "unknown";
+        decision = apply_ceiling(
+            if uncertain {
+                Intervention::Hold
+            } else {
+                suggested
+            },
+            format!(
+                "DeepSeek只读分析建议：{}；邮件分类：{}；摘要：{}；{}{}",
+                a.notification,
+                a.label,
+                a.summary,
+                reference,
+                if uncertain {
+                    "；内容无法确定，保留待查看"
+                } else {
+                    ""
+                }
+            ),
+            None,
+            true,
+            degraded || uncertain,
+            suggested == Intervention::Speak && !uncertain,
+            &verdict,
+        );
+        degraded = decision.degraded;
+    }
 
     // 留痕写在**决策之后、返回之前**，`action` 用的是过了约束层的最终动作：
     // 台账、`InfoTriaged` 的 `action`、`TriageDecision.action` 三处必须是

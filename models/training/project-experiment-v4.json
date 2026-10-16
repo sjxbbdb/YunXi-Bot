@@ -1,0 +1,71 @@
+{
+  "source_file": "models/training/project-review-v4.json",
+  "draft_canonical_sha256": "e31b00b04f32b15492d92cefff3cb8f8fe08279ae342317cba6618460039f257",
+  "review_status": "approved",
+  "samples": 360,
+  "decisions": 540,
+  "per_area": {
+    "input": {
+      "train": 36,
+      "validation": 8,
+      "calibration": 8,
+      "test": 8
+    },
+    "memory": {
+      "train": 36,
+      "validation": 8,
+      "calibration": 8,
+      "test": 8
+    },
+    "tool": {
+      "train": 36,
+      "validation": 8,
+      "calibration": 8,
+      "test": 8
+    },
+    "task": {
+      "train": 36,
+      "validation": 8,
+      "calibration": 8,
+      "test": 8
+    },
+    "companion": {
+      "train": 36,
+      "validation": 8,
+      "calibration": 8,
+      "test": 8
+    },
+    "mail": {
+      "train": 36,
+      "validation": 8,
+      "calibration": 8,
+      "test": 8
+    }
+  },
+  "losses": [
+    "rlcd",
+    "soft-ce"
+  ],
+  "seeds": [
+    20261015,
+    20261016,
+    20261017
+  ],
+  "epochs": 8,
+  "train_items": 324,
+  "optimizer_updates_per_run": 328,
+  "micro_batch": 1,
+  "grad_accum": 8,
+  "encoder_lr": 1e-05,
+  "head_lr": 5e-05,
+  "mps_allocator_limit_gib": 12,
+  "split_request_sha256": {
+    "train": "c8978406b49fbd864facca8e1b79b78f5f67de292be5069136567bc9fd7633b8",
+    "validation": "861474093d01e4e087c44dc7eb45472a92c8157ae55541e8989d309988f9cf87",
+    "calibration": "9393faf4252189a33e7652a35defeab06b2175479481267eb0e958765f0a409f",
+    "test": "c40d119cd2144d93df486998c131c6271fb05a0f4bccf712bc06d18e8eea2b12"
+  },
+  "selection": "validation-only; compare three-seed mean accuracy then mean loss; final ties prefer rlcd",
+  "production_changed": false,
+  "approved_source_sha256": "1e295acf77abba11715b9fcfc31d8f6bfbf24e41df886fe0790b176c79441b12"
+}

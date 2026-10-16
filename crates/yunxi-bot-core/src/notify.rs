@@ -75,7 +75,8 @@ impl Urgency {
 pub struct Notification {
     pub title: String,
     pub body: String,
-    /// 去重标识。**同 tag 的通知会替换而不是堆积**。
+    /// 去重标识。平台后端以相同 tag 去重或替换通知。
+    /// macOS原生出口回读同标识同内容，重试时不重复投递。
     ///
     /// 用它是为了避免"未读邮件 3 封"、"未读邮件 4 封"、"未读邮件 5 封"
     /// 连刷三条——那正是使用者最讨厌的通知形态。
@@ -114,12 +115,11 @@ impl Notification {
 pub enum Delivery {
     /// **确认送达，且能证明**（在系统通知中心里查得到）。
     ///
-    /// 只有这一档允许对外说"通知你了"。
+    /// 确认进入通知中心不证明横幅可见或用户已读。
     Confirmed { evidence: String },
     /// 交给了系统，但**无法证明使用者会看到**。
     ///
-    /// 勿扰/专注助手开着时就是这一档：通知进了通知中心，但不弹横幅。
-    /// 这不算失败，但**也不能算送达**。
+    /// 无法回读系统记录的后端只到这一档，不能算确认送达。
     HandedOff { note: String },
     /// **确定不会送达**：应用通知被关、被用户关、被组策略禁止。
     ///
@@ -185,6 +185,22 @@ pub trait Notifier: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn notify(&self, n: &Notification) -> Delivery;
+}
+
+/// 所有入口共用平台选择，防止只有手动 notify 能发、守护进程仍使用空出口。
+pub fn platform_notifier() -> Box<dyn Notifier> {
+    #[cfg(windows)]
+    {
+        Box::new(crate::notify_windows::WindowsToast::new())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(crate::notify_macos::MacNotification)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Box::new(NullNotifier)
+    }
 }
 
 /// 什么都不发。**这是显式的选择，不是失败。**

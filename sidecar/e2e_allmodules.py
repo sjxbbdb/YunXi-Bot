@@ -151,7 +151,7 @@ def main():
     # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
     before_home = snapshot_home(real_home)
     (home / "secrets").mkdir(parents=True, exist_ok=True)
-    for n in ("agnes.key", "deepseek.key", "bocha.key"):
+    for n in ("deepseek.key", "bocha.key"):
         src = real_home / "secrets" / n
         if src.is_file():
             shutil.copy2(src, home / "secrets" / n)

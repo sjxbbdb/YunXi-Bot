@@ -56,16 +56,14 @@ def main() -> int:
     real_home = real_home_dir()
     # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
     before_home = snapshot_home(real_home)
-    key = real_home / "secrets" / "agnes.key"
-    if not key.exists():
-        print("没有 agnes.key，这个验证需要真模型", file=sys.stderr)
-        return 2
 
     with tempfile.TemporaryDirectory(prefix="yunxi-rules-") as tmp:
         root = Path(tmp)
         home = root / "home"
         (home / "secrets").mkdir(parents=True, exist_ok=True)
-        shutil.copy(key, home / "secrets" / "agnes.key")
+        key = real_home / "secrets" / "deepseek.key"
+        if key.exists():
+            shutil.copy(key, home / "secrets" / "deepseek.key")
         env = dict(os.environ, YUNXI_BOT_HOME=str(home), PYTHONIOENCODING="utf-8")
 
         def chat(lines: list[str], cwd: Path, sid: str, *extra: str, timeout: int = 300):

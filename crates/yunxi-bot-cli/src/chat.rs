@@ -112,6 +112,7 @@ impl yunxi_bot_core::think::context::Summarizer for ModelSummarizer {
             temperature: None,
             thinking: Some(yunxi_bot_core::think::Thinking::Disabled),
             tools: Vec::new(),
+            json_output: false,
         };
 
         // **摘要也要走限流等待。**
@@ -136,16 +137,17 @@ impl yunxi_bot_core::think::context::Summarizer for ModelSummarizer {
 fn compact_now(
     handler: &mut ChatHandler,
     budget: &yunxi_bot_core::think::context::ContextBudget,
+    spec: &yunxi_bot_core::think::ModelSpec,
 ) -> Option<yunxi_bot_core::think::context::Compaction> {
     // 用量还没到就别白花一次调用
     let usage = handler.chat_usage()?;
     if !budget.should_compact(&usage) {
         return None;
     }
-    // 用哪个模型做摘要：优先便宜的那个（摘要是简单活），
+    // 摘要使用本轮选中的模型；纯任务会话不额外唤醒本地聊天模型。
     // 拿不到就退回兜底——**压缩不能失败**。
     let summarizer: Box<dyn yunxi_bot_core::think::context::Summarizer> =
-        match handler.summarizer_thinker() {
+        match handler.summarizer_thinker(spec) {
             Some(t) => Box::new(ModelSummarizer::new(t)),
             None => Box::new(yunxi_bot_core::think::context::DropMarker),
         };
@@ -389,11 +391,19 @@ pub fn run(
             }
         }
 
+        let routing = match handler.route_for(input, effort) {
+            Ok(routing) => routing,
+            Err(e) => {
+                eprintln!("这一轮未执行: {e}");
+                continue;
+            }
+        };
+
         // ---- 压缩检查：**在花掉这一轮之前做** ----
         //
         // 放在这里而不是响应之后：响应回来时已经花掉了，
         // 而超限的响应本身就是失败（API 报错）。所以要在发出去之前压。
-        if let Some(c) = compact_now(handler, &budget) {
+        if let Some(c) = compact_now(handler, &budget, &routing.spec) {
             println!("  （{}）", c.summary());
             if let Some(l) = ledger.as_mut() {
                 let _ = l.append(
@@ -417,7 +427,6 @@ pub fn run(
         }
 
         // ---- 一轮对话 ----
-        let routing = handler.route_for(input, effort);
         println!(
             "  [{}·{}]",
             routing.spec.model,

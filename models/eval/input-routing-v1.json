@@ -1,0 +1,208 @@
+{
+  "criteria": {
+    "task": "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类",
+    "chat": "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。不需要我动手做任何事，回一句话就够了只是引用台词、描述别人的命令而明确不要求执行时，也是闲聊。"
+  },
+  "samples": [
+    {
+      "input": "你好呀",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "我今天有点累，只想有人陪我说说话",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "你在吗？",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "为什么最近总觉得日子过得好快啊，我只是感慨一下",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "今天终于把工作做完了，好开心",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "别给我建议，我就想吐槽几句",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "我不想写周报了，陪我聊聊天就好",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "太阳为什么看起来是红色的？简单聊聊就行",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "“帮我删除文件”是我刚才看到的一句台词，我不是让你做",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "谢谢，先不做任何事了",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "帮我处理一下",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "查一下明天上海的天气",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "帮我写一封请假邮件",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "把结果保存为报告.txt",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "读取当前目录的输入.txt，告诉我里面的口令",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "运行测试，找出失败原因",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "分析这两份方案的优缺点",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "我心情不太好，不过先帮我读一下输入.txt",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "帮我算一下这几个项目的总预算",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "帮我删除旧日志文件",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "刚才客户说“把报告重写一遍”，我快气死了，只想吐槽，不用帮忙",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "假如机器人会洗碗就好了，哈哈，随口一说",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "先别查天气，陪我说会儿话",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "不知道为什么，今天特别想家",
+      "expected": "chat",
+      "group": "development"
+    },
+    {
+      "input": "我有点烦，还是先把这段文字翻译成英文：今天很开心",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "查找目录里名字包含账单的文件",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "帮我拟一份周末旅行安排",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "检查这份配置有没有问题",
+      "expected": "task",
+      "group": "development"
+    },
+    {
+      "input": "今天路上看见一朵很漂亮的花，想跟你分享",
+      "expected": "chat",
+      "group": "validation"
+    },
+    {
+      "input": "没什么事，就是想跟你打个招呼",
+      "expected": "chat",
+      "group": "validation"
+    },
+    {
+      "input": "好久没休息了，有点委屈，听我讲就好",
+      "expected": "chat",
+      "group": "validation"
+    },
+    {
+      "input": "你喜欢听什么类型的音乐？",
+      "expected": "chat",
+      "group": "validation"
+    },
+    {
+      "input": "周末到了，终于可以躺一会儿了",
+      "expected": "chat",
+      "group": "validation"
+    },
+    {
+      "input": "不用帮忙，我已经处理好了，来聊天吧",
+      "expected": "chat",
+      "group": "validation"
+    },
+    {
+      "input": "请帮我把会议纪要整理成三条行动项",
+      "expected": "task",
+      "group": "validation"
+    },
+    {
+      "input": "读取项目中的 README 文件",
+      "expected": "task",
+      "group": "validation"
+    },
+    {
+      "input": "把文档中的错别字改掉",
+      "expected": "task",
+      "group": "validation"
+    },
+    {
+      "input": "我很开心，顺便帮我搜索附近的书店",
+      "expected": "task",
+      "group": "validation"
+    },
+    {
+      "input": "请调用 now 工具告诉我现在的时间",
+      "expected": "task",
+      "group": "validation"
+    },
+    {
+      "input": "先查资料，再帮我比较两种技术的区别",
+      "expected": "task",
+      "group": "validation"
+    }
+  ]
+}

@@ -79,6 +79,7 @@ impl PriceTable {
         source: "本地模型（sidecar/local_llm_server.py）：无 API 费用",
     };
 
+    // 仅用于重算历史台账；Agnes 已退出运行模型表（ADR D140）。
     pub const AGNES_30_FLASH: Self = Self {
         cache_hit_peak: 0.035,
         cache_hit_idle: 0.035,

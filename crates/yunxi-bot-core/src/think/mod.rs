@@ -1,23 +1,7 @@
-//! 思考层：Agent 的通用能力来自这里。
-//!
-//! ## 分工
-//!
-//! - **思考层（本模块）**：Agent 的"脑子"。通用推理、写东西、规划、干活。
-//!   默认接远端模型（Agnes）。慢、贵、有配额，但是通用的。
-//! - **决策层（[`crate::decide`]）**：只管"该不该介入"这一类判断。
-//!   本地跑（Laya），快、免费、离线可用。
-//!
-//! 两者不是一回事：**Laya 不负责思考，只负责判断要不要打扰你。**
-//!
-//! ## 为什么必须有本地那一层做前置
-//!
-//! Agnes 免费档的文本模型 **RPM 只有 10**（2026-09 起从 20 下调 50%）。
-//! 常驻进程如果每轮都去打远端，几秒钟就把配额烧光并触发限流。
-//!
-//! 所以顺序是：**本地 Laya 先筛 → 只有值得的才花一次远端调用**。
-//! 这不是为了省钱的优化，是这个配额下的结构必然。
+//! 生成层：本地模型承担对话、摘要与陪伴表达；复杂任务可路由到 DeepSeek。
+//! 决策层 Laya 提供分类建议，执行权限仍由确定性策略控制。
 
-pub mod agnes;
+pub mod client;
 pub mod context;
 pub mod cost;
 pub mod local_health;
@@ -32,7 +16,7 @@ pub mod thresholds {
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub use agnes::{OpenAiThinker, ThinkerConfig};
+pub use client::{OpenAiThinker, ThinkerConfig};
 pub use cost::{Cost, PriceTable, Usage};
 pub use router::{
     ModelRouter, ModelSpec, ReasoningEffort, Routing, TaskKind, TaskProfile, Thinking, detect_code,
@@ -149,6 +133,8 @@ pub struct ThinkRequest {
     ///
     /// 实测：**开思考时带 `tools` 不会报错**，正常返回 `tool_calls`。
     pub tools: Vec<serde_json::Value>,
+    /// 机器读取的结果显式请求 JSON；普通聊天保持服务端默认格式。
+    pub json_output: bool,
 }
 
 impl ThinkRequest {
@@ -159,6 +145,7 @@ impl ThinkRequest {
             temperature: None,
             thinking: None,
             tools: Vec::new(),
+            json_output: false,
         }
     }
 

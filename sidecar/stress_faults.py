@@ -19,7 +19,7 @@
 
 ## 怎么注入
 
-- **坏 key**：`YUNXI_BOT_AGNES_KEY` 环境变量覆盖（代码里写了这条覆盖路径）
+- **坏 key**：`YUNXI_BOT_DEEPSEEK_KEY` 环境变量覆盖（代码里写了这条覆盖路径）
 - **侧车不可达**：把 `--port` 指到一个没人监听的端口
 - **中途挂掉**：先跑一轮，杀了侧车，再跑一轮
 
@@ -68,14 +68,14 @@ def main() -> int:
     real_home = real_home_dir()
     # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
     before_home = snapshot_home(real_home)
-    if not (real_home / "secrets" / "agnes.key").exists():
-        print("没有 agnes.key，这个验证需要真模型", file=sys.stderr)
+    if not (real_home / "secrets" / "deepseek.key").exists():
+        print("没有 deepseek.key，这个验证需要真模型", file=sys.stderr)
         return 2
 
     with tempfile.TemporaryDirectory(prefix="yunxi-fault-") as tmp:
         home = Path(tmp)
         (home / "secrets").mkdir(parents=True, exist_ok=True)
-        for n in ("agnes.key", "deepseek.key", "bocha.key", "mail.json"):
+        for n in ("deepseek.key", "bocha.key", "mail.json"):
             src = real_home / "secrets" / n
             if src.exists():
                 shutil.copy(src, home / "secrets" / n)
@@ -85,9 +85,9 @@ def main() -> int:
 
         # ================= 一、坏 API key =================
         print("=== 故障注入 1：坏 API key ===")
-        bad_env = dict(base_env, YUNXI_BOT_AGNES_KEY="sk-this-key-is-definitely-wrong")
+        bad_env = dict(base_env, YUNXI_BOT_DEEPSEEK_KEY="sk-this-key-is-definitely-wrong")
         r = subprocess.run(
-            [str(BIN), "think", "说「好」", "--thinking", "off"],
+            [str(BIN), "think", "说「好」", "--provider", "deepseek", "--thinking", "off"],
             capture_output=True, text=True, encoding="utf-8",
             env=bad_env, timeout=300, cwd=str(work),
         )

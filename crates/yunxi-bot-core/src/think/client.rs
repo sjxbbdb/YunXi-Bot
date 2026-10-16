@@ -1,24 +1,10 @@
-//! Agnes AI 接入（OpenAI 兼容）。
-//!
-//! - Base URL：`https://api.agnes-ai.cn/v1`
-//! - 端点：`POST /v1/chat/completions`
-//! - 认证：`Authorization: Bearer <key>`
-//! - 默认模型：`agnes-3.0-flash`（512K 上下文、支持工具调用、面向 Agent 任务）
-//!
-//! 文档：<https://wiki.agnes-ai.cn/zh-Hans/docs/overview>
+//! OpenAI 兼容客户端：本地生成模型与显式配置的远端模型共用协议。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::router::Thinking;
 use super::{RateLimiter, ThinkError, ThinkRequest, ThinkResponse, Thinker, Usage};
-
-/// 默认 Base URL。
-pub const DEFAULT_BASE_URL: &str = "https://api.agnes-ai.cn/v1";
-/// 默认模型。3.0 Flash 面向 Agent 任务与工具调用，是本项目的主力。
-pub const DEFAULT_MODEL: &str = "agnes-3.0-flash";
-/// 免费档文本模型的实际 RPM（2026-09 起从 20 下调到 10）。
-pub const FREE_TIER_RPM: u32 = 10;
 
 /// API 密钥。
 ///
@@ -35,20 +21,19 @@ impl ApiKey {
 
     /// 从环境变量或本地文件读取。
     ///
-    /// 顺序：`YUNXI_BOT_AGNES_KEY` 环境变量 → `key_file`。
+    /// 顺序：`YUNXI_BOT_DEEPSEEK_KEY`（仅 deepseek.key）→ `key_file`。
     /// 文件方式优先于命令行参数，**避免密钥出现在进程列表里**。
     pub fn load(key_file: &Path) -> Result<Self, ThinkError> {
-        if let Ok(v) = std::env::var("YUNXI_BOT_AGNES_KEY")
+        if key_file
+            .file_name()
+            .is_some_and(|name| name == "deepseek.key")
+            && let Ok(v) = std::env::var("YUNXI_BOT_DEEPSEEK_KEY")
             && !v.trim().is_empty()
         {
             return Ok(Self::new(v));
         }
-        let text = std::fs::read_to_string(key_file).map_err(|e| {
-            ThinkError::Auth(format!(
-                "读不到密钥文件 {}（可设 YUNXI_BOT_AGNES_KEY 覆盖）: {e}",
-                key_file.display()
-            ))
-        })?;
+        let text = std::fs::read_to_string(key_file)
+            .map_err(|e| ThinkError::Auth(format!("读不到密钥文件 {}: {e}", key_file.display())))?;
         let key = text.trim();
         if key.is_empty() {
             return Err(ThinkError::Auth(format!(
@@ -97,13 +82,13 @@ pub enum KeySource {
     Loopback,
 }
 
-/// Agnes 客户端配置。
+/// 生成模型客户端配置。
 #[derive(Debug, Clone)]
 pub struct ThinkerConfig {
     pub base_url: String,
     pub model: String,
     pub timeout: Duration,
-    /// 每分钟请求数上限。默认按免费档 10 处理。
+    /// 每分钟请求数上限。
     pub rpm: u32,
     /// 密钥来源。见 [`KeySource`]。
     pub key_source: KeySource,
@@ -113,15 +98,7 @@ pub struct ThinkerConfig {
 
 impl Default for ThinkerConfig {
     fn default() -> Self {
-        Self {
-            base_url: DEFAULT_BASE_URL.to_string(),
-            model: DEFAULT_MODEL.to_string(),
-            // 长上下文 + 大输出的请求可能要跑一会儿；给足余量但不无限等
-            timeout: Duration::from_secs(120),
-            rpm: FREE_TIER_RPM,
-            key_source: KeySource::File("agnes.key"),
-            thinking: Thinking::ServerDefault,
-        }
+        Self::deepseek()
     }
 }
 
@@ -141,11 +118,6 @@ impl ThinkerConfig {
             key_source: KeySource::File("deepseek.key"),
             thinking: Thinking::Enabled,
         }
-    }
-
-    /// Agnes 3.0 Flash。
-    pub fn agnes() -> Self {
-        Self::default()
     }
 
     /// 本地侧车（`sidecar/local_llm_server.py`，默认 `127.0.0.1:17872`）。
@@ -174,13 +146,13 @@ impl ThinkerConfig {
             base_url: base_url.into(),
             model: model.into(),
             timeout: Duration::from_secs(120),
-            // 和 `ModelSpec::LOCAL_QWEN` 声明的一致：本地没有端点限流，
+            // 和 `ModelSpec::LOCAL` 声明的一致：本地没有端点限流，
             // 这个数只用来算"两次调用之间至少隔多久"。
             rpm: 600,
             // 本地侧车的 socket 只绑回环（它自己也会拒绝其他 host），
             // 而且不认 `Authorization`——见 [`KeySource::Loopback`]。
             key_source: KeySource::Loopback,
-            // 侧车不吃 `thinking` 字段，和 Agnes 同理：不塞。
+            // 未知本地后端默认不发送思考字段，具体模型由 ModelSpec 声明能力。
             thinking: Thinking::ServerDefault,
         }
     }
@@ -228,7 +200,7 @@ pub(crate) fn is_loopback_url(base_url: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
-/// 默认的密钥文件位置：`<home>/secrets/agnes.key`。
+/// 凭证文件位置：`<home>/secrets/<name>`。
 ///
 /// 放在**仓库之外**（`%LOCALAPPDATA%\YunXiBot`），并在 `.gitignore` 里用
 /// `*.key` / `secrets/` 兜底。
@@ -236,12 +208,7 @@ pub fn key_file_for(home: &Path, name: &str) -> PathBuf {
     home.join("secrets").join(name)
 }
 
-/// 默认（Agnes）的密钥文件。
-pub fn default_key_file(home: &Path) -> PathBuf {
-    key_file_for(home, "agnes.key")
-}
-
-/// Agnes 客户端。
+/// OpenAI 兼容客户端。
 pub struct OpenAiThinker {
     config: ThinkerConfig,
     api_key: ApiKey,
@@ -618,7 +585,7 @@ impl Thinker for OpenAiThinker {
     ///
     /// ## 实测确认过的事
     ///
-    /// Agnes 支持 `stream: true` + `stream_options.include_usage: true`，
+    /// OpenAI 兼容 SSE 使用 `stream: true` + `stream_options.include_usage: true`，
     /// **最后一个 chunk 带 `usage`**（实测 `prompt_tokens: 84`）。
     ///
     /// 这一点很关键：上下文锚点靠的就是 `prompt_tokens`。
@@ -729,6 +696,9 @@ impl OpenAiThinker {
         // 工具描述。实测开思考时带 tools 不报错。
         if !req.tools.is_empty() {
             body["tools"] = serde_json::json!(req.tools);
+        }
+        if req.json_output {
+            body["response_format"] = serde_json::json!({"type": "json_object"});
         }
         body
     }
@@ -949,6 +919,23 @@ mod tests {
     use crate::think::Message;
 
     #[test]
+    fn json_output_is_opt_in_and_keeps_thinking_and_tools_unchanged() {
+        let client = OpenAiThinker::new(ThinkerConfig::default(), ApiKey::new("test-key"));
+        let mut req =
+            ThinkRequest::new(vec![Message::user("返回JSON")]).with_thinking(Thinking::Enabled);
+        let ordinary = client.build_body(&req);
+        assert!(ordinary.get("response_format").is_none());
+        req.json_output = true;
+        let structured = client.build_body(&req);
+        assert_eq!(
+            structured["response_format"],
+            serde_json::json!({"type":"json_object"})
+        );
+        assert_eq!(structured["thinking"], ordinary["thinking"]);
+        assert!(structured.get("tools").is_none());
+    }
+
+    #[test]
     fn api_key_never_prints_itself() {
         let k = ApiKey::new("sk-abcdefghijklmnop");
         let shown = format!("{k:?}");
@@ -996,12 +983,12 @@ mod tests {
     fn endpoint_has_no_double_slash() {
         let t = OpenAiThinker::new(
             ThinkerConfig {
-                base_url: "https://api.agnes-ai.cn/v1/".into(),
+                base_url: "https://example.com/v1/".into(),
                 ..Default::default()
             },
             ApiKey::new("sk-x"),
         );
-        assert_eq!(t.endpoint(), "https://api.agnes-ai.cn/v1/chat/completions");
+        assert_eq!(t.endpoint(), "https://example.com/v1/chat/completions");
     }
 
     #[test]
@@ -1017,7 +1004,7 @@ mod tests {
         // 指向远端时必须**造都造不出来**：等到发出去再报错就晚了，
         // 那时候提示词、记忆、工具结果已经在对面了。
         let cfg = ThinkerConfig {
-            base_url: "https://api.agnes-ai.cn/v1".into(),
+            base_url: "https://example.com/v1".into(),
             model: "某本地模型".into(),
             key_source: KeySource::Loopback,
             ..Default::default()
@@ -1032,10 +1019,7 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(msg.contains("回环"), "要说清是回环这条约束: {msg}");
-        assert!(
-            msg.contains("api.agnes-ai.cn"),
-            "要把写错的地址带出来: {msg}"
-        );
+        assert!(msg.contains("example.com"), "要把写错的地址带出来: {msg}");
     }
 
     #[test]
@@ -1054,7 +1038,7 @@ mod tests {
         // 主机名后缀、userinfo、fragment、少一个方括号、没有 scheme。
         // 按"先找 @ 再切串"写的解析会被其中几条绕过。
         for bad in [
-            "https://api.agnes-ai.cn/v1",
+            "https://example.com/v1",
             "http://127.0.0.1.evil.com/v1",
             "https://127.0.0.1.evil.com/v1",
             "http://127.0.0.1@evil.com/v1",
@@ -1070,7 +1054,7 @@ mod tests {
     fn a_local_client_needs_no_key_file_at_all() {
         // 构造本地客户端**不该碰盘**：home 指到一个不存在的目录也照样造得出来。
         // 这正是"不需要密钥"那个类型级事实的验收——
-        // 老写法（`key_file` 字符串）在这一步就会去读 `secrets/agnes.key`。
+        // 老写法（`key_file` 字符串）在这一步就会去读 `secrets/deepseek.key`。
         let cfg = ThinkerConfig::local("http://127.0.0.1:17872/v1", "Qwen3-4B-Instruct-2507");
         let t = OpenAiThinker::from_home(Path::new("C:/绝对不存在的目录"), cfg)
             .expect("不需要密钥的客户端不该因为读不到密钥文件而失败");
@@ -1080,13 +1064,15 @@ mod tests {
 
     #[test]
     fn local_throttle_blocks_the_second_call() {
-        let t = OpenAiThinker::new(ThinkerConfig::default(), ApiKey::new("sk-x"));
-        // 第一次不受本地限流影响（会真的去发请求，但我们只关心限流分支）
-        let first = t.think(&ThinkRequest::new(vec![Message::user("hi")]));
-        assert!(
-            !matches!(first, Err(ThinkError::LocalThrottle { .. })),
-            "第一次不该被本地限流: {first:?}"
+        let t = OpenAiThinker::new(
+            ThinkerConfig {
+                rpm: 1,
+                ..Default::default()
+            },
+            ApiKey::new("sk-x"),
         );
+        // 直接占用配额，避免单元测试向默认服务发送真实请求。
+        assert!(t.limiter.try_acquire().is_none());
         let second = t.think(&ThinkRequest::new(vec![Message::user("hi")]));
         assert!(
             matches!(second, Err(ThinkError::LocalThrottle { .. })),
@@ -1095,9 +1081,9 @@ mod tests {
     }
 
     #[test]
-    fn default_key_file_is_outside_any_repo_path() {
-        let p = default_key_file(Path::new("C:/Users/x/AppData/Local/YunXiBot"));
-        assert!(p.ends_with("secrets/agnes.key") || p.ends_with("secrets\\agnes.key"));
+    fn provider_key_file_is_under_secrets() {
+        let p = key_file_for(Path::new("/tmp/yunxi"), "deepseek.key");
+        assert!(p.ends_with("secrets/deepseek.key") || p.ends_with("secrets\\deepseek.key"));
     }
 
     #[test]

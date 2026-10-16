@@ -51,6 +51,7 @@ impl std::error::Error for LockError {}
 ///
 /// - Windows：`OpenProcess` 探测句柄能否拿到。
 /// - Linux：`/proc/<pid>` 是否存在。
+/// - macOS：kill(pid, 0) 探测，不发送信号；只有明确不存在才允许接管。
 /// - 其他平台：保守返回 `true`（宁可拒绝启动，也不要冒重复运行的风险）。
 #[cfg(windows)]
 pub fn is_process_alive(pid: u32) -> bool {
@@ -110,7 +111,28 @@ pub fn is_process_alive(pid: u32) -> bool {
     pid != 0 && Path::new(&format!("/proc/{pid}")).exists()
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+pub fn is_process_alive(pid: u32) -> bool {
+    // kill 的 0 和负 PID 表示进程组，不能把锁文件里的无效 PID 转成组探测。
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // SAFETY: 正 PID、信号 0 只检查存活/权限，不修改目标进程。
+    if unsafe { kill(pid, 0) } == 0 {
+        return true;
+    }
+    const ESRCH: i32 = 3; // macOS SDK sys/errno.h: No such process
+    // EPERM 或其他未知错误都不能证明进程已死。
+    std::io::Error::last_os_error().raw_os_error() != Some(ESRCH)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn is_process_alive(pid: u32) -> bool {
     let _ = pid;
     true
@@ -148,7 +170,7 @@ impl InstanceLock {
         let pid = std::process::id();
         let info = LockInfo {
             pid,
-            at: crate::now_millis().unwrap_or(0),
+            at: crate::now_millis().map_err(|e| LockError::Io(e.to_string()))?,
             schema: 1,
         };
         let body = serde_json::to_string(&info).map_err(|e| LockError::Io(e.to_string()))?;
@@ -179,6 +201,32 @@ impl Drop for InstanceLock {
         }
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// 内核文件锁保护跨进程读改写；文件关闭释放，锁文件不能删除。
+#[cfg(unix)]
+pub(crate) fn exclusive_file_lock(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(|_| "无法打开操作锁")?;
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    // SAFETY: 有效的 File 描述符；LOCK_EX | LOCK_NB，不删除文件使其他进程锁失效。
+    if unsafe { flock(file.as_raw_fd(), 0x02 | 0x04) } != 0 {
+        return Err("另一个进程正在处理，请稍后重试".into());
+    }
+    Ok(file)
+}
+#[cfg(not(unix))]
+pub(crate) fn exclusive_file_lock(_: &Path) -> Result<std::fs::File, String> {
+    Err("邮件理解当前只支持本机Mac".into())
 }
 
 #[cfg(test)]
@@ -260,5 +308,36 @@ mod tests {
     #[test]
     fn current_process_is_detected_alive() {
         assert!(is_process_alive(std::process::id()));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn invalid_pids_are_not_treated_as_process_groups() {
+        assert!(!is_process_alive(0));
+        assert!(!is_process_alive(u32::MAX));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_reaped_child_no_longer_holds_the_instance_lock() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!is_process_alive(pid));
+        let p = tmp("reaped");
+        fs::write(
+            &p,
+            serde_json::to_string(&LockInfo {
+                pid,
+                at: 0,
+                schema: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(InstanceLock::acquire(&p).is_ok());
     }
 }

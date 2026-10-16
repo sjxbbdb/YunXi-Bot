@@ -6,7 +6,7 @@
 
 让陪伴有连续性，让行动有分寸。
 
-[设计哲学](#设计哲学) · [系统架构](#系统架构) · [记忆与人格](#记忆与人格) · [任务执行](#任务执行) · [主动陪伴](#主动陪伴) · [开始使用](#开始使用)
+[当前能做什么](#当前能做什么) · [邮件与mac联动](#邮件与mac联动) · [系统架构](#系统架构) · [开始使用](#开始使用) · [边界与当前进展](#边界与当前进展)
 
 </div>
 
@@ -14,7 +14,56 @@ YunXi Bot 是 YunXi 家族衍生的个人 Agent。它以本地机器为长期运
 
 项目的目标是让一个助理长期在场：相处有连续性，行动有边界，主动有分寸。
 
-> **开发状态**：当前提供 CLI 交互与常驻守护，主要在 Windows 上开发和验证。语音、微信和 Web 入口尚未接入本仓库。下面的功能与流程按当前源码说明；产品目标与实现限制分别列出。
+> **当前状态（2026-10-16）**：重点开发和验收平台为 **Apple Silicon / macOS 14+**，入口是 CLI 与后台守护。聊天和任务由 DeepSeek 生成，本地只需 Laya 决策与按需启动的语义编码器。Windows 通用内核与启动入口保留，新增 Mac 生态工具仅在 Mac 可用；本轮未重做 Windows 真机验收。7×24 常驻是项目目标，长期运行和休眠唤醒尚未完成验收。
+
+## 当前能做什么
+
+Mac 内置注册表共 **48 个工具**，不含用户另接的 MCP 工具。三批能力共用工具审批、执行回执和本地审计，不需要记住工具参数才能在对话中使用。
+
+| 批次 / 能力 | 可以完成的事情 | 当前边界 |
+|---|---|---|
+| 第一批：通用工具 | 读写和搜索文件、运行命令、网页搜索与抓取、知识库查询、向用户追问 | 写入、命令与外发按策略审批；网页搜索可配置博查，站点限制会明确报错 |
+| 第一批：日程与待办 | 从自然语言安排一天；连续追问时间、时长等缺失信息；新增事项后重排；创建、修改、取消日历和待办 | 默认可排 09:00–12:00、13:00–18:00，间隔 10 分钟；写入 iCloud 专用“云熙”日历/列表，保留已有固定安排 |
+| 第二批：邮件 | 搜索、完整邮件串、附件保存与文本/PDF读取、标已读、归档；起草、回复、转发、审批发送；收件摘要通知、可选自动拟回复 | 使用 Mac Mail 已同步内容；本机草稿不等于 Mail 草稿邮箱；扫描件 OCR、Office 正文解析尚未接入 |
+| 第二批：联系人 | 按姓名、公司、职务或邮箱找人，查看地址，同名时继续确认 | 以已获权限的通讯录为准，不凭称呼猜收件人；真实同名联系人验收仍待补充 |
+| 第二批：地点、交通与天气 | 查询地址、路线、驾车/步行/公交预计用时和天气；把准备、通勤绑定到会议 | 营业时间须核实网页；公交当前是预计用时，不含完整换乘方案 |
+| 第三批：出行、住宿与多日行程 | 比较公开交通/酒店信息、整理预订资料；统筹多日出行、入住退房、固定约会和弹性工作，写回日历与待办 | **尚无实时票务、酒店库存和预订交易接口**；不支持后台航班延误自动重排 |
+| 跨任务背景 | 可编辑人格、经确认的画像、长期记忆、会话恢复；任务按阶段刷新背景，检索独立文本知识库 | EmbeddingGemma 2 本地语义编码；资料须显式导入，不自动扫描硬盘，不代表所有入口共用一套召回 |
+
+可以直接这样说，信息不够时 Bot 会追问；示例中的写入和发送仍需相应批准：
+
+- “今天下午三点有个会。”随后补充“一个小时，走路过去，提前十五分钟准备”。
+- “今天还要写两小时报告，重新安排一下，别动已经确定的会议。”
+- “看看刚才那封人事邮件，把面试和回复截止时间安排好。”
+- “根据接下来一周的安排起草回复，把我选的附件带上，先让我确认。”
+- “把这份车票和酒店预订整理成两天的行程，检查和已有日程有没有冲突。”
+
+验收记录：[第一批](docs/第一批工具复验-20261016.md) · [第二批](docs/第二批工具验收-20261016.md) · [第三批](docs/第三批工具验收-20261016.md) · [日程统筹](docs/日程统筹验收-20261016.md)。多日保存会先检查整份计划，但系统写入不是跨日原子事务；中途失败会报告已完成部分。
+
+## 邮件与Mac联动
+
+**接收侧**：本地发现新信与去重 → DeepSeek 用独立的[接收提示词](crates/yunxi-bot-core/src/prompts/mail_review.md)只读提炼内容、行动项、期限和风险 → Laya 留下参考判断 → 确定性策略 → Mac 通知或待查看。分析不带工具权限，邮件中的要求不会直接触发发信、改日程或执行附件。
+
+- 通知采用“**云熙 · 邮件｜人事回复**”等来源与关键词标题，附发件信息、摘要、待处理事项和原邮件时间。
+- 开启 DeepSeek 审理的 Mac 邮件已取消共用的每日 3 次上限和 120 分钟间隔。有效建议需要及时提醒的邮件及时处理，同轮多封合并；无行动项、期限或风险的普通工作/私人/交易信息进入 **15 分钟摘要窗口**。
+- 23:00–08:00 安静时段、明确静默、黑名单、通知去重、调用预算及系统专注模式仍生效。未知、不完整或分析失败留待查看；投递失败保留批次并退避核对，不当作已读。
+- 用户随后可说“处理刚才那封邮件”，读取原文并关联日历、待办；单纯接收邮件不会自动创建或完成这些事项。
+
+**发送侧**：核对联系人与邮箱 → 读取用户指定的资料和近期安排 → 用独立的[发送提示词](crates/yunxi-bot-core/src/prompts/mail_send.md)起草 → 展示收件人、正文、附件与当前版本 → **逐封确认发送** → 查询本机提交/发件记录。可跨会话找回草稿、替换附件，再按用户要求创建跟进待办或日程；发件端回执不能代替收件人确认收到。
+
+可选的**自动拟回复**只处理开启后的新邮件：结合真实邮件串、未来 7 天忙闲与待办期限、可用画像，生成可审核正文或待确认问题。日历标题和备注不提供给拟稿模型；有空档也不代表已同意预约。不会无人值守发送，缺少信息时可能只返回问题。
+
+```bash
+./启动.command mail --pending                    # 待查看邮件
+./启动.command mail --pending --include-notified # 包含已通知邮件
+./启动.command mail --reply-mode review          # 开启新邮件自动拟回复
+./启动.command mail --replies                    # 查看建议及待确认问题
+./启动.command mail --reply-mode off             # 停止自动拟回复，保留已有建议
+```
+
+使用前先按下文配置 Mail 来源和内容审理。后台巡检是在本地运行的循环，不是每次轮询都调用大模型；仅需分析、拟稿等工作才产生云端请求，已有有效分析会复用。发现延迟还受 Mail 同步、串行模型调用和休眠影响，不能保证每封邮件固定秒数内通知。
+
+详情：[收件理解](docs/邮件理解通知验收-20261016.md) · [通知分流](docs/通知与主动陪伴分流方案-20261016.md) · [邮件与日历待办](docs/邮件与Mac联动-20261016.md) · [发送侧](docs/邮件发送与Mac联动-20261016.md) · [自动拟回复](docs/邮件代回复与双向提示词-20261016.md)。
 
 ## 设计哲学
 
@@ -46,35 +95,35 @@ YunXi Bot 是 YunXi 家族衍生的个人 Agent。它以本地机器为长期运
 flowchart TB
     USER[用户对话与目标] --> CORE[Rust 内核<br/>对话 · 任务 · 常驻循环]
     EVENTS[定时触发与外部信息] --> CORE
-    CORE --> VERDICT[决策模型 · Verdict<br/>分类、召回、选择、介入]
+    CORE --> LAYA[决策模型 · Laya 多语言版<br/>分类、召回、选择、介入]
     CORE --> THINK[生成模型<br/>对话、规划与表达<br/>提出工具调用]
-    MEMORY[长期记忆与当前状态] -->|判断证据| VERDICT
+    MEMORY[长期记忆与当前状态] -->|判断证据| LAYA
     MEMORY -->|对话上下文| THINK
-    VERDICT -. 判断建议 .-> POLICY[确定性约束与授权]
+    LAYA -. 判断建议 .-> POLICY[确定性约束与授权]
     THINK --> POLICY
-    POLICY --> TOOLS[执行工具<br/>文件、命令、网络与 MCP]
+    POLICY --> TOOLS[执行工具<br/>文件、网络、Mac 生态与 MCP]
     POLICY --> RESPONSE[回复、表达与通知<br/>回到用户]
     TOOLS --> LEDGER[事件记录与状态投影]
     RESPONSE --> LEDGER
     LEDGER --> NEXT[下一回合<br/>恢复任务、记忆与反馈状态]
     classDef decision fill:#fff2cc,stroke:#9a6700,color:#3b2e00;
-    class VERDICT decision;
+    class LAYA decision;
 ```
 
 ### 决策能力嵌入在哪里
 
-Verdict 是共享的本地判断能力。各模块构造自己的问题与证据，解释答案，再应用对应的约束和失败处理。图中的黄色节点均表示 Verdict 的业务判断。
+Laya 多语言版是共享的本地判断能力。各模块构造自己的问题与证据，解释答案，再应用对应的约束和失败处理。图中的黄色节点均表示 Laya 的业务判断。
 
 | 参与模块 | 判断的问题 | 对运行的影响 |
 |---|---|---|
-| 输入分类 | 这句话是在办事，还是在闲聊？ | 为对话回合的模型路由提供输入 |
+| 输入分类 | 这句话是在办事，还是在闲聊？ | 建议回复模式；工具调用由 DeepSeek 结合连续对话提出，执行仍受审批约束 |
 | 记忆召回 | 回答这一句，需要关于用户的什么记忆？ | 决定是否进入动态召回；关键词不确定时调用 |
 | 工具门禁 | 这个动作是否需要先询问用户？ | 在规则允许进入模型判断的路径上，选择自动执行或询问 |
 | 任务决策点 | 根据现有证据，应选择哪个候选方案？ | 为 `decide:` 步骤选择结果，弃权则等待人工 |
 | 陪伴介入 | 现在适合开口、延后，还是沉默？ | 结合记忆和现状决定介入，再受安静时段等约束收紧 |
-| 通知分流 | 这条外部信息值得现在提醒吗？ | 在通知规则未定时参与判断，影响提醒、延后与忽略 |
+| 通知分流 | 这条外部信息值得现在提醒吗？ | Mac 内容审理采用 DeepSeek 建议、Laya 参考；未启用审理的旧路径仍由规则/Laya 分流 |
 
-输入分类、召回、审批、任务决策、陪伴和通知具有不同的失败代价。模型不可用时，审批与任务决策倾向交给人，陪伴与通知倾向不打扰；召回门控保留保守的召回判断。分类失败在当前对话入口中按闲聊处理。模型答案不构成越过权限的依据，未校准的概率也不用于强制审批阈值。
+输入分类、召回、审批、任务决策、陪伴和通知具有不同的失败代价。模型不可用时，审批与任务决策倾向交给人，陪伴与通知倾向不打扰；召回门控保留保守的召回判断。输入分类失败会停止当前回合并记录降级原因。模型答案不构成越过权限的依据，未校准的概率也不用于强制审批阈值。
 
 实现入口：[决策契约](crates/yunxi-bot-core/src/decide/mod.rs) · [对话装配](crates/yunxi-bot-cli/src/chat_handler.rs) · [任务决策](crates/yunxi-bot-core/src/task/decide.rs) · [陪伴约束](crates/yunxi-bot-core/src/companion.rs)
 
@@ -83,38 +132,27 @@ Verdict 是共享的本地判断能力。各模块构造自己的问题与证据
 | 组件 | 当前实现 | 职责 |
 |---|---|---|
 | 主程序 | Rust 2024，CLI + core 两个 crate | 会话、任务、调度、约束、工具和台账 |
-| 决策服务 | Verdict，回环端口 `17870` | 结构化分类与选择 |
-| 本地生成服务 | `Qwen3-4B-Instruct-2507`，回环端口 `17872` | 闲聊与确定简单的任务，支持工具调用和流式输出 |
-| 远端生成模型 | `deepseek-flash` | 复杂任务，以及默认需要推理的规划、分析步骤 |
-| 远端回落与表达 | `agnes-3.0-flash` | 本地未就绪时的回落；当前主动陪伴表达和画像提炼也使用它 |
-| 邮件服务 | Python IMAP sidecar，回环端口 `17871` | 只读获取邮件，不标记为已读 |
+| 决策服务 | Laya 多语言版，回环端口 `17870` | 结构化分类与选择 |
+| 生成服务 | `deepseek-flash` | 闲聊、任务、摘要、画像提炼、主动陪伴表达；默认不加载本地生成权重 |
+| 语义检索服务 | EmbeddingGemma 2 文本编码器，CPU，回环端口 `17873` | 目标任务的向量记忆与知识检索；按需启动 |
+| 邮件巡检 | Mac默认原生Mail；其他平台或显式选择时使用IMAP sidecar `17871` | Mac配置启用DeepSeek只读理解后，由其建议提醒、Laya作参考，再经固定策略通知；不标记为已读 |
+| Mac助理接口 | 原生应用，EventKit / Contacts / MapKit / Mail | 日程、待办、联系人和邮件等工具；云熙本机草稿，经审批后交由Mail发送 |
 | MCP | Rust 客户端 + stdio 子进程 | 连接外部工具；异步运行时封装在 MCP 模块内 |
 
 <details>
-<summary>展开模型路由与本地健康回落</summary>
+<summary>展开输入分类与模型分工</summary>
 
-```mermaid
-flowchart TB
-    INPUT[聊天输入] --> V[Verdict<br/>办事还是闲聊？]
-    V --> ROUTE{规则路由}
-    STEP[任务步骤的类型与复杂度] --> ROUTE
-    ROUTE -->|闲聊或确定简单| LOCAL[选择本地 Qwen]
-    ROUTE -->|复杂或无法确定简单| REMOTE[选择 DeepSeek]
-    LOCAL --> REASON{需要推理？}
-    REASON -->|是| REMOTE
-    REASON -->|否或显式关闭| HEALTH{本地就绪？}
-    HEALTH -->|是| USE[本轮使用本地模型]
-    HEALTH -->|否| FALLBACK[本轮回落 Agnes<br/>记录原因]
-    HEALTH -. 空闲或加载中 .-> WARM[请求后台预热<br/>后续回合重新检查]
-    classDef decision fill:#fff2cc,stroke:#9a6700,color:#3b2e00;
-    class V decision;
-```
+每条聊天输入先由 Laya 建议回复模式。闲聊与任务均由 DeepSeek 处理，连续追问中的短答不会撤掉工具；实际调用通过既有工具审批和执行链路。缺信息直接追问，下一条回答可以沿用已保存的会话背景。
+分类不可用、弃权、返回未知选项或审计失败时停止本轮，不伪装成正常闲聊。模型分类尚未校准，不能替代审批。
 
-路由由代码规则完成，健康探测访问 sidecar 的 `/health`。它们不额外询问 Verdict。每个任务步骤独立选模型，一步内部的工具循环保持该模型。`do --provider agnes|deepseek` 可覆盖该次执行的路由，`resume` 当前恢复默认路由；`--thinking` 控制思考模式。
+`do`、`resume` 和 daemon 的目标任务都使用 DeepSeek；`--provider local` 不再用于助理任务。
+`--thinking auto` 下聊天不开思考，规划和分析开启；显式 `on/off` 仍生效。
+摘要、画像候选和主动陪伴表达也使用 DeepSeek。Laya 与向量编码器留在本机，Gemma/Qwen 权重仅留作实验，不自动启动。
 
-**本地优先不等于全程离线。** 默认复杂任务会访问远端模型，本地回落也会向 Agnes 发送本轮上下文；选择的模型会收到相应的提示词、召回内容和工具结果。模型名、端点与计价表是当前代码配置，服务可用性和实际费用以供应商为准。
+**生成需要联网和 DeepSeek 凭证。** 人格、画像、召回片段与必要的工具结果会进入相应请求；源资料和向量库仍存放在本地。
+远端故障明确报错，不自动加载本地生成模型。使用与验收见 [轻量运行架构](docs/轻量运行架构.md)。
 
-源码：[router](crates/yunxi-bot-core/src/think/router.rs) · [local_health](crates/yunxi-bot-core/src/think/local_health.rs) · [OpenAI 兼容客户端](crates/yunxi-bot-core/src/think/agnes.rs)
+源码：[router](crates/yunxi-bot-core/src/think/router.rs) · [local_health](crates/yunxi-bot-core/src/think/local_health.rs) · [OpenAI 兼容客户端](crates/yunxi-bot-core/src/think/client.rs)
 
 </details>
 
@@ -131,13 +169,13 @@ flowchart TB
 
 ### 先判断需要，再召回内容
 
-对话会先识别记忆需求。常见问法由关键词处理，拿不准时让 Verdict 区分私人记忆、用户画像、通用知识等需求。随后由检索代码完成召回和筛选。
+对话会先识别记忆需求。常见问法由关键词处理，拿不准时让 Laya 区分私人记忆、用户画像、通用知识等需求。随后由检索代码完成召回和筛选。
 
 ```mermaid
 flowchart TB
     INPUT[用户这一句] --> GATE{关键词判断}
     GATE -->|确定| NEED[记忆需求]
-    GATE -->|Mixed：拿不准| V[Verdict<br/>判断 memory_need]
+    GATE -->|Mixed：拿不准| V[Laya 多语言版<br/>判断 memory_need]
     V -->|有效选择| NEED
     V -->|失败：保留 Mixed| NEED
     NEED -->|none / knowledge| SKIP[不召回私人记忆]
@@ -155,11 +193,11 @@ flowchart TB
 
 图中的“需要回忆”包括 `episode / long_term / mixed`，当前进入同一条检索链。`knowledge` 只表示不翻私人记忆，不会自动启动知识库搜索。召回使用本地字符 n-gram 向量与词面匹配，无需独立 embedding 服务。
 
-画像、常驻记忆、项目规则与动态召回目前装配在 `chat`。`do` 的步骤使用人格、任务指令与前置结果，尚未共享完整的聊天记忆上下文；主动陪伴使用长期记忆证据，但表达仍采用固定提示词，尚未复用可编辑的人格与画像前缀。
+上图描述 `chat` 的私人记忆召回。`do`、`resume` 与 daemon 的目标任务已按阶段刷新人格、画像、常驻记忆及项目规则，并通过 EmbeddingGemma 2 分别检索向量记忆和独立知识库；前置步骤结果另外保留。知识库支持显式导入 UTF-8 Markdown/文本、查询、移除和重建，见[任务上下文与知识库](docs/任务上下文与知识库.md)。主动陪伴使用长期记忆证据，但表达仍采用固定提示词，尚未复用可编辑的人格与画像前缀。
 
 ### 记忆如何进入系统
 
-`remember` 显式记录一条记忆；`profile --learn` 从最近会话的用户发言中提炼画像候选，再由 `--accept` / `--reject` 确认。后者使用生成模型 Agnes。保存聊天历史不会自动把每一句话写成长期记忆。
+`remember` 显式记录一条记忆；`profile --learn` 从最近会话的用户发言中提炼画像候选，再由 `--accept` / `--reject` 确认。后者使用 DeepSeek。保存聊天历史不会自动把每一句话写成长期记忆。
 
 ```powershell
 cargo run -- remember "回答时先给结论，再展开解释" --kind preference
@@ -199,7 +237,7 @@ flowchart TB
     PLAN --> KIND{选择就绪步骤}
     KIND -->|普通步骤| RUN[路由模型并执行<br/>带入前置结果、调用工具]
     KIND -->|decide:| OPTIONS[生成模型提出候选方案]
-    OPTIONS --> V[Verdict<br/>选择方案]
+    OPTIONS --> V[Laya 多语言版<br/>选择方案]
     V -->|选中| SAVE[记录步骤结果]
     V -->|弃权 / 不可用| HUMAN[保存问题与候选<br/>等待人工回答]
     HUMAN -->|resume --answer| SAVE
@@ -227,7 +265,7 @@ cargo run -- resume '实际任务ID' --answer "采用第二个方案"
 
 ### 工具与权限协同
 
-内置工具覆盖时间、文件读取与检索、文件写入与编辑、命令执行、网页抓取与搜索，以及向用户提问。模型提出动作后，工具门禁先检查规则；需要判断的路径再询问 Verdict，无法确定则交给人。
+内置工具覆盖[三批能力](#当前能做什么)及知识检索。DeepSeek 根据连续对话提出调用，Laya 的闲聊标签不会撤掉工具。门禁先检查规则；需要判断的路径再询问 Laya，无法确定则交给人。
 
 <details>
 <summary>展开工具审批、执行与结果回灌</summary>
@@ -238,7 +276,7 @@ flowchart TB
     RULE -->|拒绝规则命中| DENY[拒绝执行]
     RULE -->|已授权或符合只读规则| EXEC[执行工具]
     RULE -->|需要显式人工授权| HUMAN{人工确认}
-    RULE -->|允许模型参与判断| V[Verdict<br/>是否需要先询问？]
+    RULE -->|允许模型参与判断| V[Laya 多语言版<br/>是否需要先询问？]
     V -->|auto| EXEC
     V -->|ask / 弃权 / 不可用| HUMAN
     HUMAN -->|批准| EXEC
@@ -268,19 +306,24 @@ MCP 使用 stdio 传输，从数据目录中的 `mcp.json` 加载配置。当前
 
 ## 主动陪伴
 
+**当前部署未开启主动陪伴。** 邮件通知已单独修复，陪伴的情境判断、互动计时与 Mac 通知出口仍待完善；下图描述现有组件关系，不表示这些产品目标已全部验收。
+
 主动介入有两种来源：内部的记忆与任务现状，以及外部的信息变化。它们分别进入陪伴判断和通知分流，最终都要经过克制打扰的约束。
 
 ```mermaid
 flowchart TB
     MEMORY[记忆与关系信息] --> STATE[裁剪判断所需的证据]
     EVENTS[互动与任务现状] --> STATE
-    STATE --> V1[Verdict<br/>此刻是否适合介入？]
+    STATE --> V1[Laya 多语言版<br/>此刻是否适合介入？]
     V1 --> LIMIT1[安静时段、互动间隔与打扰额度]
     LIMIT1 -->|开口| SPEAK[生成模型组织陪伴表达]
     LIMIT1 -->|延后或沉默| QUIET[本轮不打扰]
     MAIL[外部信息 · 当前为邮件] --> RULE[检查通知记录<br/>用户反馈与确定性规则]
-    RULE -->|需要判断| V2[Verdict<br/>是否值得现在提醒？]
-    RULE -->|规则已有结论| LIMIT2[通知与陪伴约束]
+    RULE -->|Mac启用内容分析| ANALYSIS[DeepSeek只读摘要<br/>提醒建议与风险线索]
+    ANALYSIS --> REF[Laya参考留痕]
+    REF --> LIMIT2
+    RULE -->|未启用内容分析| V2[Laya 多语言版<br/>是否值得现在提醒？]
+    RULE -->|规则已有结论| LIMIT2[对应来源的通知策略<br/>静默、去重与失败处理]
     V2 --> LIMIT2
     LIMIT2 -->|提醒| NOTIFY[通知出口]
     LIMIT2 -->|延后| HOLD[保留待后续巡览重判]
@@ -291,9 +334,9 @@ flowchart TB
     class V1,V2 decision;
 ```
 
-陪伴链路只在需要开口时调用生成模型组织表达。邮件巡览记录获取、判断和投递结果，用户反馈进入后续分流依据。暂缓项目可在后续巡览重新判断。
+陪伴链路只在需要开口时调用生成模型组织表达。Mac邮件启用内容分析后，将需要判断的新信交给DeepSeek只读理解；Laya仅作参考，实际提醒继续受固定策略约束。邮件巡览记录获取、判断和投递结果，用户反馈进入后续分流依据。暂缓项目可在后续巡览重新判断；用户在对话中要求处理时，再读取原信并进入对应工具审批流程。
 
-设计上区分“决定提醒”“尝试投递”“已确认送达”和“用户已读”。当前通知去重仍有实现限制：非演练的投递记录即可能进入已处理集合，失败投递不保证自动重试；通知后端的确认也不能证明用户看到了通知。
+设计上区分“决定提醒”“尝试投递”“已确认送达”和“用户已读”。已审理 Mac 邮件在调用系统前保存固定批次，失败或结果未知时退避核对，取得确认回执后逐封记账；普通摘要不额外调用生成模型。旧通知路径保留既有去重语义。Mac 回读到通知中心记录才确认送达，仍不能证明横幅可见或用户已读，也不能保证极端崩溃情况下绝无重复。
 
 ```powershell
 cargo run -- check --dry-run
@@ -302,7 +345,7 @@ cargo run -- feedback --last --never
 cargo run -- journal
 ```
 
-`check --dry-run` 仍会读取信息、执行判断并写台账，只是不发送通知。邮件巡览需要先配置并启动 [邮件 sidecar](sidecar/mail_server.py)。
+`check --dry-run` 仍会读取信息、执行判断并写台账，只是不发送通知。Mac使用 [本机Mail巡检](docs/邮件原生通知验收-20261016.md)；其他平台或显式指定 `--mail-source imap` 时，配置并启动 [邮件 sidecar](sidecar/mail_server.py)。
 
 源码：[陪伴回合](crates/yunxi-bot-core/src/agent.rs) · [信息巡览](crates/yunxi-bot-core/src/assistant.rs) · [通知分流](crates/yunxi-bot-core/src/triage.rs) · [反馈投影](crates/yunxi-bot-core/src/feedback.rs)
 
@@ -338,7 +381,9 @@ flowchart TB
 
 当前陪伴与邮件巡览共用决策引擎：只开启邮件巡览时，也可能进入无表达模型的陪伴判断回合。需要纯命令调度时，可显式关闭邮件巡览和目标任务推进。
 
-`supervise` 在守护异常退出后重启，Windows 登录自启使用当前用户的启动目录。当前监督器只转发主循环间隔，不会转发全部 `daemon` 参数。无人值守的审批者不授予新的人工作业批准；需要人工的任务应回到交互入口处理。
+上表是 CLI 默认值。当前 Mac 邮件部署使用 15 秒巡检、`--judge-every 0`，且未开启 `--agent`；这不会把轮询变成每 15 秒固定调用模型。普通邮件摘要窗口仍是 15 分钟。
+
+`supervise` 在守护异常退出后重启，Windows 登录自启使用当前用户的启动目录。macOS 则由用户级 launchd LaunchAgent 直接管理 daemon，并保留注册时指定的启动参数。当前 `supervise` 只转发主循环间隔，不会转发全部 `daemon` 参数。无人值守的审批者不授予新的人工作业批准；需要人工的任务应回到交互入口处理。
 
 ```powershell
 # 仅运行命令任务调度
@@ -368,9 +413,71 @@ cargo run -- cost --calls 10
 
 ## 开始使用
 
-以下命令以 **Windows 上的 PowerShell 7.1+** 为例。需要 Git、Rust 1.88 或更新版本及相应编译工具；本地决策服务使用 Python 3.12。第一次安装需要联网。
+当前从源码安装。GitHub 的 `models-v1` 是历史 Verdict 权重归档，**不是当前 Mac 应用安装包或 Laya 权重包**；当前下载器以仓库模型清单为准。首次安装需要联网，默认不下载大型聊天模型。
 
-### 1. 构建并准备决策模型
+### macOS（当前主要验收平台）
+
+需要 Apple Silicon、macOS 14+、Xcode Command Line Tools、Git、Rust 1.88+ 和 Python 3.12。先准备这些工具，再执行：
+
+```bash
+git clone https://github.com/sjxbbdb/YunXi-Bot.git
+cd YunXi-Bot
+export YUNXI_BOT_HOME="$PWD/data"
+./安装Mac环境.command
+./启动.command mac status
+```
+
+安装脚本创建 `.venv`、准备 Laya、构建 Rust release 和“云熙本机助理”原生应用。默认数据目录为仓库 `data/`；自定义目录须在安装、交互与后台使用同一个 `YUNXI_BOT_HOME`。
+
+在本机设置 `YUNXI_BOT_DEEPSEEK_KEY`，或把密钥单独保存到 `$YUNXI_BOT_HOME/secrets/deepseek.key`，文件权限设为 `0600`。后台使用凭证文件更方便；不要把密钥写进脚本、JSON 配置、Git 或命令示例。日历和待办写入需要可用的 iCloud 账户；邮件须先在 Mac Mail 登录并完成同步。
+
+```bash
+# 按使用需求申请；必须在 macOS 系统提示中允许
+./启动.command mac authorize calendar
+./启动.command mac authorize reminders
+./启动.command mac authorize contacts
+./启动.command mac authorize mail
+./启动.command mac authorize notifications
+
+# 开始交互
+./启动.command chat
+./启动.command do "读取 README 并总结项目用途"
+```
+
+**知识库按需安装**：首次使用前准备语义模型；导入的源文件不会自动刷新。
+
+```bash
+.venv/bin/python scripts/fetch_embedding_candidates.py --only embeddinggemma-2
+./启动.command knowledge add /完整路径/资料.md
+./启动.command knowledge search "需要查询的内容"
+```
+
+**邮件后台是单独配置的可选能力**：先通过 `mac_mail_accounts` 查询真实账户 ID，在数据目录建立 `mac-mail.json`，仅列希望巡检的邮箱，例如：
+
+```json
+[{"account_id":"替换为真实账户ID","mailbox_path":["INBOX"]}]
+```
+
+若同意把这些邮箱的新邮件主题、发件信息与正文发给 DeepSeek 只读分析，再建立 `mail-analysis.json`，内容为 `{"provider":"deepseek"}`。首次开启建立历史基线，不集中通知旧信；自动拟回复须另外开启，画像和线程会参与相应云端请求。
+
+```bash
+# 前台巡检；15 秒是检查间隔，不是送达时限
+./启动.command daemon --mail-source mac --assistant-interval 15 --task-interval 0 --judge-every 0
+
+# 或退出前台守护后，注册登录自启
+./启动.command install-autostart -- --mail-source mac --assistant-interval 15 --task-interval 0 --judge-every 0
+./启动.command autostart-status
+# 停止并取消自启，保留数据
+./启动.command uninstall-autostart
+```
+
+系统权限和 Bot 动作批准分别生效。原生应用使用本机签名，重建后 macOS 可能要求重新授权；更换电脑或移动目录不能直接复用权限和自启路径。详细配置见 [Mac 开发指南](docs/macOS开发.md)与[本机工具](docs/Mac本机助理工具.md)。
+
+### Windows 通用内核
+
+以下命令以 PowerShell 7.1+ 为例，需要 Git、Rust 1.88+、编译工具和 Python 3.12。Mac 原生工具不随这些命令获得 Windows 实现。
+
+#### 1. 构建并准备决策模型
 
 ```powershell
 git clone https://github.com/sjxbbdb/YunXi-Bot.git
@@ -384,39 +491,39 @@ cargo build
 cargo run -- isolation-check
 ```
 
-`setup.ps1` 创建 `.venv`、安装决策服务依赖，并下载 Verdict 权重。优先使用 [models-v1 Release](https://github.com/sjxbbdb/YunXi-Bot/releases/tag/models-v1) 归档并校验 SHA256；Hugging Face 回落使用清单固定的 revision，不执行同样的归档校验。清单位于 [models/manifest.json](models/manifest.json)。这个步骤**不会下载本地 Qwen 模型，也不保证安装了适配显卡的 CUDA 版 PyTorch**。
+`setup.ps1` 创建 `.venv`、安装 Laya 0.4.7，并下载 Laya 多语言权重（约 678 MB）。使用固定 Hugging Face revision，校验权重、词表与编码器配置 SHA256。清单位于 [models/manifest.json](models/manifest.json)。这个步骤**不会下载本地 Qwen 模型，也不保证安装了适配显卡的 CUDA 版 PyTorch**。
 
 在一个单独终端中，从仓库根目录启动决策服务：
 
 ```powershell
 $env:YUNXI_BOT_HOME = Join-Path $PWD 'data'
-.\.venv\Scripts\python.exe sidecar/verdict_server.py --port 17870
+.\.venv\Scripts\python.exe sidecar/laya_server.py --port 17870
 ```
 
 `chat` 和 `do` 也会尝试自动拉起决策服务；显式启动便于确认模型加载情况，并供守护进程使用。
 
-### 2. 配置远端模型并开始交互
+Laya 固定使用多语言底座，Mac 自动选择 MPS。`/health` 只有在加载和预热完成后才报告 `ok`；启动期间或推理失败按原有方向降级。`calibrated: false` 表示未证明概率在 YunXi 场景中可靠，不能用概率替代审批或策略；它本身不是工具门禁。候选已完成中文微调与独立温度拟合，但校准指标并未全面改善，详见 [v4六组比较](docs/Laya微调-v4六组比较.md)。
 
-在本机数据目录的专用凭证文件中分别配置 Agnes 与 DeepSeek。下面用隐藏输入读取密钥；文件中仍是明文凭证，应限制本机访问权限，不上传到仓库：
+#### 2. 配置远端模型并开始交互
+
+聊天、任务、摘要、画像提炼与陪伴表达都使用 DeepSeek，需要在本机数据目录配置它的凭证。下面用隐藏输入读取密钥；文件中仍是明文凭证，应限制本机访问权限，不上传到仓库：
 
 ```powershell
 $secretsDir = Join-Path $env:YUNXI_BOT_HOME 'secrets'
 New-Item -ItemType Directory -Force $secretsDir | Out-Null
-Read-Host 'Agnes API key' -MaskInput | Set-Content (Join-Path $secretsDir 'agnes.key') -NoNewline
 Read-Host 'DeepSeek API key' -MaskInput | Set-Content (Join-Path $secretsDir 'deepseek.key') -NoNewline
-
-# 当前共享凭证读取器会优先使用此变量；清除本终端的覆盖值
-Remove-Item Env:YUNXI_BOT_AGNES_KEY -ErrorAction SilentlyContinue
 
 cargo run -- chat
 ```
 
-Agnes 用于本地回落等路径，DeepSeek 用于默认复杂任务。当前客户端存在凭证接线限制：`YUNXI_BOT_AGNES_KEY` 会同时覆盖两种服务的文件来源，`YUNXI_BOT_DEEPSEEK_KEY` 尚未被读取。因此使用双服务时，应采用上面的独立文件，并在每个运行终端清除 Agnes 环境变量覆盖。
+DeepSeek 可从 `YUNXI_BOT_DEEPSEEK_KEY` 或 `secrets/deepseek.key` 读取凭证。Agnes 的运行配置、provider 选项及环境变量读取已移除；历史台账仍能统计旧调用费用。
 
 <details>
-<summary>3. 可选：启用本地 Qwen 生成模型</summary>
+<summary>3. 实验入口：手动使用本地生成模型（主流程不启用）</summary>
 
-CLI 自动启动本地模型时使用 CUDA。需要兼容的 NVIDIA 显卡、驱动、足够显存，以及同一 Python 环境中的 CUDA 版 PyTorch。按 [PyTorch 安装指南](https://pytorch.org/get-started/locally/) 为当前设备选择版本，不应仅凭 `setup.ps1` 成功就判断 GPU 环境可用。
+只有显式 `think --provider local` 会自动启动实验性本地生成服务。其他平台使用 `--device auto`，由 PyTorch 的可用性探测按 CUDA → MPS → CPU 选择设备。也可手动指定设备；指定的设备不可用或加载失败时明确报错，不静默改用其他设备。成功加载后的 `/health` 返回实际设备。
+
+Windows 的 CUDA 环境仍需兼容的 NVIDIA 显卡、驱动及对应 PyTorch；Mac 使用 [PyTorch MPS 后端](https://docs.pytorch.org/docs/stable/notes/mps.html)。按 [PyTorch 安装指南](https://pytorch.org/get-started/locally/) 准备当前平台环境。MPS 使用 float16，CPU 使用 float32，CUDA 按设备能力选择 bfloat16 或 float16。
 
 ```powershell
 .\.venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"
@@ -424,11 +531,11 @@ CLI 自动启动本地模型时使用 CUDA。需要兼容的 NVIDIA 显卡、驱
 .\.venv\Scripts\python.exe sidecar/local_llm_server.py --model Qwen3-4B-Instruct-2507 --device cuda
 ```
 
-这里显式指定型号，以对齐 Rust 路由配置；下载脚本自己的默认型号是 `Qwen3-1.7B`。权重保存在同一数据目录的 `models/` 下。本地服务支持按需加载与空闲卸载；没有就绪时，本轮路由会回落 Agnes。`do` 不负责自动启动本地生成服务。
+这里显式指定型号，以对齐 Rust 路由配置；下载脚本自己的默认型号是 `Qwen3-1.7B`。权重保存在同一数据目录的 `models/` 下。本地服务支持按需加载与空闲卸载；没有就绪时会报告原因并请求预热，推理请求有超时上限。`do/resume --provider local` 已拒绝；主流程不依赖此服务。
 
 </details>
 
-### 4. 按需要启用能力
+### 通用命令入口
 
 | 想做什么 | 入口 |
 |---|---|
@@ -436,7 +543,7 @@ CLI 自动启动本地模型时使用 CUDA。需要兼容的 NVIDIA 显卡、驱
 | 给出目标并逐步执行 | `cargo run -- do "目标"` |
 | 保存偏好或工作目录记忆 | `cargo run -- remember "内容" --kind preference` |
 | 查看任务并续跑 | `cargo run -- tasks` / `cargo run -- resume '实际任务ID'` |
-| 巡览邮件 | 配置并启动 [mail_server.py](sidecar/mail_server.py)，再运行 `cargo run -- check` |
+| 巡览邮件 | Mac配置 `mac-mail.json` 后运行 `./启动.command check`；IMAP见 [mail_server.py](sidecar/mail_server.py) |
 | 接入扩展工具 | 配置 [MCP](crates/yunxi-bot-core/src/mcp.rs)，运行 `cargo run -- mcp list` |
 | 长期运行 | 参阅[常驻与可追溯性](#常驻与可追溯性)的开关与前提 |
 
@@ -451,8 +558,12 @@ CLI 自动启动本地模型时使用 CUDA。需要兼容的 NVIDIA 显卡、驱
 | 产品入口 | CLI 与守护可用；语音、微信、Web 尚未接入 |
 | 任务完成 | 有状态机、依赖和恢复机制；步骤结果仍部分依赖模型输出，不能替代真实产物验证 |
 | 记忆连续性 | 支持显式记忆、画像确认、会话恢复和动态召回；未实现全自动长期记忆整理 |
-| 决策质量 | 默认 Verdict 未校准；能力依赖问题与输入证据质量，需要真实场景评估 |
-| 互动状态 | 当前最近互动时间会受其他决策事件影响，主动陪伴时机仍有待完善 |
+| 决策质量 | 默认 Laya 多语言版未校准；能力依赖问题与输入证据质量，需要真实场景评估 |
+| 模型微调 | Laya 已做审核样本与六组比较；默认仍用基础权重，微调现阶段冻结，见[结果与限制](docs/Laya微调-v4六组比较.md) |
+| 出行交易 | 实时机票/火车票、酒店库存及下单、支付、退改未接入；[渠道调研](docs/实时票务与酒店渠道调研-20261016.md)不等于已开通 API |
+| 邮件 | 草稿与建议须审核；正文审理不执行邮件指令，也不扫描附件病毒。普通摘要不保证完整代替原文；未知结果留待查看 |
+| 互动状态 | 主动陪伴尚未启用；旧计时会受其他决策事件影响，情境判断与 Mac 陪伴通知仍待完善 |
+| 运行验收 | 已完成列出的场景验收，长期常驻、休眠唤醒、跨设备同步验收后置；尚无自动 CI 和当前版本的 Mac 预编译安装包 |
 | 隔离 | Windows 在要求写隔离并通过自检时使用低完整性令牌；普通命令尽力使用 Job Object。`workspace-write` 不提供 OS 目录写入边界，读取与网络也未隔离；其他平台仅提供进程级控制 |
 | 持久化 | 追加式台账可重建状态；不承诺数据库事务、断电持久性或外部副作用恰好一次 |
 
@@ -465,8 +576,9 @@ crates/
   yunxi-bot-cli/       命令、对话交互、组件装配与人工审批
   yunxi-bot-core/      任务、决策、记忆、工具、调度与台账
 sidecar/              本地模型、邮件服务、测试替身与端到端脚本
+native/macos/         日历、待办、联系人、地图、邮件与通知的系统桥接
 scripts/              环境准备、模型下载、校验与对比
-models/               模型清单与模型卡
+models/               模型清单、合成评测题和已审核训练样例（不含权重）
 docs/
   adr/                架构决策与演进依据
   readme/             架构、任务链路、人格与记忆详解
@@ -484,13 +596,22 @@ cargo clippy --all-targets
 
 Rust 测试覆盖状态、规则与失败路径；`sidecar/` 中另有邮件单元测试、端到端及压力脚本。部分脚本会使用真实模型、凭证与服务，运行前应查看各脚本前提。单元测试通过不等于真实模型任务已完成验收。
 
+2026-10-16 本机完整 Rust 回归为 **1214 项通过、11 项外部测试默认忽略**；格式、构建及严格 Clippy 通过。真实场景的范围与失败证据分别记录在三批工具、邮件和任务文档中，不能把一次通过率当作长期稳定性保证。
+
+仓库只发布源码、合成样例及脱敏验收结论。`data/`、凭证、真实邮件与附件、画像/记忆、运行台账、模型权重、虚拟环境和构建产物不上传。文档中的 `data/benchmarks/...` 是本机私有报告位置，不是 GitHub 可下载附件；测试邮箱通过运行参数提供。提交前仍需检查新增文件，不能只依赖 `.gitignore`。
+
 | 文档 | 内容 |
 |---|---|
 | [架构与边界](docs/adr/0001-架构与边界.md) | 产品哲学、已采纳的决策与演进理由 |
 | [架构与技术栈](docs/readme/01-架构与技术栈.md) | 模块组织、依赖与数据落地 |
 | [任务链路与决策模型](docs/readme/02-任务链路与决策模型.md) | 任务步骤、路由、决策与工具循环 |
 | [提示词、人格与记忆](docs/readme/03-提示词人格与记忆.md) | 上下文、画像、召回与工作目录记忆 |
+| [Mac 开发与运行](docs/macOS开发.md) | 环境、原生权限、数据目录和 launchd 自启 |
+| [日程安排](docs/日程安排.md) / [多日行程](docs/出行住宿与多日行程.md) | 自然语言排程、准备通勤、出行与已有安排统筹 |
+| [任务上下文与知识库](docs/任务上下文与知识库.md) | 人格、画像、语义记忆与独立文本知识检索 |
+| [轻量运行架构](docs/轻量运行架构.md) | DeepSeek 生成、本地辅助模型与数据流 |
 | [工具层调研与设计](docs/工具层调研与设计.md) | 能力分类、审批与扩展的设计依据 |
+| [Mac 本机助理工具](docs/Mac本机助理工具.md) | 系统日历、提醒事项、通知的安装授权与调用边界 |
 | [贡献约定](AGENTS.md) | 工程边界与验收要求 |
 
 ## YunXi 家族与许可
@@ -498,3 +619,5 @@ Rust 测试覆盖状态、规则与失败路径；`sidecar/` 中另有邮件单�
 YunXi Bot 继承了 [YunXi-Agent](https://github.com/sjxbbdb/YunXi-Agent) 的陪伴与治理设计，参考 [YunXi-Next](https://github.com/sjxbbdb/YunXi-Next) 的内核与进程边界、[YunXi-Native](https://github.com/sjxbbdb/YunXi-Native) 的自然语言交互，以及 [YunXi-Voice-Runtime](https://github.com/sjxbbdb/YunXi-Voice-Runtime) 的跨语言 sidecar 模式。家族项目已有的入口与能力，不自动代表 Bot 已经集成。
 
 本项目采用 [Apache-2.0](LICENSE) 许可。设计与代码来源的归属，以及 Miyu 等上游项目的许可声明，见 [NOTICE](NOTICE)。
+
+日常安排与临时事项重排见[日程安排](docs/日程安排.md)。

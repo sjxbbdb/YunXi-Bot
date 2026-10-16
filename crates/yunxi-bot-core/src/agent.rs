@@ -222,6 +222,7 @@ pub fn run_cycle<D: Decider, T: Thinker>(
     let prompt = compose_prompt(&ctx, &memory, &events, input.now_ms);
     let req = ThinkRequest::new(vec![Message::system(SYSTEM_PROMPT), Message::user(prompt)])
         .with_max_tokens(400)
+        .with_thinking(crate::think::Thinking::Disabled)
         // 陪伴场景要的是稳定，不是花哨
         .with_temperature(0.4);
 
@@ -415,7 +416,7 @@ pub fn agent_engine<D: Decider>(decider: D) -> DecisionEngine<D> {
 mod tests {
     use super::*;
     use crate::decide::StubDecider;
-    use crate::think::agnes::StubThinker;
+    use crate::think::client::StubThinker;
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();

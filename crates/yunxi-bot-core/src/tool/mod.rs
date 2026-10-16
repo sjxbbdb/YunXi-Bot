@@ -47,9 +47,19 @@ use serde::{Deserialize, Serialize};
 use crate::decide::{Decider, DecisionClass, DecisionSink, record_decision_optional};
 use crate::policy::SandboxMode;
 
+#[cfg(target_os = "macos")]
+pub mod agenda;
 pub mod files;
+#[cfg(target_os = "macos")]
+pub mod mac_assistant;
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(target_os = "macos")]
+pub mod mail_context;
 pub mod runner;
 pub mod system;
+#[cfg(target_os = "macos")]
+pub mod trip;
 pub mod web;
 
 pub use runner::{
@@ -233,13 +243,15 @@ impl ToolContext {
     /// 用**规范化后的前缀比较**，不是字符串包含——字符串包含会把
     /// `C:\work-evil` 判成在 `C:\work` 里面。
     pub fn inside_cwd(&self, path: &Path) -> bool {
-        let base = normalize_existing(&self.cwd);
+        let Some(base) = normalize_existing(&self.cwd) else {
+            return false;
+        };
         let p = if path.is_absolute() {
             normalize_existing(path)
         } else {
             normalize_existing(&self.cwd.join(path))
         };
-        p.starts_with(&base)
+        p.is_some_and(|p| p.starts_with(&base))
     }
 
     /// 把相对路径解析成绝对路径（不要求存在）。
@@ -252,38 +264,43 @@ impl ToolContext {
     }
 }
 
-/// 尽量规范化：能拿 canonicalize 就拿，拿不到就退回归一化 `..` 与 `.`。
+/// 逐段解析已有目录，再拼尚不存在的尾部。
 ///
-/// ## 两个必须处理的坑（都是测试抓出来的）
-///
-/// 1. **不能直接 `canonicalize`**：要检查的路径往往还不存在（比如准备新建的文件），
-///    这时 canonicalize 报错。所以要留一条手工归一化的退路。
-///
-/// 2. **Windows 上 `canonicalize` 返回 `\\?\` 前缀的"扩展长度路径"**，
-///    而手工归一化不会。两边形式不一致时 `starts_with` 恒为假——
-///    表现是"工作区内的只读访问每次都要审批"：功能没坏，但**规则悄悄失效了**。
-///    所以最后统一剥掉前缀。这条在 Linux 上永远测不出来。
-fn normalize_existing(path: &Path) -> PathBuf {
-    let raw = match path.canonicalize() {
-        Ok(c) => c,
-        Err(_) => manual_normalize(path),
+/// 整条路径 canonicalize 失败后直接做字面归一化，会丢掉 macOS 的
+/// /var → /private/var 别名，也会把指向工作区外的符号链接误判为内部路径。
+/// Windows 扩展长度前缀在最后统一剥离；无法检查的目录或悬空链接返回 None。
+fn normalize_existing(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
     };
-    strip_extended_prefix(raw)
-}
-
-/// 手工消解 `.` 与 `..`，不碰文件系统。
-fn manual_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
-    for comp in path.components() {
+    for comp in absolute.components() {
         match comp {
             std::path::Component::ParentDir => {
                 out.pop();
             }
             std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => {
+                out.push(name);
+                match out.canonicalize() {
+                    Ok(real) => out = real,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // 悬空链接也会返回 NotFound；不能把它当作普通新文件。
+                        match std::fs::symlink_metadata(&out) {
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            _ => return None,
+                        }
+                    }
+                    // 无法检查的路径交给审批兜底。
+                    Err(_) => return None,
+                }
+            }
             other => out.push(other.as_os_str()),
         }
     }
-    out
+    Some(strip_extended_prefix(out))
 }
 
 /// 剥掉 Windows 扩展长度路径前缀，让两种归一化形式可比。
@@ -1307,7 +1324,7 @@ mod tests {
         let t = FakeTool::new("read_file", Capability::ReadOnly).with_spec(SpecKind::Path);
         let d = gate(
             &t,
-            &json!({ "path": "C:\\Windows\\System32\\config\\SAM" }),
+            &json!({ "path": std::env::temp_dir().join("yunxi-outside-cwd/secret.txt") }),
             &policy_free(),
             &c,
             None,
@@ -1687,6 +1704,30 @@ mod tests {
 
     // ---- 路径边界 ----
 
+    #[cfg(unix)]
+    #[test]
+    fn missing_paths_resolve_existing_symlinks_before_checking_the_boundary() {
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("yunxi-symlink-boundary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("workspace")).unwrap();
+        std::fs::create_dir_all(root.join("outside/nested")).unwrap();
+        symlink(root.join("workspace"), root.join("alias")).unwrap();
+        symlink(root.join("outside/nested"), root.join("workspace/escape")).unwrap();
+        symlink(root.join("absent"), root.join("workspace/dangling")).unwrap();
+        let c = ToolContext::new(root.join("alias"), SandboxMode::WorkspaceWrite);
+        let inside = c.inside_cwd(&root.join("alias/new/subdir/file.txt"));
+        let outside = c.inside_cwd(Path::new("escape/new.txt"));
+        let parent_outside = c.inside_cwd(Path::new("escape/../new.txt"));
+        let dangling = c.inside_cwd(Path::new("dangling/new.txt"));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(inside, "目录别名下尚不存在的文件仍在工作区内");
+        assert!(!outside, "符号链接不能把工作区外的文件变成免审批");
+        assert!(!parent_outside, "必须先解析符号链接，再处理 ..");
+        assert!(!dangling, "无法解析的符号链接必须保守处理");
+    }
+
     #[test]
     fn inside_cwd_does_not_use_string_prefix() {
         // 字符串包含会把 C:\work-evil 判成在 C:\work 里
@@ -1716,24 +1757,13 @@ mod tests {
         assert_eq!(c.resolve(Path::new("a.md")), base.join("a.md"));
     }
 
-    /// 回归：Windows 上 `canonicalize()` 返回 `\\?\` 前缀，手工归一化不返回。
-    ///
-    /// 两者形式不一致时 `starts_with` 恒为假，表现是**工作区内的只读访问
-    /// 每次都要审批**——功能没坏，但规则悄悄失效了。这条在 Linux 上测不出来。
+    /// 已有目录与新文件要采用同一种路径表示（Windows 前缀、macOS 目录别名）。
     #[test]
-    fn windows_extended_path_prefix_does_not_break_boundary_check() {
-        // 一个真实存在的目录（canonicalize 会成功，因而带 `\\?\`）
+    fn missing_child_of_existing_directory_stays_inside_boundary() {
         let base = std::env::temp_dir();
         // 一个**不存在**的路径（canonicalize 会失败，因而走手工归一化）
         let not_yet = base.join("yunxi-not-yet-created.md");
         assert!(!not_yet.exists(), "这条测试需要一个不存在的路径");
-
-        assert!(
-            !manual_normalize(&base)
-                .to_string_lossy()
-                .starts_with(r"\\?\"),
-            "手工归一化不该产生扩展长度前缀"
-        );
 
         let c = ToolContext::new(&base, SandboxMode::WorkspaceWrite);
         assert!(

@@ -45,6 +45,7 @@ pub struct PassResult {
     pub skipped: usize,
     /// 因为已经通知过而跳过的。
     pub already_seen: usize,
+    /// 通知尝试数；送达与否以NoticeSent中的结果为准。
     pub notified: usize,
     pub held: usize,
     pub silent: usize,
@@ -62,7 +63,7 @@ impl PassResult {
     /// 一行摘要。进日志用。
     pub fn summary(&self) -> String {
         let mut s = format!(
-            "未读 {} · 本次 {} · 通知 {} · 攒着 {} · 不提 {}",
+            "未读 {} · 本次 {} · 尝试通知 {} · 攒着 {} · 不提 {}",
             self.total_unseen, self.fetched, self.notified, self.held, self.silent
         );
         if self.already_seen > 0 {
@@ -111,10 +112,33 @@ pub fn run_pass<D: Decider, N: Notifier + ?Sized>(
     ledger: &mut Ledger,
     input: &mut PassInput<'_, D, N>,
 ) -> Result<PassResult, String> {
+    run_pass_inner(ledger, input, None, None)
+}
+
+/// 已授权的Mac收件分析入口；原有IMAP调用保持本地判定。
+pub fn run_reviewed_pass<D: Decider, N: Notifier + ?Sized>(
+    ledger: &mut Ledger,
+    input: &mut PassInput<'_, D, N>,
+    review: &mut crate::mail_review::MailReview,
+    thinker: Result<&dyn crate::think::Thinker, &str>,
+) -> Result<PassResult, String> {
+    run_pass_inner(ledger, input, Some(review), Some(thinker))
+}
+
+fn run_pass_inner<D: Decider, N: Notifier + ?Sized>(
+    ledger: &mut Ledger,
+    input: &mut PassInput<'_, D, N>,
+    mut review: Option<&mut crate::mail_review::MailReview>,
+    thinker: Option<Result<&dyn crate::think::Thinker, &str>>,
+) -> Result<PassResult, String> {
     let mut out = PassResult::default();
 
     // ---- 取 ----
-    let batch = match input.source.fetch(input.limit) {
+    let fetched = match review.as_deref_mut() {
+        Some(r) => r.prepare(input.source, input.limit, input.now_ms),
+        None => input.source.fetch(input.limit),
+    };
+    let batch = match fetched {
         Ok(b) => b,
         Err(e) => {
             // **取不到要落台账。** 不记的话，"今天没通知"和"今天取不到"
@@ -152,10 +176,6 @@ pub fn run_pass<D: Decider, N: Notifier + ?Sized>(
         )
         .map_err(|e| e.to_string())?;
 
-    if batch.items.is_empty() {
-        return Ok(out);
-    }
-
     // **从台账重取一次**：上面刚 append 过，而"已经通知过"的依据必须是最新的。
     // 常驻进程里这一条尤其要紧——它每一轮都在同一个 Ledger 上追加。
     let seen = feedback::seen(ledger.events());
@@ -164,24 +184,76 @@ pub fn run_pass<D: Decider, N: Notifier + ?Sized>(
         // 已经真的通知过你的，不再判第二次。见模块文档：
         // 这在常驻场景下不是优化，是正确性。
         if feedback::already_seen(&seen, it) {
+            if let Some(r) = review.as_deref_mut() {
+                r.finish(
+                    it,
+                    "notified",
+                    "台账已有实际投递记录，未重复通知",
+                    input.now_ms,
+                )?;
+            }
             out.already_seen += 1;
             continue;
         }
 
-        let d = triage_item_with_ledger(
-            input.engine,
-            it,
-            &input.policy,
-            &input.companion,
-            &input.ctx,
-            input.local_hour,
-            input.now_ms,
-            // **这一轮手里就有台账，所以必须挂上。** 走到这里的每一条都是
-            // 确定性规则没判出来的那些——问过模型的那一种。
-            // 漏挂的表现和 D133 一样：通知照样发、`InfoTriaged` 照样全，
-            // 而"这一步问没问过模型、它是不是弃权"在决策台账里查不出来。
-            Some(&mut *ledger),
-        );
+        let blocked = crate::triage::deterministic_triage(it, &input.policy)
+            .is_some_and(|(_, rule, _)| rule == crate::triage::rules::BLOCKED_SENDER);
+        let analyzed = if blocked {
+            None
+        } else {
+            review.as_deref_mut().map(|r| {
+                r.analyze(
+                    input.source,
+                    it,
+                    thinker.unwrap_or(Err("没有分析器")),
+                    ledger,
+                    input.now_ms,
+                )
+            })
+        };
+        let full = review
+            .as_ref()
+            .map(|r| r.item(it))
+            .unwrap_or_else(|| it.clone());
+        let it = &full;
+        let d = match &analyzed {
+            Some(Ok(a)) => crate::triage::triage_reviewed_with_ledger(
+                input.engine,
+                it,
+                &input.policy,
+                &input.companion,
+                &input.ctx,
+                input.local_hour,
+                input.now_ms,
+                Some(&mut *ledger),
+                a,
+            ),
+            Some(Err(reason)) => crate::triage::TriageDecision {
+                action: Intervention::Hold,
+                reason: reason.clone(),
+                rule: None,
+                used_model: false,
+                degraded: true,
+                model_suggested_speak: false,
+                constrained: false,
+            },
+            None => triage_item_with_ledger(
+                input.engine,
+                it,
+                &input.policy,
+                &input.companion,
+                &input.ctx,
+                input.local_hour,
+                input.now_ms,
+                Some(&mut *ledger),
+            ),
+        };
+
+        // 普通摘要等待自己的窗口，不占陪伴额度，也不把Hold当作已经通知。
+        let digest = !blocked
+            && analyzed
+                .as_ref()
+                .is_some_and(|a| a.as_ref().is_ok_and(|a| a.digest_eligible()));
 
         // **每条判定都落台账，包括"决定不通知"的那些。**
         ledger
@@ -194,9 +266,9 @@ pub fn run_pass<D: Decider, N: Notifier + ?Sized>(
                     "from": it.from_addr,
                     "from_name": it.from_name,
                     "subject": it.subject,
-                    "action": format!("{:?}", d.action),
+                    "action": format!("{:?}", if digest { Intervention::Hold } else { d.action }),
                     "rule": d.rule,
-                    "reason": d.reason,
+                    "reason": if digest { "普通邮件等待15分钟合并摘要" } else { &d.reason },
                     "used_model": d.used_model,
                     "degraded": d.degraded,
                     "constrained": d.constrained,
@@ -205,11 +277,36 @@ pub fn run_pass<D: Decider, N: Notifier + ?Sized>(
             )
             .map_err(|e| e.to_string())?;
 
-        if !d.should_notify() {
-            match d.action {
+        if !d.should_notify() || digest {
+            if let Some(r) = review.as_deref_mut() {
+                r.finish(
+                    it,
+                    if blocked {
+                        "filtered"
+                    } else if digest {
+                        "digest"
+                    } else if d.action == Intervention::Hold {
+                        "held"
+                    } else {
+                        "quiet"
+                    },
+                    if digest {
+                        "普通邮件等待15分钟合并摘要"
+                    } else {
+                        &d.reason
+                    },
+                    input.now_ms,
+                )?;
+            }
+            match if digest { Intervention::Hold } else { d.action } {
                 Intervention::Hold => out.held += 1,
                 _ => out.silent += 1,
             }
+            continue;
+        }
+
+        if let Some(r) = review.as_deref_mut() {
+            r.finish(it, "ready", &d.reason, input.now_ms)?;
             continue;
         }
 
@@ -220,7 +317,14 @@ pub fn run_pass<D: Decider, N: Notifier + ?Sized>(
         } else {
             Urgency::Normal
         };
-        let n = Notification::new(it.display_from(), it.display_subject())
+        let (title, body) = match &analyzed {
+            Some(Ok(a)) => a.notification(it),
+            _ => (
+                format!("云熙 · 邮件｜{}", it.display_subject()),
+                format!("{}：{}", it.display_from(), it.display_subject()),
+            ),
+        };
+        let n = Notification::new(title, body)
             .with_tag(format!("{}.{}", it.source, it.id))
             .with_urgency(urgency);
 
@@ -258,9 +362,28 @@ pub fn run_pass<D: Decider, N: Notifier + ?Sized>(
             )
             .map_err(|e| e.to_string())?;
 
+        if delivery.left_the_process() {
+            input.ctx.interventions_today = input.ctx.interventions_today.saturating_add(1);
+        }
+        if let Some(r) = review.as_deref_mut() {
+            r.finish(
+                it,
+                if delivery.left_the_process() {
+                    "notified"
+                } else {
+                    "held"
+                },
+                &format!("{}；{}", d.reason, delivery.label()),
+                input.now_ms,
+            )?;
+        }
         out.notified += 1;
     }
 
+    if let Some(r) = review {
+        out.notified += r.flush_notifications(ledger, input)?;
+        out.held = r.waiting_count(&batch.items);
+    }
     Ok(out)
 }
 
@@ -442,7 +565,11 @@ mod tests {
         assert_eq!(r.notified, 1);
         assert_eq!(r.held, 1);
         assert_eq!(r.silent, 1);
-        assert_eq!(n.sent(), vec!["a@x.com".to_string()], "只有验证码该被通知");
+        assert_eq!(
+            n.sent(),
+            vec!["云熙 · 邮件｜验证码 1234".to_string()],
+            "只有验证码该被通知"
+        );
     }
 
     #[test]
@@ -664,6 +791,45 @@ mod tests {
         assert!(n.sent().is_empty(), "演练模式不该真的发通知");
     }
 
+    #[test]
+    fn a_batch_respects_remaining_quota_and_failed_deliveries_do_not_spend_it() {
+        for failed in [false, true] {
+            let (mut l, _d) = ledger();
+            let src = FakeSource::with(
+                (0..4)
+                    .map(|i| item(&i.to_string(), "a@x.com", "验证码 1234"))
+                    .collect(),
+            );
+            let mut n = SpyNotifier::new();
+            if failed {
+                n.verdict = Some(Delivery::Blocked {
+                    reason: "权限关闭".into(),
+                });
+            }
+            let mut engine = DecisionEngine::new(
+                StubDecider::succeeding(),
+                crate::decide::DecisionClass::Interrupt,
+            );
+            let mut situation = ctx();
+            situation.interventions_today = 2;
+            let mut input = PassInput {
+                source: &src,
+                engine: &mut engine,
+                notifier: &n,
+                policy: TriagePolicy::default(),
+                companion: CompanionPolicy::default(),
+                ctx: situation,
+                local_hour: 14,
+                now_ms: 1000,
+                limit: 20,
+                dry_run: false,
+            };
+            let r = run_pass(&mut l, &mut input).unwrap();
+            assert_eq!(n.sent().len(), if failed { 4 } else { 1 });
+            assert_eq!(r.held, if failed { 0 } else { 3 });
+            assert_eq!(input.ctx.interventions_today, if failed { 2 } else { 3 });
+        }
+    }
     #[test]
     fn dry_run_notices_report_blocked_delivery() {
         // 台账里要能看出"这条是演练，没真发"

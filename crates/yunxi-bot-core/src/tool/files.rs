@@ -1424,12 +1424,12 @@ mod tests {
     use super::*;
     use crate::policy::SandboxMode;
 
-    /// 审批粒度测试用的固定工作目录。
-    ///
-    /// 用固定值而不是 `env::temp_dir()`：粒度的断言要逐字符比对路径，
-    /// 而 temp_dir 在不同机器上不一样，断言就变成看运气了。
+    /// 使用本平台的绝对路径；Windows 盘符在 Unix 上只是相对文件名。
     fn spec_ctx() -> ToolContext {
-        ToolContext::new(PathBuf::from(r"C:\work"), SandboxMode::WorkspaceWrite)
+        ToolContext::new(
+            std::env::temp_dir().join("yunxi-spec-work"),
+            SandboxMode::WorkspaceWrite,
+        )
     }
 
     /// 每个测试一个独立子目录，`Drop` 时删掉。
@@ -2071,12 +2071,13 @@ mod tests {
         // 前缀对不上，于是每次都问，使用者以为规则坏了。
         assert_eq!(
             ReadFileTool.specifier(&json!({ "path": "a.txt" }), &spec_ctx()),
-            Some(r"C:\work\a.txt".to_string()),
+            Some(spec_ctx().cwd.join("a.txt").to_string_lossy().into_owned()),
             "相对路径要解析成绝对路径，规则才对得上"
         );
+        let absolute = std::env::temp_dir().join("yunxi-spec-other/a.txt");
         assert_eq!(
-            ReadFileTool.specifier(&json!({ "path": "D:\\x\\a.txt" }), &spec_ctx()),
-            Some("D:\\x\\a.txt".to_string()),
+            ReadFileTool.specifier(&json!({ "path": absolute }), &spec_ctx()),
+            Some(absolute.to_string_lossy().into_owned()),
             "本来就是绝对路径的不要动它"
         );
         assert_eq!(
@@ -2108,11 +2109,11 @@ mod tests {
         // 而它明明什么都没改
         assert_eq!(
             SearchFilesTool.specifier(&json!({ "pattern": "x" }), &spec_ctx()),
-            Some(r"C:\work".to_string())
+            Some(spec_ctx().cwd.to_string_lossy().into_owned())
         );
         assert_eq!(
             ListDirTool.specifier(&json!({ "path": "src" }), &spec_ctx()),
-            Some(r"C:\work\src".to_string())
+            Some(spec_ctx().cwd.join("src").to_string_lossy().into_owned())
         );
     }
 

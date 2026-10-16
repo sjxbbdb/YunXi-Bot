@@ -1,103 +1,31 @@
-//! 本地小模型槽位的健康判定与兜底：**没就绪 / 加载失败 / 状态不认识 → 这一轮改走 Agnes**。
-//!
-//! ## 为什么需要这一层
-//!
-//! D128 把 provider→客户端那处映射修好之后，请求**真的**打到
-//! `127.0.0.1:17872` 了——于是"它可能根本没在跑"第一次成了一个真问题。
-//!
-//! | 情况 | `/health` 说什么 | 后果 |
-//! |---|---|---|
-//! | sidecar 没起来 | 连接被拒 | 这一轮必然失败 |
-//! | 正在加载 8 GB 权重 | `loading`（几十秒） | **第一句话必然失败**，而那是使用者刚打完字的时候 |
-//! | 权重被空闲释放了 | `idle` | 权重不在显存里，这一轮要等它重新加载 |
-//! | 上次加载失败 | `degraded` + `detail` | **一直**失败——它不重试 |
-//!
-//! 最后一种最要命：`_load_once` 见到 `_model_error` 就直接返回，所以那是一个
-//! **不会自愈**的状态，而它看上去和"还没开始加载"一模一样。前几种靠等能好，
-//! 这一种等多久都一样——使用者唯一能做的判断是"重启 sidecar"，而前提是
-//! **他得先知道**。
-//!
-//! 要求因此很直接：**本地模型挂了 / 还没就绪 → 这一轮走 Agnes**，
-//! 而且必须看得见。静默的替换正是 D128 那一类 bug 的形状：
-//! 功能还在，只是退化成了另一个模型，看起来一切正常。
-//!
-//! > `idle` 也归到"还没就绪"这一边：sidecar 那边写着"下一个请求会自己把它
-//! > 拉回来"，而那句"拉回来"**是这一轮要等几十秒**的意思——所以这一轮不等。
-//!
-//! ## 回落之后还得有人把模型拉回来，否则本地槽位是**静默死掉**的
-//!
-//! 空闲回收之后 `/health` 报 `idle`。只回落、不催热的话：这一轮走 Agnes，
-//! 下一轮探还是 `idle`、于是再回落……**那个本地模型再也不会被用到**，
-//! 而每一处显示都正常（端点换了、账也没多花、没有一处报错）。这正是 D128
-//! 那一类：功能还在，只是退化了。
-//!
-//! 反方向（`idle` 就留在本地）同样不行：sidecar 的 `do_POST` 在
-//! `_model is None` 时**同步加载**，8 GB 要十几秒——使用者盯着一个不动的
-//! 光标，而那正是流式输出那一轮工作要消掉的东西。
-//!
-//! 所以走第三条：**这一轮走 Agnes（快），同时 fire-and-forget 地
-//! `POST /warmup`**（sidecar 立刻答 202，权重在它自己的后台线程里加载），
-//! **下一轮就回到本地**。该不该催由 [`LocalHealth::needs_warmup`] 判，
-//! 和"这一轮走谁"一起从 [`decide`] 出来（见 [`LocalSlot::Fallback`] 的 `warm`）。
-//!
-//! ## 判定是纯的，探测只有薄薄一层
-//!
-//! 六种健康状态 →"留本地 / 改走谁"这件事**不碰任何 I/O**（[`decide`]），
-//! 所以六种情况都能在单元测试里直接构造出来。真去连端口的只有 [`probe`]
-//! 一个函数，300 ms 超时，复用 [`crate::decide::http`] 那个回环客户端
-//! （它已经带了回环限制和回环专属的短连接超时）。
-//!
-//! ## 非本地槽位一律不动
-//!
-//! 健康状态说的是 `127.0.0.1:17872` 上那个 Python 进程。
-//! DeepSeek / Agnes 的端点和它没有任何关系，所以 [`decide`] 对非本地 spec
-//! **一律返回 [`LocalSlot::Keep`]**——哪怕状态是"连不上"。
-//! **回落的判据不能溢出到别的槽位**，那会变成"本地没起来，于是连远端也不用"。
+//! 本地模型健康检查与预热；不就绪时保留本地端点并报告原因。
+//! 推理请求负责有界等待或返回错误，健康检查不再选择远端替代模型。
 
 use crate::think::router::{ModelSpec, Routing};
 
-/// `/health` 探测的超时。
-///
-/// ## 为什么是 300 ms
-///
-/// 这一跳在**每一轮对话的关键路径上**，而健康的 sidecar 大约 1 ms 就答完
-/// （它只是读两个全局变量）。300 ms 只在"它在、但卡住了"这种情况下花掉，
-/// 而那种情况和"没起来"一样该回落——**为它多等一秒，是让每一轮都白等一秒**。
-///
-/// 这个数还有一层来源：`decide::http` 里量出来 Windows 连一个没人监听的
-/// 回环端口要**约 2070 ms** 才回"积极拒绝"，比默认超时还晚。所以本机服务
-/// 的探测不该用默认超时，300 ms 足够区分"要么立刻接受、要么就是没起来"。
+/// 探测位于每轮对话的关键路径，短超时避免本机服务失联拖慢路由。
 pub const HEALTH_TIMEOUT_MS: u64 = 300;
 
-/// `/warmup` 那一脚的超时。
-///
-/// 和 [`HEALTH_TIMEOUT_MS`] 恰好同一个数，但**理由不同、所以是另一个常量**：
-/// 那边是"健康状态要立刻答"，这边是"叫一声就走"。sidecar 收到就往后台线程
-/// 一扔、立刻答 202（见它的 `_warmup()`），所以这 300 ms 只在"它在、但卡住了"
-/// 的时候花掉——**催热是顺手做的事，不该比探测本身还贵**。
+/// 预热仅提交后台加载请求，不在健康检查阶段等待权重加载。
 pub const WARMUP_TIMEOUT_MS: u64 = 300;
 
-/// sidecar 报出来的健康状态。
-///
-/// **可用/不可用的几种状态全都是 HTTP 200**（见 `sidecar/local_llm_server.py`
-/// 的 `do_GET`）——状态在**正文里**，所以"能连上"远远不等于"能用"。
-/// 只看状态码会把 `degraded` 当成健康，而那恰恰是最该回落的一种。
+/// HTTP 200 不代表模型就绪；必须检查响应正文里的状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalHealth {
     /// `{"status":"ok"}`：权重在显存里，这一轮就用它。
     Ready,
     /// `{"status":"loading"}`：还在加载（几 GB、几十秒）。
     ///
-    /// **不等。** 这一轮等它加载完，使用者看到的就是"打完字之后卡住几十秒"；
-    /// 而换成 Agnes 这一轮立刻就有结果。慢不是这条路的预期——**失败才是**。
+    /// 健康检查不阻塞等待权重加载；
+    /// 等待由本地推理请求的超时约束，不更换模型。
     Loading,
     /// `{"status":"idle"}`：曾经加载好，**权重被空闲释放了**（`/unload` 或空闲回收）。
     ///
     /// sidecar 那边写着"这不是错误，也不是在加载：下一个请求会自己把它拉回来"。
     /// 但那句"拉回来"是**这一轮要等几十秒**的意思——和 [`Self::Loading`]
-    /// 对使用者是同一件事，所以判定也一样：这一轮走 Agnes，
+    /// 对使用者是同一件事，所以判定也一样：保持本地端点，请求将等待加载或明确失败，
     /// 同时由 [`Self::needs_warmup`] 决定**顺手踢一脚 `/warmup`**，
-    /// 好让下一轮回到本地。
+    /// 让推理请求到来前开始加载。
     ///
     /// **单独一支而不是并进 [`Self::Unexpected`]**：理由是给人看的。
     /// "状态不认识（idle）"会让操作者去查一个根本没坏的东西，
@@ -115,8 +43,7 @@ pub enum LocalHealth {
     Unreachable(String),
     /// 答了 200，但状态不是上面任何一种（或者根本不是 JSON）。
     ///
-    /// **不认识就回落，不猜"大概没事"。** 猜"没事"的方向是这一轮必然失败，
-    /// 而猜错的方向只需要多花几分钱——两边代价不对称，所以往能干活的那边倒。
+    /// 未知状态必须报告，不推断模型已就绪，也不改用远端。
     Unexpected(String),
 }
 
@@ -136,33 +63,24 @@ impl LocalHealth {
     /// - [`Self::Unexpected`]：**我们不知道那是什么**。对一个不认识的进程
     ///   动手，比不动手更坏
     ///
-    /// ## 这一位为什么不能省
-    ///
-    /// `idle` 只回落不催的话，下一轮还是 `idle`、再下一轮还是——
-    /// **本地槽位就静默地永远死了**：每一处显示都正常，只有那个模型
-    /// 再也不会被用到。那是 D128 那一类的形状，而它没有任何症状。
     pub fn needs_warmup(&self) -> bool {
         matches!(self, LocalHealth::Idle | LocalHealth::Loading)
     }
 }
 
-/// 这一轮用哪个槽位。
+/// 本地槽位是否就绪、是否需要预热。
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalSlot {
     /// 本地就绪，照路由走。
     Keep,
-    /// 本地用不了：改走 `to`，`reason` 是给操作者看的中文理由。
+    /// 本地未就绪：保留端点，报告原因；仅 idle/loading 会请求预热。
     ///
     /// `reason` **不含句号**——打印那一层自己补，这样它既能进 stderr
     /// 又能原样进台账/`Routing::reason`，不必有人去改标点。
-    Fallback {
-        to: ModelSpec,
+    Unavailable {
         reason: String,
         /// 要不要顺手 `POST /warmup` 把权重热上（**不等它**）。
         ///
-        /// 这一位是"idle 会不会把本地槽位永久关掉"的分水岭：`idle` / `loading`
-        /// 只回落不催的话，下一轮探还是 `idle`、于是再回落——**那个模型再也
-        /// 不会被用到，而所有显示都正常**（走的还是那个免费端点，账也没多花）。
         /// 判据见 [`LocalHealth::needs_warmup`]。
         warm: bool,
     },
@@ -173,12 +91,12 @@ pub enum LocalSlot {
 /// 判据用 `provider` 而不是 `base_url`：**`provider` 才是路由和台账用的身份**，
 /// 而 `base_url` 是可以变的（换个端口、换个 sidecar 进程，还是同一个本地槽位）。
 pub fn is_local(spec: &ModelSpec) -> bool {
-    spec.provider == ModelSpec::LOCAL_QWEN.provider
+    spec.provider == ModelSpec::LOCAL.provider
 }
 
 /// 从本地槽位的 `base_url` 推出 `/health` 地址。
 ///
-/// **这里不写端口号。** 端口已经有一份出处：`ModelSpec::LOCAL_QWEN.base_url`
+/// **这里不写端口号。** 端口已经有一份出处：`ModelSpec::LOCAL.base_url`
 /// （`crates/yunxi-bot-cli/src/main.rs` 的 `LOCAL_MODEL_PORT` 是"把 sidecar
 /// 拉起来"要用的那一份，两边注释互相指认）。再写一个数字就是第二份出处，
 /// 改一处漏一处——**那正是 D128 的成因形状**。
@@ -208,15 +126,7 @@ fn slot_root(base_url: &str) -> &str {
     base.strip_suffix("/v1").unwrap_or(base)
 }
 
-/// 从 `ModelSpec` + 健康状态决定这一轮走谁。**纯函数：不碰网络、不碰台账。**
-///
-/// 纯是刻意的：这几种健康状态在真机上凑不齐（`degraded` 要先把 torch 弄坏），
-/// 而这条判据恰恰是"本地挂了会不会静默降级"的守门人——
-/// **它必须能在一个不联网的测试里被逐条钉住。**
-///
-/// 回落的结论里还带着 `warm`（要不要顺手催一下 `/warmup`）：
-/// **"这一轮走谁"和"下一轮还能不能回到本地"是同一次判定的两半**，
-/// 分开判必然漂移——而漏掉催热的那一半，就是本地槽位静默死掉。
+/// 健康检查只决定是否需要预热，不授予切换远端的权限。
 pub fn decide(spec: &ModelSpec, health: &LocalHealth) -> LocalSlot {
     // 非本地槽位：**连看都不看健康状态**，原样放行
     if !is_local(spec) {
@@ -228,13 +138,17 @@ pub fn decide(spec: &ModelSpec, health: &LocalHealth) -> LocalSlot {
     let warm = health.needs_warmup();
     let reason = match health {
         LocalHealth::Ready => return LocalSlot::Keep,
-        LocalHealth::Loading => "还没就绪（loading，权重还在加载），这一轮走 Agnes".to_string(),
+        LocalHealth::Loading => {
+            "还没就绪（loading，权重还在加载），保持本地端点，请求将等待加载或明确失败".to_string()
+        }
         // `idle` 和 `loading` 对使用者是同一件事：权重都不在显存里，
-        // 这一轮要等几十秒。区别只在**谁去把它拉回来**——而那不是这一轮该等的。
-        LocalHealth::Idle => "权重被空闲释放了（idle），这一轮走 Agnes".to_string(),
+        // 加载由 sidecar 完成，推理请求仍受自身超时约束。
+        LocalHealth::Idle => {
+            "权重被空闲释放了（idle），保持本地端点，请求将等待加载或明确失败".to_string()
+        }
         LocalHealth::Degraded(detail) => {
             format!(
-                "加载失败过（degraded：{}），这一轮走 Agnes",
+                "加载失败过（degraded：{}），保持本地端点，请求将等待加载或明确失败",
                 snippet(detail)
             )
         }
@@ -242,21 +156,17 @@ pub fn decide(spec: &ModelSpec, health: &LocalHealth) -> LocalSlot {
         // 地址和该查什么（"连不上（回环地址 300 ms 内没接受连接）——多半是这个服务没起来"），
         // 再套一层括号只会把真正有用的那句埋掉——所以用冒号接，不套括号。
         LocalHealth::Unreachable(err) => {
-            format!("探测不通：{}，这一轮走 Agnes", snippet(err))
+            format!(
+                "探测不通：{}，保持本地端点，请求将等待加载或明确失败",
+                snippet(err)
+            )
         }
         LocalHealth::Unexpected(raw) => format!(
-            "状态不认识（{}），不敢当它可用，这一轮走 Agnes",
+            "状态不认识（{}），不敢当它可用，保持本地端点，请求将等待加载或明确失败",
             snippet(raw)
         ),
     };
-    LocalSlot::Fallback {
-        // 兜底目标是 Agnes（免费档）：和 `ModelRouter::route` 里
-        // "拿不准走免费的那个"同一条判据。**不挑 DeepSeek**——
-        // 回落的理由是"本地这台机器上跑不了"，不是"这活变难了"。
-        to: ModelSpec::AGNES_FLASH,
-        reason,
-        warm,
-    }
+    LocalSlot::Unavailable { reason, warm }
 }
 
 /// 解析 `/health` 的响应体。**纯函数**——几种 200 的区分只在这里做。
@@ -264,7 +174,7 @@ pub fn decide(spec: &ModelSpec, health: &LocalHealth) -> LocalSlot {
 /// 认得 `ok` / `loading` / `idle` / `degraded`（`sidecar/local_llm_server.py`
 /// 目前报的就是这四种）。**认不出来的一律 [`LocalHealth::Unexpected`]**：
 /// sidecar 加了新状态时，那是"我们没见过它"，不是"它一定没事"——
-/// 回落，并把原话打出来。
+/// 报告原话，不把未知状态当成就绪。
 pub fn parse_health(body: &str) -> LocalHealth {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return LocalHealth::Unexpected(snippet(body));
@@ -286,20 +196,7 @@ pub fn parse_health(body: &str) -> LocalHealth {
     }
 }
 
-/// 本地槽位那条 I/O 缝：**探一次健康**，以及**催一次加载**。
-///
-/// 做成可替换的函数对象（和 `tool::runner::DeltaSink` 同一个写法）是为了让
-/// **"该回落时回落"能在测试里发生**：真起一个 4B sidecar 要几十秒和几 GB 内存，
-/// 那种测试没人会跑第二遍——于是回落逻辑等于没测，而它恰恰是
-/// "本地挂了会不会静默降级"的守门人。
-///
-/// ## 为什么两个动作绑在同一个东西上
-///
-/// 它们是同一件事的两半：`/health` 回答"现在能不能用"，`/warmup` 说"下回能不能用"。
-/// 拆成两个可以分别注入的口子，测试里换掉了探测、却漏掉催热，那一下就会真的
-/// 打到 `127.0.0.1:17872`——同一份代码在两台机器上答案不同（一台起了 sidecar、
-/// 一台没起），而且还可能把同事机器上正闲着的模型热起来。
-/// 绑成一个结构就没这个口子：**换掉探测，催热必然一起被换掉。**
+/// 健康检查和预热一起注入，测试替身不会意外唤醒真实模型。
 pub struct Probe {
     health_fn: std::sync::Arc<dyn Fn(&str) -> LocalHealth + Send + Sync>,
     warm_fn: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
@@ -338,17 +235,7 @@ impl Probe {
     }
 }
 
-/// 真去叫一次 `/warmup`：**发出去、不等、不看结果**。
-///
-/// 三条都重要：
-///
-/// 1. **不等。** sidecar 收到就答 202，加载在它自己的后台线程里——
-///    真要等的是那十几秒，而那正是 D106 那条要躲的东西
-/// 2. **300 ms 就放弃**（[`WARMUP_TIMEOUT_MS`]）。这一下是"顺手叫一声"，
-///    不该比探测本身还贵
-/// 3. **结果一律丢掉。** 成功没有后续动作，失败也没有——这一轮已经改走 Agnes 了，
-///    在终端上多打一行"催热失败"只会是噪音；而它为什么没热起来，
-///    下一轮的 `/health` 说得比这里准（`degraded` 会带上 `detail`）
+/// 预热由侧车后台完成；本次失败由推理请求与下一次健康检查报告。
 pub fn warm_up(endpoint: &str) {
     // 正文给一个空 JSON 对象：sidecar 的 `/warmup` 不读正文，
     // 但 `Content-Type: application/json` 下面总得有个合法的东西。
@@ -360,7 +247,7 @@ pub fn warm_up(endpoint: &str) {
 /// 走 [`crate::decide::http::get_json`] 而不是自己开 socket：那个客户端
 /// **只允许回环地址**（本地槽位只可能在 `127.0.0.1` 上），而且回环连接
 /// 用它量出来的短超时。非 2xx 在它那里就是 `Err`——正好，
-/// "答了 500"和"连不上"一样该回落。
+/// "答了 500"和"连不上"都按未就绪报告。
 pub fn probe(endpoint: &str) -> LocalHealth {
     match crate::decide::http::get_json(endpoint, HEALTH_TIMEOUT_MS) {
         Ok(body) => parse_health(&body),
@@ -368,53 +255,19 @@ pub fn probe(endpoint: &str) -> LocalHealth {
     }
 }
 
-/// 探一次、判一次、**就地改写路由**；回落了就返回理由（`None` = 一个字都没动）。
-///
-/// ## 为什么"改写"这一步也在 core 里
-///
-/// 对话那条链路（`ChatHandler::route_for`）和任务引擎（`task::engine`）
-/// 都要做同一件事：本地槽位不可用 → 换端点、换档位、把理由接进 `reason`。
-/// **两份实现必然漂移**，而漂移的方向是"有一条链路悄悄不回落了"——
-/// 那正是 D128 的形状（功能还在，只是退化成了一个看不出来的样子）。
-/// 所以判据和落地都只留这一份，两个调用方各自只管"怎么把它说出来"。
-///
-/// ## 非本地槽位一个字节都不动
-///
-/// [`is_local`] 不成立时**连探都不探**：远端端点的健康和 17872 上那个进程
-/// 没有关系，白探一次不只是多花最多 300 ms——探失败时还会把"本地没起来"
-/// 记到一次本来和它无关的路由上。
-///
-/// 返回的理由**不含句号**（和 [`LocalSlot::Fallback`] 一致），
-/// 调用方要打印就自己补。
-pub fn apply_fallback(routing: &mut Routing, probe: &Probe) -> Option<String> {
+/// 未就绪时说明原因并请求预热；模型、端点与思考模式保持不变。
+pub fn prepare_local(routing: &mut Routing, probe: &Probe) -> Option<String> {
     if !is_local(&routing.spec) {
         return None;
     }
     let health = probe.health(&health_endpoint(routing.spec.base_url));
-    let LocalSlot::Fallback { to, reason, warm } = decide(&routing.spec, &health) else {
+    let LocalSlot::Unavailable { reason, warm } = decide(&routing.spec, &health) else {
         return None;
     };
     if warm {
-        // **回落和催热必须一起发生。** 只回落就是把本地槽位静默关掉；
-        // 只催热就是让这一轮白等几十秒。原设计是"这一轮走 Agnes，
-        // 本地在后台热着，下一轮回到本地"——两半缺一不可。
-        //
-        // 地址从**同一个** `base_url` 推（见 `warmup_endpoint`），
-        // 所以探的和催的必然是同一台机器上的同一个进程。
-        //
-        // 这一下是**同步发出**的（不是扔给一个线程就回来），而且是刻意的：
-        // 能走到这里说明 `/health` 刚刚**及时答过话**——"卡住"的 sidecar
-        // 探出来是 `Unreachable`，压根不会催。所以真实代价是一毫秒级的 202，
-        // 而反过来（起线程）会在"进程马上就退出"的那条路上把这一脚丢掉，
-        // 于是本地槽位还是回不来——**那正是这次要修的 bug**。
         probe.warm(&warmup_endpoint(routing.spec.base_url));
     }
     routing.reason.push_str(&format!("；{reason}"));
-    // `tier` 跟着 `spec` 一起换：兜底之后这一轮**真的**是标准档（Agnes），
-    // 留着原来那一档会让 `Routing` 自己和自己对不上，而台账、终端标签、
-    // 成本统计读的正是这两个字段。
-    routing.tier = to.tier;
-    routing.spec = to;
     Some(reason)
 }
 
@@ -434,6 +287,29 @@ fn snippet(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_failure_never_changes_the_model_or_endpoint() {
+        use crate::think::{ModelRouter, ReasoningEffort, TaskKind, TaskProfile};
+        for health in [
+            LocalHealth::Idle,
+            LocalHealth::Loading,
+            LocalHealth::Degraded("load failed".into()),
+            LocalHealth::Unreachable("offline".into()),
+            LocalHealth::Unexpected("unknown".into()),
+        ] {
+            let mut route = ModelRouter::new(vec![ModelSpec::LOCAL], ModelSpec::LOCAL.tier).route(
+                "你好",
+                TaskKind::Conversation,
+                &TaskProfile::default(),
+                ReasoningEffort::Auto,
+                None,
+            );
+            let before = route.spec.clone();
+            let probe = Probe::new(move |_| health.clone(), |_| {});
+            assert!(prepare_local(&mut route, &probe).is_some());
+            assert_eq!(route.spec, before);
+        }
+    }
     use super::*;
     use crate::think::router::ModelSpec;
 
@@ -447,8 +323,8 @@ mod tests {
     /// 表驱动而不是六个测试函数，是因为加一种新状态时，
     /// 漏掉一行比漏掉一个函数更容易被发现——左边的长度是写死的。
     #[test]
-    fn the_health_table_maps_to_keep_or_fallback() {
-        let local = ModelSpec::LOCAL_QWEN;
+    fn the_health_table_distinguishes_ready_from_unavailable() {
+        let local = ModelSpec::LOCAL;
         let cases: [(LocalHealth, bool); 6] = [
             (LocalHealth::Ready, true),
             (LocalHealth::Loading, false),
@@ -463,8 +339,7 @@ mod tests {
                 assert_eq!(got, LocalSlot::Keep, "{health:?} 该留着本地槽位");
             } else {
                 match got {
-                    LocalSlot::Fallback { to, reason, .. } => {
-                        assert_eq!(to.provider, "agnes", "{health:?} 该回落到 Agnes");
+                    LocalSlot::Unavailable { reason, .. } => {
                         assert!(!reason.is_empty(), "{health:?} 的回落必须带理由");
                     }
                     LocalSlot::Keep => panic!("{health:?} 不该当成可用——那是静默降级"),
@@ -474,10 +349,10 @@ mod tests {
     }
 
     #[test]
-    fn ready_is_the_only_state_that_keeps_the_local_slot() {
+    fn ready_is_the_only_healthy_state() {
         // 反过来钉一遍：**除了 ok，没有任何一种状态算"可用"**。
         // 这条防的是将来有人加状态时手滑把默认值写成 `Keep`。
-        let local = ModelSpec::LOCAL_QWEN;
+        let local = ModelSpec::LOCAL;
         let not_ready = [
             LocalHealth::Loading,
             LocalHealth::Idle,
@@ -501,9 +376,8 @@ mod tests {
             parse_health(r#"{"status":"idle","model":"Qwen3-4B-Instruct-2507"}"#),
             LocalHealth::Idle
         );
-        match decide(&ModelSpec::LOCAL_QWEN, &LocalHealth::Idle) {
-            LocalSlot::Fallback { to, reason, .. } => {
-                assert_eq!(to.provider, "agnes");
+        match decide(&ModelSpec::LOCAL, &LocalHealth::Idle) {
+            LocalSlot::Unavailable { reason, .. } => {
                 assert!(reason.contains("idle"), "要把 sidecar 的原话带上: {reason}");
                 assert!(
                     !reason.contains("不认识"),
@@ -528,7 +402,7 @@ mod tests {
         // - `unreachable`：不踢。没有进程在听，POST 只能等到超时
         // - `unexpected`：不踢。**我们不知道那是什么**，对不认识的进程动手
         //   比不动手更坏
-        let local = ModelSpec::LOCAL_QWEN;
+        let local = ModelSpec::LOCAL;
         let cases: [(LocalHealth, bool); 6] = [
             (LocalHealth::Ready, false),
             (LocalHealth::Loading, true),
@@ -539,7 +413,7 @@ mod tests {
         ];
         for (health, wants) in cases {
             match decide(&local, &health) {
-                LocalSlot::Fallback { warm, .. } => {
+                LocalSlot::Unavailable { warm, .. } => {
                     assert_eq!(warm, wants, "{health:?} 的催热判据不对");
                 }
                 // 只有 `ok` 走这里，而它的期望值就是"不催"
@@ -549,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn applying_the_fallback_also_kicks_the_warmup_but_never_touches_remote_slots() {
+    fn preparing_local_warms_idle_without_touching_remote_slots() {
         use crate::think::router::{TaskKind, Tier, TokenEstimate};
 
         /// 一条"本来是本地槽位"的路由。
@@ -557,7 +431,7 @@ mod tests {
             Routing {
                 tier: Tier::Cheap,
                 kind: TaskKind::Conversation,
-                spec: ModelSpec::LOCAL_QWEN,
+                spec: ModelSpec::LOCAL,
                 thinking: false,
                 reason: "这条话判成轻量".into(),
                 estimated_calls: 1,
@@ -574,9 +448,9 @@ mod tests {
             move |endpoint: &str| sink.lock().expect("锁").push(endpoint.to_string()),
         );
         let mut routing = local_routing();
-        let reason = apply_fallback(&mut routing, &probe).expect("idle 该回落");
-        assert_eq!(routing.spec.provider, "agnes", "这一轮改走 Agnes");
-        assert_eq!(routing.tier, Tier::Standard, "档位要跟着一起换");
+        let reason = prepare_local(&mut routing, &probe).expect("idle 该回落");
+        assert_eq!(routing.spec.provider, "local", "保留本地模型");
+        assert_eq!(routing.tier, Tier::Cheap, "档位保持不变");
         assert!(
             routing.reason.contains(&reason),
             "理由接进 reason 才会进台账: {}",
@@ -600,10 +474,10 @@ mod tests {
             |_: &str| panic!("远端槽位不该被催热"),
         );
         let mut remote = local_routing();
-        remote.spec = ModelSpec::AGNES_FLASH;
-        remote.tier = ModelSpec::AGNES_FLASH.tier;
+        remote.spec = ModelSpec::DEEPSEEK_FLASH;
+        remote.tier = ModelSpec::DEEPSEEK_FLASH.tier;
         let before = remote.clone();
-        assert!(apply_fallback(&mut remote, &probe).is_none());
+        assert!(prepare_local(&mut remote, &probe).is_none());
         assert_eq!(
             probed.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -613,18 +487,17 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognised_status_falls_back() {
+    fn an_unrecognised_status_is_reported_as_unavailable() {
         // **不认识就往能干活的那边倒，不是往"大概没事"倒。**
         //
         // sidecar 加了新状态时，我们并不知道它是什么意思——猜"没事"的代价是
         // 这一轮必然失败，猜错的代价只是多花几分钱。
         let got = decide(
-            &ModelSpec::LOCAL_QWEN,
+            &ModelSpec::LOCAL,
             &LocalHealth::Unexpected("hibernating".into()),
         );
         match got {
-            LocalSlot::Fallback { to, reason, .. } => {
-                assert_eq!(to.provider, "agnes");
+            LocalSlot::Unavailable { reason, .. } => {
                 assert!(
                     reason.contains("不认识"),
                     "要说明白是「不认识」，而不是别的什么原因: {reason}"
@@ -647,7 +520,7 @@ mod tests {
             LocalHealth::Unreachable("连接被拒绝".into()),
             LocalHealth::Unexpected("???".into()),
         ];
-        for spec in [ModelSpec::AGNES_FLASH, ModelSpec::DEEPSEEK_FLASH] {
+        for spec in [ModelSpec::DEEPSEEK_FLASH] {
             for h in &healths {
                 assert_eq!(
                     decide(&spec, h),
@@ -673,13 +546,16 @@ mod tests {
             }
             other => panic!("{DEGRADED_BODY} 该解析成 degraded，实际 {other:?}"),
         }
-        match decide(&ModelSpec::LOCAL_QWEN, &health) {
-            LocalSlot::Fallback { reason, .. } => {
+        match decide(&ModelSpec::LOCAL, &health) {
+            LocalSlot::Unavailable { reason, .. } => {
                 assert!(
                     reason.contains("ModuleNotFoundError: No module named 'torch'"),
                     "detail 必须原样进理由——那是操作者唯一的线索: {reason}"
                 );
-                assert!(reason.contains("Agnes"), "要说清这一轮改走了谁: {reason}");
+                assert!(
+                    reason.contains("保持本地端点"),
+                    "要说清本轮端点不变: {reason}"
+                );
             }
             LocalSlot::Keep => panic!("degraded 被当成了可用"),
         }
@@ -690,12 +566,12 @@ mod tests {
         // 连不上时理由要带**底层那句话**：`decide::http` 的文案里有地址和
         // "多半是这个服务没起来"，那正是操作者要知道的下一步。
         match decide(
-            &ModelSpec::LOCAL_QWEN,
+            &ModelSpec::LOCAL,
             &LocalHealth::Unreachable(
                 "连接失败: 127.0.0.1:17872 连不上——多半是这个服务没起来".into(),
             ),
         ) {
-            LocalSlot::Fallback { reason, .. } => {
+            LocalSlot::Unavailable { reason, .. } => {
                 assert!(reason.contains("17872"), "要带地址: {reason}");
                 assert!(reason.contains("没起来"), "要带下一步: {reason}");
             }
@@ -729,7 +605,7 @@ mod tests {
                 "{body:?} 该是「不认识」"
             );
             assert_ne!(
-                decide(&ModelSpec::LOCAL_QWEN, &parse_health(body)),
+                decide(&ModelSpec::LOCAL, &parse_health(body)),
                 LocalSlot::Keep,
                 "{body:?} 不该留下本地槽位"
             );
@@ -741,8 +617,8 @@ mod tests {
         // sidecar 理论上总会给 detail，但真不给的时候**也不能只报一句
         // "加载失败"**——那句话正是 D106 让人查了很久的东西。
         let h = parse_health(r#"{"status":"degraded","model":"unloaded"}"#);
-        match decide(&ModelSpec::LOCAL_QWEN, &h) {
-            LocalSlot::Fallback { reason, .. } => {
+        match decide(&ModelSpec::LOCAL, &h) {
+            LocalSlot::Unavailable { reason, .. } => {
                 assert!(reason.contains("degraded"), "{reason}");
                 assert!(reason.contains("没给 detail"), "要说清缺了什么: {reason}");
             }
@@ -756,8 +632,8 @@ mod tests {
         // 一行几万字的 stderr 会把真正有用的那几行冲掉。
         let long = "x".repeat(5000);
         let h = LocalHealth::Degraded(long);
-        match decide(&ModelSpec::LOCAL_QWEN, &h) {
-            LocalSlot::Fallback { reason, .. } => {
+        match decide(&ModelSpec::LOCAL, &h) {
+            LocalSlot::Unavailable { reason, .. } => {
                 assert!(
                     reason.chars().count() < 400,
                     "理由被截断了: {}",
@@ -768,8 +644,8 @@ mod tests {
         }
         // 截断按字符来，不能切出半个汉字
         let cn = LocalHealth::Degraded("很".repeat(500));
-        match decide(&ModelSpec::LOCAL_QWEN, &cn) {
-            LocalSlot::Fallback { reason, .. } => assert!(reason.contains('很')),
+        match decide(&ModelSpec::LOCAL, &cn) {
+            LocalSlot::Unavailable { reason, .. } => assert!(reason.contains('很')),
             LocalSlot::Keep => panic!(),
         }
     }
@@ -779,7 +655,7 @@ mod tests {
         // **端口只能有一份出处。** 这条钉的是"我们从 spec 推地址"，
         // 而不是"我们在第二个地方写了 17872"：
         // `LOCAL_QWEN.base_url` 一改，探测地址跟着改。
-        let ep = health_endpoint(ModelSpec::LOCAL_QWEN.base_url);
+        let ep = health_endpoint(ModelSpec::LOCAL.base_url);
         assert_eq!(ep, "http://127.0.0.1:17872/health");
         assert!(
             ep.contains("17872"),
@@ -796,14 +672,14 @@ mod tests {
         // 这里再写一个 17872 的话，改端口时漏掉它——而漏掉的表现是
         // "催热打到没人监听的端口上"，那条路是 fire-and-forget 的，
         // **没有任何地方会报出来**。
-        let warm = warmup_endpoint(ModelSpec::LOCAL_QWEN.base_url);
+        let warm = warmup_endpoint(ModelSpec::LOCAL.base_url);
         assert_eq!(warm, "http://127.0.0.1:17872/warmup");
         assert!(warm.contains("17872"), "端口必须来自 base_url: {warm}");
         // 同一条规矩：`/v1` 要砍掉（`/v1/warmup` 是 404）
         assert!(!warm.contains("/v1"), "{warm}");
         // 探的和催的必须是同一台机器上的同一个进程：两个地址除了最后一段
         // 路径之外必须逐字相同
-        let health = health_endpoint(ModelSpec::LOCAL_QWEN.base_url);
+        let health = health_endpoint(ModelSpec::LOCAL.base_url);
         assert_eq!(
             health.rsplit_once('/').expect("有斜杠").0,
             warm.rsplit_once('/').expect("有斜杠").0,
@@ -812,29 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn the_fallback_target_is_the_free_remote_slot() {
-        // 兜底挑 Agnes：免费档。**不挑 DeepSeek**——回落的理由是
-        // "本地这台机器上跑不了"，不是"这活变难了"。
-        match decide(
-            &ModelSpec::LOCAL_QWEN,
-            &LocalHealth::Unreachable("连接被拒绝".into()),
-        ) {
-            LocalSlot::Fallback { to, .. } => {
-                assert_eq!(to.provider, "agnes");
-                assert_eq!(to.model, ModelSpec::AGNES_FLASH.model);
-                // 回落之后**不能再是本地**，否则等于没落
-                assert_ne!(to.provider, ModelSpec::LOCAL_QWEN.provider);
-            }
-            LocalSlot::Keep => panic!(),
-        }
-    }
-
-    #[test]
     fn only_the_local_provider_counts_as_local() {
         // 判据用 provider，不用 base_url：换个端口、换个 sidecar 进程
         // 还是同一个本地槽位；而一个恰好也在回环上的别的槽位不该被当成它。
-        assert!(is_local(&ModelSpec::LOCAL_QWEN));
-        assert!(!is_local(&ModelSpec::AGNES_FLASH));
+        assert!(is_local(&ModelSpec::LOCAL));
         assert!(!is_local(&ModelSpec::DEEPSEEK_FLASH));
     }
 }

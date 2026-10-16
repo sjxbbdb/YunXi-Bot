@@ -169,6 +169,9 @@ pub fn seen(events: &[crate::Event]) -> std::collections::BTreeSet<String> {
                 if ev.data.get("dry_run").and_then(|v| v.as_bool()) == Some(true) {
                     continue;
                 }
+                if matches!(ev.data["result"].as_str(), Some("被系统阻止" | "发送失败")) {
+                    continue;
+                }
                 if let Some(id) = ev.data.get("id").and_then(|v| v.as_str()) {
                     out.insert(format!(
                         "{}:{}",
@@ -247,8 +250,10 @@ pub fn last_notified(events: &[crate::Event]) -> Option<InfoItem> {
             if ev.data.get("dry_run").and_then(|v| v.as_bool()) == Some(true) {
                 return None;
             }
-            // `confirmed` 为假且不是 dry_run，说明是"已交给系统但未确认可见"。
-            // 那种也算通知过了——使用者可能已经在通知中心里看到了。
+            if matches!(ev.data["result"].as_str(), Some("被系统阻止" | "发送失败")) {
+                return None;
+            }
+            // 旧记录缺少result时保持原有去重语义，避免重放历史通知。
             item_from_event(ev)
         }
         _ => None,
@@ -699,6 +704,18 @@ mod tests {
         assert!(find_item(&[], "42").is_none());
     }
 
+    #[test]
+    fn explicitly_failed_or_blocked_notices_remain_retryable() {
+        for result in ["被系统阻止", "发送失败"] {
+            let events = vec![ev(
+                EventKind::NoticeSent,
+                serde_json::json!({"source":"mail","id":"42","result":result,"dry_run":false}),
+            )];
+            assert!(!already_seen(&seen(&events), &item("a@x.com", "s")));
+            assert!(seen(&events).is_empty());
+            assert!(last_notified(&events).is_none());
+        }
+    }
     #[test]
     fn last_notified_skips_dry_runs() {
         // **别让使用者对着一封没见过的邮件建规则。**

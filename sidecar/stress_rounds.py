@@ -84,14 +84,11 @@ def main() -> int:
     real_home = real_home_dir()
     # **跑之前记一份真实 home**：跑完再比一次，证明这次测试没写回去。
     before_home = snapshot_home(real_home)
-    if not (real_home / "secrets" / "agnes.key").exists():
-        print("没有 agnes.key，这个验证需要真模型", file=sys.stderr)
-        return 2
 
     with tempfile.TemporaryDirectory(prefix="yunxi-rounds-") as tmp:
         home = Path(tmp)
         (home / "secrets").mkdir(parents=True, exist_ok=True)
-        for n in ("agnes.key", "deepseek.key", "bocha.key"):
+        for n in ("deepseek.key", "bocha.key"):
             src = real_home / "secrets" / n
             if src.exists():
                 shutil.copy(src, home / "secrets" / n)
@@ -193,7 +190,7 @@ def main() -> int:
                     f"只有 {rate:.1f}%——前缀可能在每轮之间变了，而那种失效是静默的",
                 )
             else:
-                print("      （模型没返回缓存字段，Agnes 不提供——这条验不了）")
+                print("      （模型没返回缓存字段——这条验不了）")
 
     # **隔离断言：真实 home 一个字节都不该动。**
     # 这条以前不存在——`real_home` 只被用来借密钥，没有任何东西证明

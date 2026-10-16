@@ -152,17 +152,9 @@ pub fn constraint_ceiling(
     policy: &CompanionPolicy,
     local_hour: u8,
 ) -> ConstraintVerdict {
-    if policy.is_quiet_hour(local_hour) {
-        return ConstraintVerdict {
-            ceiling: Intervention::Hold,
-            reason: format!("当前处于安静时段（{local_hour} 点）"),
-        };
-    }
-    if ctx.quiet_hours {
-        return ConstraintVerdict {
-            ceiling: Intervention::Hold,
-            reason: "情境标记为安静时段".into(),
-        };
+    let quiet = notification_ceiling(ctx, policy, local_hour);
+    if quiet.ceiling != Intervention::Speak {
+        return quiet;
     }
     if ctx.interventions_today >= policy.max_interventions_per_day {
         return ConstraintVerdict {
@@ -180,6 +172,27 @@ pub fn constraint_ceiling(
                 "距上次互动仅 {} 分钟，未达最小间隔 {} 分钟",
                 ctx.minutes_since_last_interaction, policy.min_minutes_between_interventions
             ),
+        };
+    }
+    quiet
+}
+
+/// 事务通知保留静默约束；陪伴的开口额度不应消耗重要消息的提醒机会。
+pub(crate) fn notification_ceiling(
+    ctx: &Situation,
+    policy: &CompanionPolicy,
+    local_hour: u8,
+) -> ConstraintVerdict {
+    if policy.is_quiet_hour(local_hour) {
+        return ConstraintVerdict {
+            ceiling: Intervention::Hold,
+            reason: format!("当前处于安静时段（{local_hour} 点）"),
+        };
+    }
+    if ctx.quiet_hours {
+        return ConstraintVerdict {
+            ceiling: Intervention::Hold,
+            reason: "情境标记为安静时段".into(),
         };
     }
     ConstraintVerdict {

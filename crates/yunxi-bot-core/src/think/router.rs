@@ -1,67 +1,9 @@
-//! 模型选择器：每个任务决定一次「用哪个模型 + 要不要思考」。
-//!
-//! ## 两个轴，不要混在一起
-//!
-//! | 轴 | 决定什么 | 依据 |
-//! |---|---|---|
-//! | **任务类型**（[`TaskKind`]） | **要不要思考** | 这活需要多少推理 |
-//! | **调用次数**（[`TaskProfile`]） | **用哪个模型** | RPM 瓶颈 |
-//!
-//! 我最初把后者当成全部判据，理由写的是"多轮任务换 DeepSeek 主要在解 RPM 瓶颈，
-//! 不是在图更强推理"。那句话只解释得通**模型**的选择，解释不通**思考模式**的
-//! 选择——于是我把思考模式全局关掉了，这是错的。
-//!
-//! ### 实测：关思考省 60% token，但答案短 2.5 倍
-//!
-//! 同一个需要推理的问题（三货架四层六箱，每天出 17 箱）：
-//!
-//! | 模式 | 输出 token | 思考字符 | 答案字符 | 耗时 |
-//! |---|---|---|---|---|
-//! | 默认（不传字段）= 开 | 855 | 1037 | 218 | 4.2s |
-//! | 显式 `enabled` | 815 | 941 | 253 | 3.9s |
-//! | 显式 `disabled` | **340** | 0 | **558** | 2.1s |
-//!
-//! 省下的 60% 输出 token **正是推理本身**。所以正确的做法不是"全局关掉省钱"，
-//! 而是**只在不需要推理的任务上关**——省掉的本来就是浪费。
-//!
-//! 另实测：**思考模式 + 工具调用不冲突**（`finish=tool_calls`，正常返回
-//! `reasoning_content`）。这是任务执行框架能用思考模式的前提。
-//!
-//! ## 模型轴：判据是调用次数，不是推理深度
-//!
-//! | | Agnes 3.0 Flash | DeepSeek Flash |
-//! |---|---|---|
-//! | RPM | **10**（免费档） | 并发 2500，基本无等待 |
-//! | 6 次调用要多久 | ≈ 36 秒（光是等） | ≈ 几秒 |
-//! | 价格 | 当前免费 | 空闲 ¥1/M 输入、¥4/M 输出 |
-//! | 缓存折扣 | 10 倍 | **50 倍** |
-//!
-//! **少调用走 Agnes（免费且够快），多调用走 DeepSeek（不然光等就把任务拖死）。**
-//!
-//! ## 三层判断，从便宜到贵
-//!
-//! ```text
-//! 1. 确定性信号（不花钱、不耗时）
-//!      任务长度 / 显式枚举 / 串联词 / 代码 / 推理词
-//!      → 能定就定
-//!              ↓ 拿不准
-//! 2. 本地 Verdict（免费、约 15ms、离线）
-//!      两个 choice 问题："要几次调用？""要多少推理？"
-//!              ↓ 它也弃权
-//! 3. 保守兜底：Agnes + 开思考
-//! ```
-//!
-//! **顺序不能反。** 每次都问模型判复杂度，等于为了省钱先花钱。
-//!
-//! ## 每个任务只做一次决策
-//!
-//! 路由在**任务开始时决定一次**，这个任务全程用同一个模型 + 同一个思考模式。
-//! 除了简单，这也和缓存一致：中途换模型会把已构建的前缀缓存全部作废。
-//! 拆解出来的**每个子任务各自路由一次**——那是"每个任务"，不是"任务中途换"。
+//! 每一步分别确定模型与思考模式：聊天和助理任务均走 DeepSeek；本地只保留决策与检索辅助模型。
+//! 显式 provider 可限定模型；本地健康检查不会切换到远端。
 
 use serde::{Deserialize, Serialize};
 
-use super::agnes::ThinkerConfig;
+use super::client::ThinkerConfig;
 use super::cost::{Cost, PriceTable, Usage, is_peak_hour};
 use crate::decide::Decider;
 
@@ -187,13 +129,11 @@ impl TaskKind {
         [
             (
                 "task",
-                "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，\
-                 或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类",
+                "有事要办：要查什么、要改什么、要跑什么、要写什么、要分析什么，或者要我做点什么。哪怕只有一句话、听起来很随口，只要落点是\"办成一件事\"，就是这一类",
             ),
             (
                 "chat",
-                "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。\
-                 不需要我动手做任何事，回一句话就够了",
+                "只是闲聊：打招呼、聊感受、随口说一句、问我在不在。不需要我动手做任何事，回一句话就够了只是引用台词、描述别人的命令而明确不要求执行时，也是闲聊。",
             ),
         ]
     }
@@ -296,7 +236,7 @@ pub struct ModelSpec {
     pub base_url: &'static str,
     pub model: &'static str,
     pub price: PriceTable,
-    /// 每分钟请求数上限。Agnes 免费档是 10。
+    /// 每个端点独立的请求限流。
     pub rpm: u32,
     /// 该端点的**能力**上限：它支不支持思考模式。
     ///
@@ -308,25 +248,7 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
-    /// 本地小模型：**闲聊和简单任务的第一选择**。
-    ///
-    /// ## 为什么档位是 `Cheap` 而不是新加一档
-    ///
-    /// `Tier` 表达的是"这件事有多重"，不是"用哪个模型"。
-    /// 闲聊和简单任务**本来就是最轻的那一档**，只是以前 `Cheap`
-    /// 没有对应的 spec、于是回落到默认档（免费的 Agnes）。
-    /// 现在给它一个真正本地的实现，语义反而更顺。
-    ///
-    /// ## 为什么不需要密钥
-    ///
-    /// 它在 `127.0.0.1` 上，是本机的一个 Python 进程
-    /// （`sidecar/local_llm_server.py`）。`key_hint` 留着是为了
-    /// 出错时能告诉人"这里本来该有什么"，**不是每个槽位都得有密钥。**
-    ///
-    /// ## 一个要留意的取舍
-    ///
-    /// 本地模型的能力上限明显低于 DeepSeek。所以它只该接
-    /// **闲聊和简单任务**——复杂任务走 `Tier::Deep`，不由这里决定。
+    /// 其他平台保留的轻量聊天端点；任务由 DeepSeek 处理。
     pub const LOCAL_QWEN: Self = Self {
         tier: Tier::Cheap,
         provider: "local",
@@ -344,20 +266,24 @@ impl ModelSpec {
         key_hint: "本地模型不需要密钥（先起 sidecar/local_llm_server.py）",
     };
 
-    /// Agnes 3.0 Flash：轻量/默认档。512K 上下文、支持工具调用、当前免费。
-    ///
-    /// 选它做默认的理由：**免费 + 配额够用**。10 RPM 对一两次调用绰绰有余。
-    pub const AGNES_FLASH: Self = Self {
-        tier: Tier::Standard,
-        provider: "agnes",
-        base_url: "https://api.agnes-ai.cn/v1",
-        model: "agnes-3.0-flash",
-        price: PriceTable::AGNES_30_FLASH,
-        rpm: 10,
-        // Agnes 不吃 thinking 字段，传了是错的行为
-        thinking: Thinking::ServerDefault,
-        key_hint: "secrets/agnes.key 或 YUNXI_BOT_AGNES_KEY",
+    /// Apple Silicon 已验收的量化聊天模型；思考开关仍由每次请求决定。
+    pub const LOCAL_GEMMA: Self = Self {
+        model: "gemma-4-26B-A4B-it-qat-4bit",
+        thinking: Thinking::Enabled,
+        ..Self::LOCAL_QWEN
     };
+
+    /// Mac 纯聊天槽位，复用已下载并实测的低内存量化模型。
+    pub const LOCAL_CHAT: Self = Self {
+        model: "Qwen3.5-9B-4bit",
+        thinking: Thinking::Enabled,
+        ..Self::LOCAL_QWEN
+    };
+
+    #[cfg(target_os = "macos")]
+    pub const LOCAL: Self = Self::LOCAL_CHAT;
+    #[cfg(not(target_os = "macos"))]
+    pub const LOCAL: Self = Self::LOCAL_QWEN;
 
     /// DeepSeek Flash：深度档。用于**需要多次调用、或需要推理**的任务。
     ///
@@ -376,50 +302,21 @@ impl ModelSpec {
         key_hint: "secrets/deepseek.key 或 YUNXI_BOT_DEEPSEEK_KEY",
     };
 
-    /// 这个端点吃不吃思考模式的字段。Agnes 不吃，就不该给它塞。
+    /// 这个端点吃不吃思考模式的字段。不支持时不发送。
     pub fn accepts_thinking(&self) -> bool {
         !matches!(self.thinking, Thinking::ServerDefault)
     }
 
-    /// 这条 spec 对应的客户端配置。**端点参数的唯一出处。**
-    ///
-    /// ## 为什么必须有这一层
-    ///
-    /// 在这之前没有它：调用方各自 `match spec.provider`，再手写一份
-    /// [`ThinkerConfig`]。于是"路由选了哪个端点"和"客户端实际连哪个端点"
-    /// 是两份数据，**而只有后一份会被真正使用**。
-    ///
-    /// 后果是实测出来的：`ModelSpec::LOCAL_QWEN` 的 `provider` 是 `"local"`，
-    /// 调用方的 `match` 里没有这一支，掉进 `_ =>` 兜底拿到了 Agnes 的地址
-    /// 和模型名。终端打印的是 `Qwen3-4B-Instruct-2507`、台账记的也是
-    /// `provider: "local"`，**唯独发出去的请求是给 Agnes 的**——
-    /// 本地模型一次都没被调用过，而所有显示都正常，没有任何一处报错。
-    ///
-    /// ## 所以这里只决定"密钥从哪来、超时给多少"
-    ///
-    /// `base_url` / `model` / `rpm` / `thinking` 一律从 `self` 取（见下面那四行
-    /// 覆盖）——它们**不可能和 spec 不一致**，因为它们就是 spec 的值。
-    /// 新增一个槽位时，只有密钥来源和超时需要有人拿主意——**而且这一支必须显式写出来**：
-    /// 默认那一支不给密钥（见下），所以漏写不会悄悄借用别人的凭证，只会在构造时失败。
+    /// 端点参数只从 spec 获取，避免路由标签与实际请求目的地不一致。
     pub fn thinker_config(&self) -> ThinkerConfig {
         let mut cfg = match self.provider {
             // 本地侧车：不读密钥文件，而且只认回环地址
             "local" => ThinkerConfig::local(self.base_url, self.model),
             "deepseek" => ThinkerConfig::deepseek(),
-            "agnes" => ThinkerConfig::agnes(),
-            // 没见过的 provider：**不 panic，也不替它挑一把密钥。**
-            //
-            // 这里本来落到 Agnes 的配置上。那样不安全：`agnes.key` 是真存在的，
-            // 于是一个新加的远端 provider 会**拿着 Agnes 的密钥把请求发到别的
-            // 机器上**——凭证就这么交出去了，而且全程不会有任何报错。
-            //
-            // 所以默认给"不需要密钥"，而这一类**只在回环地址上成立**
-            // （守卫在 `agnes::from_home`）。结果是新增远端槽位时**必须显式
-            // 加一支**、说明它的密钥从哪来，否则它在这里就响亮地造不出客户端。
-            // **没接上的槽位报错，好过没接上的槽位借别人的钥匙。**
+            // 未知 provider 不借用其他服务的凭证；远端会被回环守卫拒绝。
             _ => ThinkerConfig {
-                key_source: super::agnes::KeySource::Loopback,
-                ..ThinkerConfig::agnes()
+                key_source: super::client::KeySource::Loopback,
+                ..ThinkerConfig::local(self.base_url, self.model)
             },
         };
         cfg.base_url = self.base_url.to_string();
@@ -520,7 +417,7 @@ pub struct Routing {
 impl Routing {
     /// 本次实际要发出去的思考模式字段。
     ///
-    /// 端点不支持思考（Agnes）时返回 [`Thinking::ServerDefault`]——**绝不硬塞**。
+    /// 端点不支持思考时返回 [`Thinking::ServerDefault`]——**绝不硬塞**。
     pub fn thinking_field(&self) -> Thinking {
         if !self.spec.accepts_thinking() {
             return Thinking::ServerDefault;
@@ -756,15 +653,7 @@ pub struct ModelRouter {
 
 impl Default for ModelRouter {
     fn default() -> Self {
-        Self::new(
-            vec![
-                ModelSpec::LOCAL_QWEN,
-                ModelSpec::AGNES_FLASH,
-                ModelSpec::DEEPSEEK_FLASH,
-            ],
-            // 拿不准时走免费的那个
-            Tier::Standard,
-        )
+        Self::new(vec![ModelSpec::DEEPSEEK_FLASH], Tier::Deep)
     }
 }
 
@@ -811,79 +700,29 @@ impl ModelRouter {
     ) -> Routing {
         let calls = profile.estimated_calls();
 
-        // ---- 模型轴：三层，从便宜到贵 ----
-        //
-        // 这里先按**调用次数**定档，但后面还要被思考轴否决一次，见下。
-        // ---- 模型轴：**按"这是任务还是陪伴"直接定档** ----
-        //
-        // 用户定的规则：**真实任务走 DeepSeek，陪伴聊天走 Agnes。**
-        //
-        // 在这之前这里要问一次决策模型"大概几次调用"，再按次数折算档位。
-        // **现在不需要了——分类那一步已经把答案说完了。**
-        // 档位到模型的映射是这样的（`ModelSpec::AGNES_FLASH` / `DEEPSEEK_FLASH`）：
-        //
-        // | 档位 | 挂的模型 | 说明 |
-        // |---|---|---|
-        // | `Tier::Standard` | `agnes-3.0-flash` | **免费**。名字叫"标准"，实际是免费档 |
-        // | `Tier::Deep` | `deepseek-flash` | 收费 |
-        //
-        // （命名确实容易读错：`Standard` 是免费的、`Cheap` 反而没有 spec、
-        //  于是回落到默认档也就是 Agnes。**看到 `Standard` 别当成"贵的那个"。**）
-        //
-        // ## 顺带解决了两个问题
-        //
-        // 1. 原来 `heuristic_tier()` 在确定性信号有把握时**跳过决策模型**，
-        //    真机上出现过整整一次任务里它完全没参与（`e2e_allmodules`
-        //    那条 ✗）。现在这条路上不再需要它——**分类才是它该管的**。
-        // 2. 原来一次会话输入会问它 2~3 次（拆解路由 + 步骤路由 + 决策点）。
-        //    **路由不再问之后，那两次直接消失了。**
-        // **三层分派：闲聊和简单任务走本地，复杂任务走 DeepSeek。**
-        //
-        // 为什么闲聊不给 DeepSeek：**贵，而且没必要。** 一句"今天好累"
-        // 不需要一个付费端点。
-        //
-        // 为什么简单任务也不给 DeepSeek：`heuristic_tier` 早就能判
-        // "这件事有多重"（按预计调用次数、步数、字数、有没有代码）。
-        // **判据一直都在，只是 D118 之后没人用它**——那会儿任务一刀切
-        // 走了 DeepSeek。现在把它接回来，正好分本地和远程。
-        //
-        // 为什么复杂任务仍然给 DeepSeek：本地是 4B，**能力上限明显更低**。
-        // 让它接多步推理，省下的钱会在"改不对、要重试"里加倍还回去。
         let (tier, reason) = if kind == TaskKind::Conversation {
             (
                 Tier::Cheap,
-                "档位=轻量：寒暄/陪伴走本地模型（Qwen3-4B-Instruct-2507）".to_string(),
-            )
-        // **只有"确定简单"才走本地，其余一律 DeepSeek。**
-        //
-        // `heuristic_tier()` 返回 `Option<Tier>`——`None` 是"拿不准"。
-        // 拿不准的时候往哪边倒，**两边的代价是不对称的**：
-        //
-        // - 错判成本地：一个任务办砸，可能还要重试，**用户直接受损**
-        // - 错判成 DeepSeek：多花几分钱，**任务还是办成了**
-        //
-        // 所以门槛卡在"确定是轻量"，而不是"大概不重"。
-        // **省钱的收益是线性的，砸任务的损失不是。**
-        } else if profile.heuristic_tier() == Some(Tier::Cheap) {
-            (
-                Tier::Cheap,
-                format!(
-                    "档位=轻量：简单任务走本地模型，预计 {calls} 次调用（{} 字 / {} 步）",
-                    profile.prompt_chars, profile.step_count
-                ),
+                "聊天模式：直接回复，不开放任务工具".to_string(),
             )
         } else {
             (
                 Tier::Deep,
                 format!(
-                    "档位=深度：复杂任务走 DeepSeek（deepseek-flash），预计 {calls} 次调用（{} 字 / {} 步）",
+                    "档位=深度：助理任务走 DeepSeek（deepseek-flash），预计 {calls} 次调用（{} 字 / {} 步）",
                     profile.prompt_chars, profile.step_count
                 ),
             )
         };
         let mut reason = reason;
 
-        let mut spec = self.spec(tier).cloned().unwrap_or(ModelSpec::AGNES_FLASH);
+        let mut spec = self
+            .spec(tier)
+            .cloned()
+            .unwrap_or(ModelSpec::DEEPSEEK_FLASH);
+        if self.specs.len() == 1 {
+            reason = format!("限定模型：{}（{}）", spec.provider, spec.model);
+        }
 
         // ---- 两个轴在这里交汇：需要推理，但没有能推理的端点 ----
         //
@@ -911,7 +750,8 @@ impl ModelRouter {
         }
 
         // ---- 思考轴：由任务类型决定 ----
-        let mut think = effort.applies(kind, spec.tier);
+        // 按任务所需档位决定思考，显式换成便宜的推理模型不能把思考关掉。
+        let mut think = effort.applies(kind, tier);
         if think && !spec.accepts_thinking() {
             // 选了不支持思考的端点却要思考 → 说清楚并降级，不静默
             reason.push_str(&format!(
@@ -953,8 +793,7 @@ impl ModelRouter {
     /// **路由失败不能把任务卡住**。
     /// 问决策模型"这个任务大概要几次调用"，用来折算档位。
     ///
-    /// **路由现在不调它了**——档位由 `kind` 直接定（真实任务→DeepSeek，
-    /// 寒暄→Agnes）。留着是因为它仍然是"向本地决策模型问一个数值判断"
+    /// **路由现在不调它了**——档位由 `kind` 直接定（聊天与任务→DeepSeek）。留着是因为它仍然是"向本地决策模型问一个数值判断"
     /// 的完整范例，删掉的话连它那套"弃权怎么处理"的测试也一起没了。
     ///
     /// 哪天要做"按任务复杂度动态选档"，从它接着写。
@@ -985,20 +824,15 @@ impl ModelRouter {
     /// 硬套的话，"闲聊"只会被归成"不用推理"，于是走到查找档，
     /// **那还是当成了任务**。
     ///
-    /// ## 这一步决定的是钱
-    ///
-    /// 判成任务 → DeepSeek（收费）；判成闲聊 → Agnes（免费）。
-    /// 而闲聊占了日常交互的绝大多数，所以**判错的代价是不对称的**：
-    /// 把闲聊判成任务，天天在花钱；把任务判成闲聊，那件事做不成。
-    /// 所以提示词里把"要我做点什么"写得很实——**用户不会说
-    /// "请执行一个任务"，他会说"帮我把这个改一下"**。
+    /// 分类建议本轮回复模式；聊天与任务都交给 DeepSeek，工具供给不因短答被撤销。
+    /// 模型判断不能替代工具策略或人工审批。
     ///
     /// ## 只问一次
     ///
     /// 调用方在一次输入的开头问一次，拿到结果后**在整轮里复用**。
     /// 路由本身不再问（D118 之后它谁也不问了），所以不会重复。
-    /// 返回 `None` = 决策模型弃权或不可用，**调用方决定怎么兜**。
-    pub fn classify_input(&self, decider: &dyn Decider, text: &str) -> Option<bool> {
+    /// 返回分类与实际模型名供审计；`None` 表示弃权或不可用，由调用方兜底。
+    pub fn classify_input(&self, decider: &dyn Decider, text: &str) -> Option<(bool, String)> {
         use crate::decide::{DecisionRequest, Question};
 
         let question = Question::choice(
@@ -1009,8 +843,8 @@ impl ModelRouter {
         let req = DecisionRequest::new(serde_json::json!({ "input": text }), vec![question]);
         let result = decider.decide(&req).ok()?;
         match result.choice("input_kind") {
-            Some("task") => Some(true),
-            Some("chat") => Some(false),
+            Some("task") => Some((true, result.model)),
+            Some("chat") => Some((false, result.model)),
             // 弃权或给了不认识的选项——**不猜**，交给调用方兜
             _ => None,
         }
@@ -1059,9 +893,44 @@ pub fn is_peak_now(now: chrono::DateTime<chrono::Local>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_task_kind_uses_deepseek_even_with_one_short_step() {
+        use super::*;
+        for kind in [
+            TaskKind::Lookup,
+            TaskKind::Generation,
+            TaskKind::Edit,
+            TaskKind::Execution,
+            TaskKind::Analysis,
+            TaskKind::Planning,
+        ] {
+            for effort in [ReasoningEffort::Auto, ReasoningEffort::Never] {
+                let route = ModelRouter::default().route(
+                    "做一下",
+                    kind,
+                    &profile_task("做一下", 1),
+                    effort,
+                    None,
+                );
+                assert_eq!(route.spec.provider, "deepseek", "{kind:?} / {effort:?}");
+            }
+        }
+    }
+    #[test]
+    fn active_models_and_default_client_do_not_require_agnes() {
+        let router = super::ModelRouter::default();
+        assert!(router.specs().iter().all(|s| s.provider != "agnes"));
+        let cfg = super::ThinkerConfig::default();
+        assert_eq!(cfg.model, super::ModelSpec::DEEPSEEK_FLASH.model);
+        assert_eq!(cfg.base_url, super::ModelSpec::DEEPSEEK_FLASH.base_url);
+        assert_eq!(
+            cfg.key_source,
+            crate::think::client::KeySource::File("deepseek.key")
+        );
+    }
     use super::*;
     use crate::decide::StubDecider;
-    use crate::think::agnes::{KeySource, OpenAiThinker, is_loopback_url};
+    use crate::think::client::{KeySource, OpenAiThinker, is_loopback_url};
     use std::path::Path;
 
     fn profile(chars: usize, steps: usize) -> TaskProfile {
@@ -1169,26 +1038,17 @@ mod tests {
     }
 
     #[test]
-    fn conversation_goes_to_the_free_tier() {
-        // 另一半规则：**寒暄/陪伴走 Agnes（免费）**。
-        // 它占了日常交互的绝大多数，不该花钱。
+    fn conversation_uses_deepseek_without_auto_thinking() {
         let router = ModelRouter::default();
-        let stub = StubDecider::succeeding().with_choice("call_count", "many");
         let r = router.route(
-            "今天天气不错",
+            "聊聊天",
             TaskKind::Conversation,
             &profile(20, 1),
             ReasoningEffort::Auto,
-            Some(&stub),
+            None,
         );
-        // **规格又变了（用户定）：陪伴走本地模型。**
-        //
-        // 上一版是 Agnes（免费端点）。本地模型**比它更省**——
-        // 不花钱、不占配额、不走网络，而且 10 RPM 那个限制根本不存在。
-        // 不变的是那条意图：**陪伴类不该走贵的那条。**
-        assert_eq!(r.tier, Tier::Cheap, "陪伴类压在最低档");
-        assert_eq!(r.spec.provider, "local", "陪伴走本地模型");
-        assert_eq!(stub.calls(), 0, "寒暄也不该为了选档去问决策模型");
+        assert_eq!(r.spec.provider, "deepseek");
+        assert!(!r.thinking);
     }
 
     #[test]
@@ -1203,7 +1063,7 @@ mod tests {
         let stub = StubDecider::succeeding().with_choice("input_kind", "task");
         assert_eq!(
             router.classify_input(&stub, "帮我把这个文件改一下"),
-            Some(true),
+            Some((true, "stub".into())),
             "要办事的话该判成任务"
         );
         assert_eq!(stub.calls(), 1, "**只问一次**");
@@ -1215,7 +1075,10 @@ mod tests {
         // 判错这一边的代价是天天在花钱。
         let router = ModelRouter::default();
         let stub = StubDecider::succeeding().with_choice("input_kind", "chat");
-        assert_eq!(router.classify_input(&stub, "今天天气不错"), Some(false));
+        assert_eq!(
+            router.classify_input(&stub, "今天天气不错"),
+            Some((false, "stub".into()))
+        );
         assert_eq!(stub.calls(), 1);
     }
 
@@ -1256,9 +1119,10 @@ mod tests {
     }
 
     #[test]
-    fn default_chain_is_agnes_plus_deepseek() {
+    fn default_chain_contains_only_deepseek() {
         let router = ModelRouter::default();
-        assert_eq!(router.spec(Tier::Standard).unwrap().provider, "agnes");
+        assert_eq!(router.spec(Tier::Standard).unwrap().provider, "deepseek");
+        assert_eq!(router.specs().len(), 1);
         let deep = router.spec(Tier::Deep).unwrap();
         assert_eq!(deep.provider, "deepseek");
         assert_eq!(deep.model, "deepseek-flash", "模型名不能写错");
@@ -1311,10 +1175,10 @@ mod tests {
     #[test]
     fn the_local_slot_is_keyless_and_only_ever_points_at_loopback() {
         // 本地槽位没有密钥文件可读，所以它必须落在"不需要密钥"那一类；
-        // 而这一类**只在回环地址上成立**（守卫在 `agnes::from_home`）。
+        // 而这一类**只在回环地址上成立**（守卫在 `client::from_home`）。
         // 两件事要一起断言：只测"能构造出来"的话，
         // 哪天有人把它指到远端，这条测试反而会替那个改动放行。
-        let spec = ModelSpec::LOCAL_QWEN;
+        let spec = ModelSpec::LOCAL;
         let cfg = spec.thinker_config();
         assert_eq!(
             cfg.key_source,
@@ -1371,9 +1235,9 @@ mod tests {
 
     #[test]
     fn missing_tier_falls_back_to_default() {
-        let router = ModelRouter::new(vec![ModelSpec::AGNES_FLASH], Tier::Standard);
+        let router = ModelRouter::new(vec![ModelSpec::LOCAL_QWEN], Tier::Cheap);
         let s = router.spec(Tier::Deep).expect("应回落到默认档");
-        assert_eq!(s.provider, "agnes");
+        assert_eq!(s.provider, "local");
     }
 
     // ---------- 思考轴：任务类型 ----------
@@ -1402,45 +1266,26 @@ mod tests {
         assert_eq!(r.thinking_field(), Thinking::Enabled);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn a_simple_task_goes_to_the_local_model() {
-        // **这条原来是 `simple_tasks_go_to_agnes_without_thinking`。**
-        //
-        // 旧规格：调用次数少就省钱，走免费的 Agnes。
-        // **新规格（用户定）：真实任务一律走 DeepSeek，省钱的判断让位给可靠性。**
-        // 动机有真机证据——Agnes 免费档 10 RPM，一次真实任务连着几步
-        // 必然撞限流（`e2e_allmodules` 那次就是连续 9 次"等 N ms 后重发"
-        // 之后任务卡住）。
-        //
-        // 代价要说明白：**这一步现在要花钱了**，哪怕它只是一次简单查找。
+    fn cloud_chat_honors_explicit_thinking() {
         let router = ModelRouter::default();
-        let task = "帮我看下今天几点开会";
-        let kind = TaskKind::classify(task).expect("这句话该有词表命中");
-        assert_eq!(kind, TaskKind::Lookup, "分类本身没变——它仍然是查找类");
-        assert!(!kind.needs_reasoning(), "查找类不需要推理");
-
-        let r = router.route(
-            task,
-            kind,
-            &profile_task(task, 1),
-            ReasoningEffort::Auto,
-            None,
-        );
-        // **规格又变了（用户定）：简单任务走本地模型，只有复杂任务走 DeepSeek。**
-        //
-        // 上一版是"真实任务一律走 DeepSeek"——那解决了 Agnes 10 RPM
-        // 把任务拖死的问题（`e2e_allmodules` 那次连续 9 次"等 N ms 后重发"），
-        // **但代价是每一次简单查找都在花钱。**
-        //
-        // 现在的分界不是"是不是任务"，而是"这件事有多重"：
-        // 这句话是查找类、`heuristic_tier` 判得出轻量，所以走本地。
-        //
-        // **代价也要说明白**：本地是 4B，能力上限更低。所以门槛卡在
-        // "确定轻量"，拿不准的一律回 DeepSeek——那个方向错了只是多花钱。
-        assert_eq!(r.spec.provider, "local", "简单任务走本地模型");
-        assert_eq!(r.tier, Tier::Cheap);
-        // 分类没变：它仍然被认成"不需要推理"的查找类
-        assert!(!r.thinking, "查找类不开思考——省的是思考的钱，不是模型的钱");
+        for (effort, expected) in [
+            (ReasoningEffort::Auto, false),
+            (ReasoningEffort::Always, true),
+            (ReasoningEffort::Never, false),
+        ] {
+            let routing = router.route(
+                "你好",
+                TaskKind::Conversation,
+                &profile_task("你好", 1),
+                effort,
+                None,
+            );
+            assert_eq!(routing.spec.model, "deepseek-flash");
+            assert_eq!(routing.thinking, expected);
+            assert_eq!(routing.thinking_field(), Thinking::from_decision(expected));
+        }
     }
 
     #[test]
@@ -1459,11 +1304,11 @@ mod tests {
     }
 
     #[test]
-    fn agnes_never_gets_a_thinking_field() {
+    fn an_unsupported_endpoint_never_gets_a_thinking_field() {
         // Agnes 不吃 thinking 字段，就不能给它塞
-        assert_eq!(ModelSpec::AGNES_FLASH.thinking, Thinking::ServerDefault);
-        assert_eq!(ModelSpec::AGNES_FLASH.thinking.body_field(), None);
-        assert!(!ModelSpec::AGNES_FLASH.accepts_thinking());
+        assert_eq!(ModelSpec::LOCAL_QWEN.thinking, Thinking::ServerDefault);
+        assert_eq!(ModelSpec::LOCAL_QWEN.thinking.body_field(), None);
+        assert!(!ModelSpec::LOCAL_QWEN.accepts_thinking());
     }
 
     #[test]
@@ -1485,7 +1330,7 @@ mod tests {
     #[test]
     fn unsupported_endpoint_downgrades_loudly() {
         // 选了不支持思考的端点却要思考：说清楚，不静默
-        let router = ModelRouter::new(vec![ModelSpec::AGNES_FLASH], Tier::Standard);
+        let router = ModelRouter::new(vec![ModelSpec::LOCAL_QWEN], Tier::Cheap);
         let r = router.route(
             "分析一下",
             TaskKind::Analysis,
@@ -1513,7 +1358,7 @@ mod tests {
             ReasoningEffort::Auto,
             None,
         );
-        assert!(r.reason.contains("档位"), "要解释档位: {}", r.reason);
+        assert!(r.reason.contains("deepseek"), "要解释模型: {}", r.reason);
         assert!(
             r.reason.contains("思考模式"),
             "要解释思考模式: {}",

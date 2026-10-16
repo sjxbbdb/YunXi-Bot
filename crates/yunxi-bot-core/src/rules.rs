@@ -118,10 +118,18 @@ impl RuleSet {
     ///
     /// **读一次就够**：规则进稳定前缀，中途变会让缓存全废。
     pub fn discover(cwd: &Path, home: &Path) -> Self {
+        Self::try_discover(cwd, home).unwrap_or_else(|e| {
+            eprintln!("项目规则加载失败：{e}");
+            Self::default()
+        })
+    }
+
+    /// 执行任务时，存在但读不动的约束不能当作不存在。
+    pub fn try_discover(cwd: &Path, home: &Path) -> Result<Self, std::io::Error> {
         let mut files = Vec::new();
 
         // 用户级：跨项目的通用偏好
-        if let Some(f) = read_rule(&home.join(RULE_FILENAMES[0]), RuleScope::User, 0) {
+        if let Some(f) = read_rule(&home.join(RULE_FILENAMES[0]), RuleScope::User, 0)? {
             files.push(f);
         }
 
@@ -153,7 +161,7 @@ impl RuleSet {
 
         for (i, dir) in chain.iter().enumerate() {
             for name in RULE_FILENAMES {
-                if let Some(f) = read_rule(&dir.join(name), RuleScope::Project, chain.len() - i) {
+                if let Some(f) = read_rule(&dir.join(name), RuleScope::Project, chain.len() - i)? {
                     files.push(f);
                     break; // 同一目录里找到一份就够了
                 }
@@ -177,7 +185,7 @@ impl RuleSet {
             };
             key(a).cmp(&key(b)).then_with(|| a.path.cmp(&b.path))
         });
-        Self { files }
+        Ok(Self { files })
     }
 
     /// 拼成要进稳定前缀的那一段。
@@ -233,22 +241,24 @@ impl RuleSet {
     }
 }
 
-/// 读一份规则文件。不存在、读不了、或内容为空都返回 `None`。
-///
-/// **读不了不报错**：规则文件是锦上添花，一个权限不对的文件
-/// 不该让整个会话起不来。但它会被 `discover` 跳过——
-/// 而使用者可以用 `yunxi-bot rules` 看看到底加载了什么。
-fn read_rule(path: &Path, scope: RuleScope, depth: usize) -> Option<RuleFile> {
-    if !path.is_file() {
-        return None;
-    }
-    let raw = std::fs::read(path).ok()?;
+/// 缺省可以没有规则，损坏或不可读必须让执行入口看见。
+fn read_rule(
+    path: &Path,
+    scope: RuleScope,
+    depth: usize,
+) -> Result<Option<RuleFile>, std::io::Error> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     // BOM 要去掉：留在前缀里会让首行变成 "\u{feff}# 标题"，
     // 而模型看到的是个乱码开头的标题
     let raw = raw.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&raw);
-    let text = String::from_utf8_lossy(raw).into_owned();
+    let text = String::from_utf8(raw.to_vec())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if text.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     let truncated = text.len() > MAX_RULE_BYTES;
     let text = if truncated {
@@ -261,13 +271,13 @@ fn read_rule(path: &Path, scope: RuleScope, depth: usize) -> Option<RuleFile> {
     } else {
         text
     };
-    Some(RuleFile {
+    Ok(Some(RuleFile {
         path: path.to_path_buf(),
         scope,
         depth,
         text,
         truncated,
-    })
+    }))
 }
 
 #[cfg(test)]

@@ -1,0 +1,2 @@
+# Mac Gemma 聊天服务和模型对比共用；与 Laya 的 PyTorch 环境分开。
+mlx-lm==0.32.0

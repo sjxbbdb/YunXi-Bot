@@ -267,10 +267,16 @@ fn kill_tree(pid: u32) {
     }
     #[cfg(unix)]
     {
-        // 子进程以独立进程组派生，负号表示整组
-        let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .status();
+        // 不依赖 PATH 上的 kill；负 PID 指向 spawn 时建立的独立进程组。
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        if let Ok(pid) = i32::try_from(pid)
+            && pid > 0
+        {
+            // SAFETY: 只向本次派生的进程组发送 SIGKILL，不指向调用方进程组。
+            unsafe { kill(-pid, 9) };
+        }
     }
     #[cfg(not(any(windows, unix)))]
     {
@@ -354,6 +360,12 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // 必须在 exec 前建立，否则超时路径找不到以 child.id() 命名的进程组。
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn().map_err(|e| ExecError::Spawn(e.to_string()))?;
     let pid = child.id();
 
@@ -364,19 +376,17 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
     //
     // 这里刻意**不**把 assign 失败当作致命错误：Job 是"额外的"护栏，
     // 而诚实隔离要求我们把实际达到的级别如实报出去（见 `effective_level`）。
-    let mut effective_level = IsolationLevel::ProcessOnly;
+    #[cfg(not(windows))]
+    let effective_level = IsolationLevel::ProcessOnly;
     #[cfg(windows)]
-    let _job = match crate::win_job::JobObject::create(opts.memory_limit_bytes, opts.max_processes)
-    {
-        Ok(job) => match job.assign(&child) {
-            Ok(()) => {
-                effective_level = IsolationLevel::WindowsJobObject;
-                Some(job)
-            }
-            Err(_) => None,
-        },
-        Err(_) => None,
-    };
+    let (effective_level, _job) =
+        match crate::win_job::JobObject::create(opts.memory_limit_bytes, opts.max_processes) {
+            Ok(job) => match job.assign(&child) {
+                Ok(()) => (IsolationLevel::WindowsJobObject, Some(job)),
+                Err(_) => (IsolationLevel::ProcessOnly, None),
+            },
+            Err(_) => (IsolationLevel::ProcessOnly, None),
+        };
 
     // 管道必须边跑边读：等进程结束再读会在输出超过管道缓冲时死锁
     let mut out_pipe = child.stdout.take();
@@ -387,25 +397,33 @@ pub fn run_command(command: &[String], opts: &ExecOptions) -> Result<ExecOutcome
     let deadline = started + Duration::from_millis(opts.timeout_ms);
     let mut timed_out = false;
 
-    let status = loop {
-        match child
-            .try_wait()
-            .map_err(|e| ExecError::Wait(e.to_string()))?
-        {
-            Some(st) => break Some(st),
-            None => {
-                if Instant::now() >= deadline {
-                    timed_out = true;
-                    kill_tree(pid);
-                    // 等它真正死掉，避免留下僵尸
-                    let _ = child.wait();
-                    break None;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child
+                .try_wait()
+                .map_err(|e| ExecError::Wait(e.to_string()))?;
         }
-    };
+        // 父进程退出并不意味着输出结束：孙进程可能仍持有管道。
+        // 管道也必须受同一个超时约束，否则下面的 join 会无限等待。
+        if status.is_some() && out_handle.is_finished() && err_handle.is_finished() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            kill_tree(pid);
+            // 组清理失败时仍尝试回收直接子进程。
+            let _ = child.kill();
+            let _ = child.wait();
+            status = None;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 
+    // 父进程可能已经退出，taskkill 此时找不到它；关闭 Job 仍可回收持管道的后代。
+    #[cfg(windows)]
+    drop(_job);
     let (stdout, out_bad) = out_handle.join().unwrap_or_default();
     let (stderr, err_bad) = err_handle.join().unwrap_or_default();
 
@@ -705,6 +723,29 @@ mod tests {
         .expect("应能派生");
         assert!(out.timed_out, "应被判定为超时");
         assert!(!out.succeeded());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_reaps_the_process_group_and_closes_inherited_pipes() {
+        // 两种情况都必须受超时约束：父进程等待子进程，或父进程先退出但管道仍被子进程持有。
+        for script in ["sleep 2 & wait", "sleep 2 & echo parent-exited"] {
+            let start = Instant::now();
+            let out = run_command(
+                &["/bin/sh".into(), "-c".into(), script.into()],
+                &ExecOptions {
+                    timeout_ms: 100,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(out.timed_out, "{script}: 必须报告管道/进程超时");
+            assert!(!out.succeeded());
+            assert!(
+                start.elapsed() < Duration::from_millis(1500),
+                "{script}: 超时后仍在等子进程自然结束"
+            );
+        }
     }
 
     #[cfg(windows)]
