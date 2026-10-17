@@ -44,6 +44,22 @@ original copyright and license are preserved as required.
    No Miyu persona data, databases, platform credentials, or web assets are
    included in this repository.
 
+7. Cua Driver  —  https://github.com/trycua/cua
+   Release: cua-driver-rs-v0.36.0
+   Commit: 6d6c734c127025fb39ad5d585a10382808b39dc1
+   Copyright (c) 2025 Cua AI, Inc.
+   Driver license: MIT; optional components and bundled third-party materials
+   retain their own notices and licenses.
+   Used for: macOS native and browser computer control through a separately
+   installed CuaDriver.app. YunXi registers a reviewed subset of 35 operations.
+   The unmodified Driver subproject source is included at
+   third_party/cua/libs/cua-driver, with upstream license, licensing boundaries,
+   version metadata and attribution at third_party/cua/.
+   The generated tool schema subset and its MIT notice are also retained at
+   crates/yunxi-bot-core/src/tool/computer/.
+   No upstream app binaries, optional model artifacts, browser profiles,
+   credentials, recordings or local runtime data are redistributed.
+
 --------------------------------------------------------------------------------
 Design ideas are not copyrightable; the attribution above exists so that any
 code actually migrated can be traced to its origin.

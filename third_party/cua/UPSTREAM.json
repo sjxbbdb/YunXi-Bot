@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/trycua/cua",
+  "release_tag": "cua-driver-rs-v0.36.0",
+  "commit": "6d6c734c127025fb39ad5d585a10382808b39dc1",
+  "paths": [
+    "libs/cua-driver",
+    "LICENSE.md",
+    "LICENSING.md"
+  ],
+  "driver_tree_git_sha1": "cfd2f0084ce2056588db96ca9cae556e1ac1858a",
+  "upstream_files": 1355,
+  "upstream_bytes": 28982673,
+  "local_modifications": []
+}
