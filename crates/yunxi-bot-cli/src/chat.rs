@@ -180,6 +180,12 @@ pub fn run(
                     &f,
                     &handler.expected_chat_prefix(),
                 );
+                if layout.build().iter().any(|m| {
+                    m.content
+                        .contains(yunxi_bot_core::think::image::IMAGE_NOTICE)
+                }) {
+                    println!("提示：此会话的原图未保存；继续核对图片内容前请用 /image 重新附图。");
+                }
                 handler.restore_chat_layout(layout, crate::chat_handler::CHAT_SESSION_KEY);
                 resumed_turns = f.turns;
                 match mismatch {
@@ -246,6 +252,7 @@ pub fn run(
     }));
 
     let mut records = Vec::new();
+    let mut pending_images = Vec::new();
     let outcome = loop {
         print!("› ");
         let _ = std::io::stdout().flush();
@@ -266,7 +273,7 @@ pub fn run(
 
         // ---- 斜杠命令：不进模型 ----
         if let Some(cmd) = input.strip_prefix('/') {
-            let (name, _rest) = match cmd.split_once(char::is_whitespace) {
+            let (name, rest) = match cmd.split_once(char::is_whitespace) {
                 Some((a, b)) => (a, b.trim()),
                 None => (cmd, ""),
             };
@@ -274,6 +281,22 @@ pub fn run(
                 "exit" | "quit" | "q" => break Ok(()),
                 "help" | "h" => {
                     print_help();
+                    continue;
+                }
+                "image" => {
+                    if rest == "clear" {
+                        pending_images.clear();
+                        println!("已清空待发送图片。");
+                    } else {
+                        let path = unquote_image_path(rest);
+                        match attach_image(&mut pending_images, std::path::Path::new(path)) {
+                            Ok(()) => println!(
+                                "已附 {} 张图；下一句会连同图片发给 DeepSeek。",
+                                pending_images.len()
+                            ),
+                            Err(e) => eprintln!("附图失败：{e}"),
+                        }
+                    }
                     continue;
                 }
                 "save" => {
@@ -290,6 +313,7 @@ pub fn run(
                     // 开一个新会话，**不删旧的**——删是不可逆的，而"想重来"
                     // 不等于"想把刚才那段扔掉"。
                     handler.reset_chat_session();
+                    pending_images.clear();
                     turns = 0;
                     resumed_turns = 0;
                     println!("已开新会话（旧的还在，用 `chat list` 能看到）。");
@@ -437,8 +461,14 @@ pub fn run(
             }
         );
 
-        match handler.chat_turn(&routing, input, &mut records) {
+        let result = if pending_images.is_empty() {
+            handler.chat_turn(&routing, input, &mut records)
+        } else {
+            handler.chat_turn_with_images(&routing, input, pending_images.clone(), &mut records)
+        };
+        match result {
             Ok(text) => {
+                pending_images.clear();
                 // **正文已经边生成边打出来了。**
                 //
                 // 这里只补收尾的换行——再打一遍 `text` 会显示两遍。
@@ -551,6 +581,8 @@ fn persist(
 fn print_help() {
     println!("命令：");
     println!("  /help              看这个");
+    println!("  /image <图片路径>   附图到下一句（可多次添加；将发给 DeepSeek）");
+    println!("  /image clear        清空待发送图片");
     println!("  /save              立刻存盘（其实每轮都自动存）");
     println!("  /history           看本会话有多少轮");
     println!("  /usage             看上下文用了多少、什么时候会压缩");
@@ -586,4 +618,50 @@ pub fn list_sessions(store: &SessionStore) -> Result<i32, Box<dyn std::error::Er
     println!();
     println!("接着聊：yunxi-bot chat --resume <id>");
     Ok(0)
+}
+
+pub fn attach_image(
+    images: &mut Vec<yunxi_bot_core::think::ImageInput>,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use yunxi_bot_core::think::image::{ImageInput, MAX_IMAGES, MAX_TOTAL_IMAGE_BYTES};
+    if images.len() >= MAX_IMAGES {
+        return Err("最多附 8 张图片".into());
+    }
+    let image = ImageInput::from_path(path).map_err(|e| e.to_string())?;
+    let total = images.iter().map(ImageInput::byte_len).sum::<usize>() + image.byte_len();
+    if total > MAX_TOTAL_IMAGE_BYTES {
+        return Err("图片合计不能超过 16 MiB；已有附图保留".into());
+    }
+    images.push(image);
+    Ok(())
+}
+
+fn unquote_image_path(path: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = path.strip_prefix(quote).and_then(|p| p.strip_suffix(quote)) {
+            return inner;
+        }
+    }
+    path
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn image_paths_keep_spaces_and_optional_outer_quotes() {
+        assert_eq!(unquote_image_path("/tmp/a b.png"), "/tmp/a b.png");
+        assert_eq!(unquote_image_path("\"/tmp/a b.png\""), "/tmp/a b.png");
+        assert_eq!(unquote_image_path("'/tmp/a b.png'"), "/tmp/a b.png");
+        assert_eq!(unquote_image_path(""), "");
+    }
+
+    #[test]
+    fn invalid_attachment_does_not_remove_previously_queued_images() {
+        let mut images = vec![yunxi_bot_core::think::ImageInput::from_bytes(b"GIF89a").unwrap()];
+        assert!(attach_image(&mut images, std::path::Path::new(".")).is_err());
+        assert_eq!(images.len(), 1);
+    }
 }

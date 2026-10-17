@@ -49,6 +49,8 @@ use crate::policy::SandboxMode;
 
 #[cfg(target_os = "macos")]
 pub mod agenda;
+#[cfg(target_os = "macos")]
+pub mod computer;
 pub mod files;
 #[cfg(target_os = "macos")]
 pub mod mac_assistant;
@@ -58,6 +60,8 @@ pub mod macos;
 pub mod mail_context;
 pub mod runner;
 pub mod system;
+#[cfg(target_os = "macos")]
+pub mod travel;
 #[cfg(target_os = "macos")]
 pub mod trip;
 pub mod web;
@@ -141,7 +145,7 @@ impl Capability {
 }
 
 /// 工具执行的结果。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ToolOutput {
     /// 回灌给模型的文本。
     pub text: String,
@@ -150,6 +154,18 @@ pub struct ToolOutput {
     /// 只读结论可以永久记住；改过状态的动作只记到会话结束——
     /// 因为环境已经不同了，"上次允许过"不能证明"这次也对"。
     pub changed_state: bool,
+    /// 仅在当前工具循环回传，不进入台账或会话存档。
+    pub images: Vec<crate::think::ImageInput>,
+}
+
+impl std::fmt::Debug for ToolOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolOutput")
+            .field("text_chars", &self.text.chars().count())
+            .field("changed_state", &self.changed_state)
+            .field("images", &self.images)
+            .finish()
+    }
 }
 
 impl ToolOutput {
@@ -157,12 +173,14 @@ impl ToolOutput {
         Self {
             text: text.into(),
             changed_state: false,
+            images: Vec::new(),
         }
     }
     pub fn changed(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             changed_state: true,
+            images: Vec::new(),
         }
     }
 }
@@ -328,6 +346,29 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> serde_json::Value;
 
     fn capability(&self) -> Capability;
+
+    /// 通用界面动作无法从按钮文字证明后果，禁止永久预批准。
+    fn fresh_approval(&self) -> bool {
+        false
+    }
+
+    /// 只读检查执行前提；只能追加拒绝，None仍须走正常策略和审批。
+    fn preflight_rejection(&self, _args: &serde_json::Value, _ctx: &ToolContext) -> Option<String> {
+        None
+    }
+
+    /// 屏幕、剪贴板和输入可能含凭证，原文只供本轮模型使用。
+    fn private_io(&self) -> bool {
+        false
+    }
+
+    fn audit_arguments(&self, args: &serde_json::Value) -> serde_json::Value {
+        if self.private_io() {
+            serde_json::json!({"private_arguments": true})
+        } else {
+            args.clone()
+        }
+    }
 
     /// 审批规则的**粒度**：文件工具给路径，网络工具给域名，命令工具给命令动词。
     ///
@@ -702,6 +743,16 @@ pub fn gate_with_ledger(
                 "命中拒绝规则 {name}({})",
                 r.specifier.as_deref().unwrap_or("*")
             ),
+        };
+    }
+
+    if let Some(reason) = tool.preflight_rejection(args, ctx) {
+        return GateDecision::Deny { reason };
+    }
+
+    if tool.fresh_approval() {
+        return GateDecision::Ask {
+            reason: "通用界面动作须逐次人工批准，预批准规则不适用".into(),
         };
     }
 

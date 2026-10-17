@@ -16,7 +16,7 @@
 //! 直接回车 = 拒绝。审批提示的默认值必须是"不执行"——**手滑敲回车不该
 //! 变成一个不可逆动作**。这是整个工具层"失败方向朝不执行"的最后一个落点。
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 
 use yunxi_bot_core::tool::{Approval, ApprovalRequest, Approver};
 
@@ -55,7 +55,7 @@ impl Default for StdinApprover {
 
 impl Approver for StdinApprover {
     fn approve(&mut self, req: &ApprovalRequest) -> Approval {
-        if self.assume_yes {
+        if self.assume_yes && !req.require_human {
             eprintln!("· 自动批准（--yes）：{}", req.tool);
             return Approval::Once;
         }
@@ -65,6 +65,13 @@ impl Approver for StdinApprover {
             return Approval::Deny;
         }
 
+        if req.private && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+            eprintln!(
+                "· 私有工具 {} 需要交互终端审批，未输出私有参数，未执行",
+                req.tool
+            );
+            return Approval::Deny;
+        }
         println!();
         println!("┌─ 需要你确认 ─────────────────────────────");
         println!("│ 工具      : {}（{}）", req.tool, req.capability.label());
@@ -139,7 +146,18 @@ mod tests {
             arguments: "{\"path\":\"a.md\"}".into(),
             reason: "写入能力".into(),
             preview: None,
+            require_human: tool == "computer_act",
+            private: tool == "computer_act",
         }
+    }
+
+    #[test]
+    fn computer_actions_cannot_use_the_global_assume_yes_shortcut() {
+        let mut approver = StdinApprover::new().assume_yes().dry_run();
+        assert_eq!(
+            approver.approve(&req("computer_act", Capability::Outbound)),
+            Approval::Deny
+        );
     }
 
     #[test]

@@ -50,7 +50,7 @@ use super::{
 };
 
 /// 审批请求。给前端（CLI / 守护进程 / 未来的语音或微信）看的东西。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ApprovalRequest {
     pub tool: String,
     pub capability: Capability,
@@ -65,6 +65,23 @@ pub struct ApprovalRequest {
     /// 那时审批框只能显示参数——而那是**参数，不是后果**，
     /// 所以"没有预览"本身就是一件该让人知道的事。
     pub preview: Option<String>,
+    pub require_human: bool,
+    pub private: bool,
+}
+
+impl std::fmt::Debug for ApprovalRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("ApprovalRequest");
+        d.field("tool", &self.tool)
+            .field("capability", &self.capability)
+            .field("require_human", &self.require_human)
+            .field("private", &self.private);
+        if !self.private {
+            d.field("arguments", &self.arguments)
+                .field("preview", &self.preview);
+        }
+        d.finish()
+    }
 }
 
 /// 人工的答复。
@@ -119,6 +136,8 @@ pub struct ToolCallRecord {
     /// 执行耗时（毫秒）。没执行时为 0。
     #[serde(default)]
     pub duration_ms: u64,
+    #[serde(skip)]
+    pub live_output: Option<ToolOutput>,
 }
 
 impl ToolCallRecord {
@@ -528,9 +547,20 @@ impl<'a> ToolRunner<'a> {
             //
             // **这和本项目反复踩的"截断"是同一个根**：被截断的东西
             // 不能当成完整的用，也不能原样传下去。
-            layout.push_raw(Message::assistant_tool_calls(sanitize_tool_calls(
-                &resp.tool_calls,
-            )));
+            let mut assistant =
+                Message::assistant_tool_calls(sanitize_tool_calls(&resp.tool_calls));
+            let live_calls = assistant.tool_calls.clone();
+            for call in &mut assistant.tool_calls {
+                if call["function"]["name"]
+                    .as_str()
+                    .and_then(|n| self.registry.get(n))
+                    .is_some_and(|tool| tool.private_io())
+                {
+                    call["function"]["arguments"] = Value::String("{}".into());
+                    assistant.live_tool_calls = live_calls.clone();
+                }
+            }
+            layout.push_raw(assistant);
 
             // **先全部判定（串行），再批量执行（只读的并行）。**
             //
@@ -558,6 +588,7 @@ impl<'a> ToolRunner<'a> {
                             output: None,
                             started_at_ms: 0,
                             duration_ms: 0,
+                            live_output: None,
                         })
                     } else {
                         self.decide_one(tr)
@@ -578,7 +609,22 @@ impl<'a> ToolRunner<'a> {
                         .map(str::to_owned)
                 });
 
-            for (tr, record) in reqs.into_iter().zip(records) {
+            let mut observations = Vec::new();
+            for (tr, mut record) in reqs.into_iter().zip(records) {
+                let live = record.live_output.take();
+                let private = self.registry.get(&tr.name).is_some_and(|t| t.private_io());
+                if private {
+                    record.arguments = self
+                        .registry
+                        .get(&tr.name)
+                        .map(|t| t.audit_arguments(&tr.arguments))
+                        .unwrap_or_else(|| serde_json::json!({"private_arguments":true}));
+                    if matches!(record.output, Some(Ok(_))) {
+                        record.output = Some(Ok(
+                            "【私有工具结果：仅在本进程可见；恢复后须重新观察】".into(),
+                        ));
+                    }
+                }
                 // **每一次调用都交给 sink。**
                 //
                 // 放在回灌模型之前、放进 `calls` 之前——因为那两步之后
@@ -596,7 +642,21 @@ impl<'a> ToolRunner<'a> {
                 // 否则它会以为工具没被调用过而重复请求同一个。
                 let text = render_tool_result(&record);
                 calls.push(record);
-                layout.push_raw(Message::tool_result(tr.id.clone(), text));
+                let mut message = Message::tool_result(tr.id.clone(), text);
+                if let Some(output) = live {
+                    if private {
+                        message.live_content = Some(output.text);
+                    }
+                    if !output.images.is_empty() {
+                        observations.push((tr.id, output.images));
+                    }
+                }
+                layout.push_raw(message);
+            }
+            // Chat Completions accepts images only in user blocks; all tool ids are
+            // answered first, and the envelope explicitly preserves tool provenance.
+            for (id, images) in observations {
+                layout.push_observation(&id, images)?;
             }
             if let Some(text) = waiting {
                 layout.push_raw(Message::assistant(text.clone()));
@@ -649,6 +709,7 @@ impl<'a> ToolRunner<'a> {
                 output: None,
                 started_at_ms: 0,
                 duration_ms: 0,
+                live_output: None,
             });
         };
 
@@ -675,6 +736,7 @@ impl<'a> ToolRunner<'a> {
                 output: None,
                 started_at_ms: 0,
                 duration_ms: 0,
+                live_output: None,
             }),
             GateDecision::Allow { reason } => Decided::Run {
                 tool,
@@ -696,6 +758,8 @@ impl<'a> ToolRunner<'a> {
                     // 那时审批框会如实说"没提供预览"，
                     // 而不是让人以为参数 JSON 就是后果。
                     preview: tool.preview(&tr.arguments, &self.ctx),
+                    require_human: tool.fresh_approval(),
+                    private: tool.private_io(),
                 };
                 match self.approver.approve(&req) {
                     Approval::Deny => Decided::Settled(ToolCallRecord {
@@ -712,6 +776,7 @@ impl<'a> ToolRunner<'a> {
                         output: None,
                         started_at_ms: 0,
                         duration_ms: 0,
+                        live_output: None,
                     }),
                     verdict => {
                         if verdict == Approval::Always {
@@ -749,7 +814,10 @@ impl<'a> ToolRunner<'a> {
                     arguments: call.arguments.clone(),
                     capability,
                     decision: GateDecision::Allow { reason },
-                    output: Some(out.map(|o| o.text)),
+                    output: Some(out.as_ref().map(|o| o.text.clone()).map_err(Clone::clone)),
+                    live_output: out
+                        .ok()
+                        .filter(|o| tool.private_io() || !o.images.is_empty()),
                     started_at_ms: started,
                     duration_ms: duration,
                 }
@@ -842,7 +910,7 @@ impl<'a> ToolRunner<'a> {
                 call,
                 capability,
                 reason,
-                ..
+                tool,
             } = d
             else {
                 unreachable!("只读批次里不该有已定案项")
@@ -855,7 +923,15 @@ impl<'a> ToolRunner<'a> {
                 arguments: call.arguments.clone(),
                 capability,
                 decision: GateDecision::Allow { reason },
-                output: Some(result.map(|o| o.text)),
+                output: Some(
+                    result
+                        .as_ref()
+                        .map(|o| o.text.clone())
+                        .map_err(Clone::clone),
+                ),
+                live_output: result
+                    .ok()
+                    .filter(|o| tool.private_io() || !o.images.is_empty()),
                 started_at_ms: started,
                 duration_ms: duration,
             });
@@ -1331,6 +1407,7 @@ mod parallel_tests {
             output: None,
             started_at_ms: 0,
             duration_ms: 0,
+            live_output: None,
         });
         assert!(!d.parallelizable());
     }
@@ -1695,6 +1772,85 @@ mod tests {
         approver: &'a mut dyn Approver,
     ) -> ToolRunner<'a> {
         ToolRunner::new(reg, policy, approver, ctx())
+    }
+
+    #[test]
+    fn private_tool_images_reach_model_after_all_results_but_never_saved_or_audited() {
+        struct Screen;
+        impl Tool for Screen {
+            fn name(&self) -> &str {
+                "screen"
+            }
+            fn description(&self) -> &str {
+                "test"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object"})
+            }
+            fn capability(&self) -> Capability {
+                Capability::ReadOnly
+            }
+            fn private_io(&self) -> bool {
+                true
+            }
+            fn call(&self, _: &Value, _: &mut ToolContext) -> Result<ToolOutput, ToolError> {
+                let mut out = ToolOutput::read("private-screen-token");
+                out.images
+                    .push(crate::think::ImageInput::from_bytes(b"GIF89a").unwrap());
+                Ok(out)
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Screen)).unwrap();
+        registry
+            .register(Arc::new(ScriptTool::new("ordinary", Capability::ReadOnly)))
+            .unwrap();
+        let thinker = ScriptThinker::new(vec![
+            ScriptThinker::tool_reply(vec![
+                call_json("c1", "screen", json!({"text":"private-input-token"})),
+                call_json("c2", "ordinary", json!({})),
+            ]),
+            ScriptThinker::text_reply("verified"),
+        ]);
+        let mut layout = PromptLayout::new("test");
+        layout.ask("observe");
+        let mut ap = RefusingApprover;
+        let result = runner(&registry, ToolPolicy::default(), &mut ap)
+            .run(&thinker, &mut layout, 1024)
+            .unwrap();
+        assert_eq!(result.text, "verified");
+        let requests = thinker.requests();
+        let messages = &requests[1].messages;
+        assert_eq!(messages.last().unwrap().images.len(), 1);
+        assert_eq!(
+            messages[messages.len() - 2].tool_call_id.as_deref(),
+            Some("c2")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.live_content.as_deref() == Some("private-screen-token"))
+        );
+        assert!(messages.iter().any(|m| !m.live_tool_calls.is_empty()));
+        for saved in [
+            serde_json::to_string(&layout).unwrap(),
+            serde_json::to_string(&result.calls).unwrap(),
+            format!("{messages:?}"),
+        ] {
+            for secret in [
+                "private-input-token",
+                "private-screen-token",
+                "R0lGODlh",
+                "data:image",
+            ] {
+                assert!(!saved.contains(secret), "private data escaped: {secret}");
+            }
+        }
+        let restored: PromptLayout =
+            serde_json::from_str(&serde_json::to_string(&layout).unwrap()).unwrap();
+        assert!(restored.build().iter().all(|m| m.images.is_empty()
+            && m.live_content.is_none()
+            && m.live_tool_calls.is_empty()));
     }
 
     // ---- 基本循环 ----
@@ -2489,6 +2645,7 @@ mod tests {
             output,
             started_at_ms: 0,
             duration_ms: 0,
+            live_output: None,
         };
         let denied = render_tool_result(&base(
             GateDecision::Deny {
@@ -2529,6 +2686,7 @@ mod tests {
             output: Some(Ok("原始产出".into())),
             started_at_ms: 0,
             duration_ms: 0,
+            live_output: None,
         };
         assert_eq!(render_tool_result(&rec), "原始产出");
     }
@@ -2546,6 +2704,7 @@ mod tests {
             output: Some(Ok("内容".into())),
             started_at_ms: 0,
             duration_ms: 0,
+            live_output: None,
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert_eq!(v["tool"], "read_file");

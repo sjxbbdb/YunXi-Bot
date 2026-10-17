@@ -263,8 +263,19 @@ impl Compaction {
 /// **要算上工具调用**：`tool_calls` 里是完整 JSON，占的 token 不少，
 /// 只算 `content` 会明显低估——而低估的后果是撞上限。
 pub fn message_chars(m: &Message) -> usize {
-    let mut n = m.content.chars().count();
-    for tc in &m.tool_calls {
+    // 官方每图最多 1024 token；按保守上限估算，不把 base64 当文本计数。
+    let mut n = m
+        .live_content
+        .as_deref()
+        .unwrap_or(&m.content)
+        .chars()
+        .count()
+        + m.images.len() * 1024 * CHARS_PER_TOKEN;
+    for tc in if m.live_tool_calls.is_empty() {
+        &m.tool_calls
+    } else {
+        &m.live_tool_calls
+    } {
         n += serde_json::to_string(tc)
             .map(|s| s.chars().count())
             .unwrap_or(0);

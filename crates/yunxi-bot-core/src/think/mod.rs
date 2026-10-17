@@ -4,6 +4,7 @@
 pub mod client;
 pub mod context;
 pub mod cost;
+pub mod image;
 pub mod local_health;
 pub mod prompt;
 pub mod router;
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant};
 
 pub use client::{OpenAiThinker, ThinkerConfig};
 pub use cost::{Cost, PriceTable, Usage};
+pub use image::ImageInput;
 pub use router::{
     ModelRouter, ModelSpec, ReasoningEffort, Routing, TaskKind, TaskProfile, Thinking, detect_code,
     detect_explicit_multi, is_peak_now, profile_task,
@@ -33,8 +35,8 @@ pub enum Role {
     /// 工具返回。**只在带工具调用的一轮里出现。**
     ///
     /// 单独一个角色而不是塞进 `User`：工具返回的内容是**不可信数据**
-    /// （网页、文件、第三方 server 的输出），把它标成用户消息会让
-    /// "模型生成的内容不能作为授权依据"这条不变量失去载体。
+    /// （网页、文件、第三方 server 的输出），文字不能冒充用户指令；D153仅为接口限制
+    /// 给工具截图使用带明确来源的user封装，仍不构成授权。
     Tool,
 }
 
@@ -56,11 +58,18 @@ impl Role {
 /// OpenAI 兼容的工具调用协议要求：助手消息带回 `tool_calls`，随后每条工具
 /// 结果必须用 `role: "tool"` 且带上对应的 `tool_call_id`。少一个字段服务端
 /// 就报 400——**而不是"忽略工具结果"**，所以这里不能省。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
     /// 工具结果的消息内容可以是空字符串（比如工具只返回结构化数据）。
     pub content: String,
+    /// 图片仅随当前进程发送；存档只保留附图说明，不保存原图。
+    #[serde(skip)]
+    pub images: Vec<ImageInput>,
+    #[serde(skip)]
+    pub live_content: Option<String>,
+    #[serde(skip)]
+    pub live_tool_calls: Vec<serde_json::Value>,
     /// 助手请求调用的工具。只出现在助手消息上。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<serde_json::Value>,
@@ -69,11 +78,28 @@ pub struct Message {
     pub tool_call_id: Option<String>,
 }
 
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Message")
+            .field("role", &self.role)
+            .field("content", &self.content)
+            .field("images", &self.images)
+            .field("tool_calls", &self.tool_calls)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("has_private_content", &self.live_content.is_some())
+            .field("has_private_arguments", &!self.live_tool_calls.is_empty())
+            .finish()
+    }
+}
+
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
             content: content.into(),
+            images: Vec::new(),
+            live_content: None,
+            live_tool_calls: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -82,14 +108,30 @@ impl Message {
         Self {
             role: Role::User,
             content: content.into(),
+            images: Vec::new(),
+            live_content: None,
+            live_tool_calls: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
     }
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageInput>) -> Self {
+        let mut message = Self::user(content);
+        if !images.is_empty() {
+            message.content.push_str("\n\n");
+            message.content.push_str(image::IMAGE_NOTICE);
+            message.images = images;
+        }
+        message
+    }
+
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            images: Vec::new(),
+            live_content: None,
+            live_tool_calls: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -100,6 +142,9 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: String::new(),
+            images: Vec::new(),
+            live_content: None,
+            live_tool_calls: Vec::new(),
             tool_calls,
             tool_call_id: None,
         }
@@ -110,6 +155,9 @@ impl Message {
         Self {
             role: Role::Tool,
             content: content.into(),
+            images: Vec::new(),
+            live_content: None,
+            live_tool_calls: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
         }

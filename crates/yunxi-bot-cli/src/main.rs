@@ -14,6 +14,8 @@ mod autostart_macos;
 mod chat;
 mod chat_handler;
 mod detach;
+#[cfg(all(test, target_os = "macos"))]
+mod recorded_travel;
 mod tool_sink;
 mod tooling;
 
@@ -91,6 +93,7 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
 
   yunxi-bot isolation-check      隔离自检：真起受限子进程验证写入隔离是否生效
   yunxi-bot think <提示词>     调一次生成模型（默认 DeepSeek），验证连通性与用量
+      --image <图片路径>    附图发送给 DeepSeek（可重复，最多8张/合计16MiB）
   yunxi-bot agent [选项]      跑一个完整的 Agent 回合（判断 + 表达）
       --hour <0-23>         假定当前小时（用于观察安静时段的影响）
       --no-think            只判断不表达（不消耗远端配额）
@@ -1599,30 +1602,55 @@ fn record_think_cost(provider: &str, resp: &yunxi_bot_core::think::ThinkResponse
     }
 }
 
+fn parse_think_input(args: &[String]) -> Result<(String, Vec<String>), String> {
+    let mut words = Vec::new();
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--provider" | "--thinking" | "--image" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|v| !v.starts_with("--") && !v.is_empty())
+                    .ok_or_else(|| format!("{} 缺少参数", args[index]))?;
+                if args[index] == "--image" {
+                    paths.push(value.clone());
+                }
+                index += 2;
+            }
+            flag if flag.starts_with("--") => return Err(format!("未知参数 {flag}")),
+            _ => {
+                words.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    let prompt = if words.is_empty() {
+        if paths.is_empty() {
+            "用一句话说明你是谁。"
+        } else {
+            "描述这些图片中的内容。"
+        }
+        .to_string()
+    } else {
+        words.join(" ")
+    };
+    Ok((prompt, paths))
+}
+
 fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::think::{Message, ModelSpec, ThinkRequest, Thinker, client::OpenAiThinker};
 
-    let positional: Vec<String> = args
-        .iter()
-        .enumerate()
-        .filter(|(i, a)| {
-            !a.starts_with("--")
-                && !(*i > 0
-                    && matches!(
-                        args.get(i - 1).map(String::as_str),
-                        Some("--provider" | "--thinking")
-                    ))
-        })
-        .map(|(_, a)| a.clone())
-        .collect();
-    let prompt: String = if positional.is_empty() {
-        "用一句话说明你是谁。".to_string()
-    } else {
-        positional.join(" ")
-    };
-
+    let (prompt, image_paths) = parse_think_input(args)?;
     let home = default_home();
     let provider = flag(args, "--provider").unwrap_or("deepseek");
+    if !image_paths.is_empty() && provider != "deepseek" {
+        return Err("附图目前只支持 --provider deepseek".into());
+    }
+    let mut images = Vec::new();
+    for path in image_paths {
+        chat::attach_image(&mut images, std::path::Path::new(&path))?;
+    }
     let config = match provider {
         "local" => {
             ensure_local_model_running();
@@ -1661,7 +1689,7 @@ fn cmd_think(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 
     let req = ThinkRequest::new(vec![
         Message::system("你是一个个人助理程序的连通性测试端点。回答简洁。"),
-        Message::user(prompt),
+        Message::user_with_images(prompt, images),
     ])
     .with_max_tokens(256)
     .with_thinking(thinking)
@@ -4682,6 +4710,34 @@ mod tests {
     //! 它判错的代价不是"多跑一次"，而是"本地槽位被一个永远好不了的进程锁住"。
 
     use super::*;
+
+    #[test]
+    fn think_image_options_do_not_become_prompt_text() {
+        let args = [
+            "看一下",
+            "--image",
+            "/tmp/图 1.png",
+            "--thinking",
+            "off",
+            "--image",
+            "/tmp/b.jpg",
+            "--provider",
+            "deepseek",
+        ];
+        let (prompt, paths) = parse_think_input(&args.map(String::from)).unwrap();
+        assert_eq!(prompt, "看一下");
+        assert_eq!(paths, ["/tmp/图 1.png", "/tmp/b.jpg"]);
+        for args in [
+            vec!["--image"],
+            vec!["--image", "--thinking"],
+            vec!["--provider"],
+            vec!["--unknown"],
+        ] {
+            assert!(
+                parse_think_input(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err()
+            );
+        }
+    }
 
     #[test]
     fn invalid_mail_analysis_configuration_is_audited_without_falling_back() {

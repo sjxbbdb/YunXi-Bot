@@ -340,11 +340,21 @@ fn wire_message(m: &super::Message) -> serde_json::Value {
     let mut v = serde_json::Map::new();
     v.insert("role".into(), serde_json::json!(m.role.as_str()));
 
-    if m.role == Role::Assistant && !m.tool_calls.is_empty() {
-        v.insert("content".into(), serde_json::Value::Null);
-        v.insert("tool_calls".into(), serde_json::json!(m.tool_calls));
+    let content = m.live_content.as_deref().unwrap_or(&m.content);
+    let tool_calls = if m.live_tool_calls.is_empty() {
+        &m.tool_calls
     } else {
-        v.insert("content".into(), serde_json::json!(m.content));
+        &m.live_tool_calls
+    };
+    if m.role == Role::Assistant && !tool_calls.is_empty() {
+        v.insert("content".into(), serde_json::Value::Null);
+        v.insert("tool_calls".into(), serde_json::json!(tool_calls));
+    } else if !m.images.is_empty() {
+        let mut blocks = vec![serde_json::json!({"type": "text", "text": content})];
+        blocks.extend(m.images.iter().map(super::ImageInput::wire_block));
+        v.insert("content".into(), serde_json::json!(blocks));
+    } else {
+        v.insert("content".into(), serde_json::json!(content));
     }
 
     if let Some(id) = &m.tool_call_id {
@@ -490,6 +500,7 @@ impl Thinker for OpenAiThinker {
         if self.api_key.is_empty() {
             return Err(ThinkError::Auth("密钥为空".into()));
         }
+        super::image::validate_messages(&req.messages)?;
         if req.messages.is_empty() {
             return Err(ThinkError::BadRequest {
                 status: 0,
@@ -525,8 +536,19 @@ impl Thinker for OpenAiThinker {
                     .header("Retry-After")
                     .and_then(|v| v.trim().parse::<u64>().ok())
                     .map(Duration::from_secs);
-                let detail = r.into_string().unwrap_or_default();
-                let detail: String = detail.chars().take(300).collect();
+                let detail = if req.messages.iter().any(|m| {
+                    !m.images.is_empty()
+                        || m.live_content.is_some()
+                        || !m.live_tool_calls.is_empty()
+                }) {
+                    "图片请求失败；未记录服务端正文，以免回显图片数据".to_string()
+                } else {
+                    r.into_string()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(300)
+                        .collect()
+                };
                 return Err(Self::map_status(code, detail, retry_after));
             }
             Err(ureq::Error::Transport(t)) => {
@@ -542,9 +564,19 @@ impl Thinker for OpenAiThinker {
             }
         };
 
-        let wire: WireResponse = resp
-            .into_json()
-            .map_err(|e| ThinkError::Malformed(format!("响应不是预期结构: {e}")))?;
+        let wire: WireResponse = resp.into_json().map_err(|e| {
+            ThinkError::Malformed(
+                if req.messages.iter().any(|m| {
+                    !m.images.is_empty()
+                        || m.live_content.is_some()
+                        || !m.live_tool_calls.is_empty()
+                }) {
+                    "图片响应不是预期结构；未记录可能回显原图的解析诊断".into()
+                } else {
+                    format!("响应不是预期结构: {e}")
+                },
+            )
+        })?;
 
         let choice = wire
             .choices
@@ -612,6 +644,7 @@ impl Thinker for OpenAiThinker {
         if self.api_key.is_empty() {
             return Err(ThinkError::Auth("密钥为空".into()));
         }
+        super::image::validate_messages(&req.messages)?;
         if req.messages.is_empty() {
             return Err(ThinkError::BadRequest {
                 status: 0,
@@ -646,8 +679,19 @@ impl Thinker for OpenAiThinker {
                     .header("Retry-After")
                     .and_then(|v| v.trim().parse::<u64>().ok())
                     .map(Duration::from_secs);
-                let detail = r.into_string().unwrap_or_default();
-                let detail: String = detail.chars().take(300).collect();
+                let detail = if req.messages.iter().any(|m| {
+                    !m.images.is_empty()
+                        || m.live_content.is_some()
+                        || !m.live_tool_calls.is_empty()
+                }) {
+                    "图片请求失败；未记录服务端正文，以免回显图片数据".to_string()
+                } else {
+                    r.into_string()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(300)
+                        .collect()
+                };
                 return Err(Self::map_status(code, detail, retry_after));
             }
             Err(ureq::Error::Transport(t)) => {
@@ -664,7 +708,21 @@ impl Thinker for OpenAiThinker {
 
         let thinking = req.effective_thinking(self.config.thinking);
         let reader = std::io::BufReader::new(resp.into_reader());
-        self.read_sse(reader, thinking, on_delta)
+        self.read_sse(reader, thinking, on_delta).map_err(|error| {
+            if matches!(error, ThinkError::Malformed(_))
+                && req.messages.iter().any(|m| {
+                    !m.images.is_empty()
+                        || m.live_content.is_some()
+                        || !m.live_tool_calls.is_empty()
+                })
+            {
+                ThinkError::Malformed(
+                    "图片流响应不完整或格式错误；未记录可能回显原图的解析诊断".into(),
+                )
+            } else {
+                error
+            }
+        })
     }
 
     fn model(&self) -> &str {
@@ -917,6 +975,156 @@ impl Thinker for StubThinker {
 mod tests {
     use super::*;
     use crate::think::Message;
+
+    #[test]
+    fn text_only_wire_format_is_unchanged_and_images_are_content_blocks() {
+        let text = Message::user("hello");
+        assert_eq!(
+            wire_message(&text),
+            serde_json::json!({"role":"user", "content":"hello"})
+        );
+        let image = super::super::ImageInput::from_bytes(b"GIF89a").unwrap();
+        let message = Message::user_with_images("看图", vec![image.clone(), image]);
+        let wire = wire_message(&message);
+        assert_eq!(wire["content"][0]["type"], "text");
+        assert!(
+            wire["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("看图")
+        );
+        assert_eq!(wire["content"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            wire["content"][1]["image_url"]["url"],
+            "data:image/gif;base64,R0lGODlh"
+        );
+    }
+
+    #[test]
+    fn image_http_requests_work_in_both_modes_and_error_bodies_are_not_exposed() {
+        use std::io::{Read, Write};
+        for streaming in [false, true] {
+            for response_kind in [0, 1, 2] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).unwrap();
+                        header.push(byte[0]);
+                    }
+                    let size: usize = String::from_utf8(header)
+                        .unwrap()
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|n| n.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    let mut bytes = vec![0; size];
+                    stream.read_exact(&mut bytes).unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        body["messages"][0]["content"][1]["image_url"]["url"],
+                        "data:image/gif;base64,R0lGODlh"
+                    );
+                    let (status, mime, response) = if response_kind == 1 {
+                        (
+                            "400 Bad Request",
+                            "application/json",
+                            "private-image-echo-R0lGODlh",
+                        )
+                    } else if response_kind == 2 {
+                        if streaming {
+                            (
+                                "200 OK",
+                                "text/event-stream",
+                                "data: private-image-echo-R0lGODlh\n\ndata: [DONE]\n\n",
+                            )
+                        } else {
+                            (
+                                "200 OK",
+                                "application/json",
+                                "{\"choices\":\"private-image-echo-R0lGODlh\"}",
+                            )
+                        }
+                    } else if streaming {
+                        assert_eq!(body["stream"], true);
+                        (
+                            "200 OK",
+                            "text/event-stream",
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"图已收到\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        )
+                    } else {
+                        assert!(body.get("stream").is_none());
+                        (
+                            "200 OK",
+                            "application/json",
+                            "{\"choices\":[{\"message\":{\"content\":\"图已收到\"},\"finish_reason\":\"stop\"}]}",
+                        )
+                    };
+                    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+                });
+                let client = OpenAiThinker::new(
+                    ThinkerConfig {
+                        base_url: format!("http://{address}/v1"),
+                        timeout: Duration::from_secs(5),
+                        ..Default::default()
+                    },
+                    ApiKey::new("unit-test-dummy"),
+                );
+                let image = super::super::ImageInput::from_bytes(b"GIF89a").unwrap();
+                let req = ThinkRequest::new(vec![Message::user_with_images("看图", vec![image])]);
+                let mut output = String::new();
+                let result = if streaming {
+                    client.think_stream(&req, &mut |s| output.push_str(s))
+                } else {
+                    client.think(&req)
+                };
+                if response_kind != 0 {
+                    let err = result.unwrap_err().to_string();
+                    assert!(!err.contains("private-image-echo"));
+                    assert!(!err.contains("R0lGODlh"));
+                } else {
+                    assert_eq!(result.unwrap().content, "图已收到");
+                    if streaming {
+                        assert_eq!(output, "图已收到");
+                    }
+                }
+                server.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_image_roles_are_rejected_before_network_or_rate_limit() {
+        let client = OpenAiThinker::new(ThinkerConfig::default(), ApiKey::new("unit-test-dummy"));
+        let image = super::super::ImageInput::from_bytes(b"GIF89a").unwrap();
+        let mut message = Message::user_with_images("", vec![image]);
+        for role in [
+            super::super::Role::System,
+            super::super::Role::Assistant,
+            super::super::Role::Tool,
+        ] {
+            message.role = role;
+            let req = ThinkRequest::new(vec![message.clone()]);
+            assert!(matches!(
+                client.think(&req),
+                Err(ThinkError::BadRequest { status: 0, .. })
+            ));
+            assert!(matches!(
+                client.think_stream(&req, &mut |_| {}),
+                Err(ThinkError::BadRequest { status: 0, .. })
+            ));
+        }
+        assert!(client.limiter.peek_wait().is_none());
+    }
 
     #[test]
     fn json_output_is_opt_in_and_keeps_thinking_and_tools_unchanged() {

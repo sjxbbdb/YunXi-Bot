@@ -222,6 +222,7 @@ mod tests {
             output,
             started_at_ms: 0,
             duration_ms: 0,
+            live_output: None,
         }
     }
 

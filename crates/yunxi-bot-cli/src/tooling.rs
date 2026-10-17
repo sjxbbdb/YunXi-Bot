@@ -129,6 +129,14 @@ pub fn default_registry(home: &Path) -> Result<ToolRegistry, String> {
     add(Arc::new(AskUserTool::new(ask)))?;
 
     #[cfg(target_os = "macos")]
+    add(Arc::new(yunxi_bot_core::tool::travel::TravelPrepare))?;
+
+    #[cfg(target_os = "macos")]
+    for tool in yunxi_bot_core::tool::computer::tools() {
+        add(Arc::new(tool))?;
+    }
+
+    #[cfg(target_os = "macos")]
     for name in yunxi_bot_core::tool::macos::NAMES {
         add(Arc::new(yunxi_bot_core::tool::macos::MacTool::new(name)))?;
     }
@@ -514,7 +522,7 @@ mod tests {
     fn all_platform_tools_register_without_name_clashes() {
         // 重名会被注册表拒绝，所以这条测试同时守着"名字没撞"
         let r = default_registry(&std::env::temp_dir()).expect("默认工具集应能注册");
-        let expected = if cfg!(target_os = "macos") { 48 } else { 12 };
+        let expected = if cfg!(target_os = "macos") { 54 } else { 12 };
         assert_eq!(
             r.len(),
             expected,
@@ -598,7 +606,12 @@ mod tests {
                 | "ask_user"
                 | "knowledge_search"
                 | "mail_review_pending"
-                | "mail_reply_pending" => {
+                | "mail_reply_pending"
+                | "travel_prepare"
+                | "travel_checkout"
+                | "travel_order_read"
+                | "computer_schema"
+                | "computer_observe" => {
                     assert_eq!(cap, Capability::ReadOnly, "{name} 应只读");
                 }
                 "write_file" | "edit_file" => assert_eq!(cap, Capability::Write, "{name}"),
@@ -619,7 +632,8 @@ mod tests {
                 | "mac_mail_outbox"
                 | "mac_mail_draft_get"
                 | "mac_document_read" => assert_eq!(cap, Capability::ReadOnly, "{name}"),
-                "mail_reply_prepare"
+                "computer_act"
+                | "mail_reply_prepare"
                 | "mac_calendar_create"
                 | "mac_calendar_update"
                 | "mac_calendar_delete"
@@ -644,7 +658,7 @@ mod tests {
         }
         assert_eq!(
             outbound,
-            if cfg!(target_os = "macos") { 17 } else { 0 },
+            if cfg!(target_os = "macos") { 18 } else { 0 },
             "系统写入和通知必须显式审批"
         );
     }
@@ -704,6 +718,8 @@ mod tests {
             arguments: "{}".into(),
             reason: "测试".into(),
             preview: None,
+            require_human: false,
+            private: false,
         };
         // 非 --yes 且非 --dry-run 时它会去读 stdin；测试里 stdin 是空的，
         // 所以应当落到"读不到输入 → 拒绝"
@@ -721,6 +737,8 @@ mod tests {
             arguments: "{}".into(),
             reason: "测试".into(),
             preview: None,
+            require_human: false,
+            private: false,
         };
         assert_eq!(
             a.lock().unwrap().approve(&req),

@@ -332,7 +332,12 @@ impl McpHub {
         }
 
         let cmd = build_command(spec);
-        let transport = TokioChildProcess::new(cmd).map_err(|e| McpError::Spawn {
+        // Tokio process pipes register with the reactor during construction, before serve().
+        let transport = {
+            let _entered = self.rt.enter();
+            TokioChildProcess::new(cmd)
+        }
+        .map_err(|e| McpError::Spawn {
             server: spec.name.clone(),
             detail: e.to_string(),
         })?;
@@ -439,6 +444,21 @@ impl McpHub {
         tool: &str,
         args: serde_json::Value,
     ) -> Result<String, McpError> {
+        let result = self.call_content(server, tool, args)?;
+        let text = render_content(&result.content);
+        if result.is_error == Some(true) {
+            return Ok(format!("【工具报告失败】{text}"));
+        }
+        Ok(text)
+    }
+
+    /// Trusted adapters may consume image blocks; generic MCP tools keep their textual contract.
+    pub fn call_content(
+        &mut self,
+        server: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<rmcp::model::CallToolResult, McpError> {
         let Some(idx) = self.servers.iter().position(|s| s.spec.name == server) else {
             return Err(McpError::NoSuchServer(server.to_string()));
         };
@@ -487,14 +507,7 @@ impl McpHub {
 
         srv.last_error = None;
 
-        // **工具级失败是"这次没成"，不是"程序坏了"。**
-        // MCP 用 `is_error` 区分这两者，我们要保留那个区分：
-        // 把它当成本地异常会让模型看到一个"工具不可用"，而其实工具好好的。
-        let text = render_content(&result.content);
-        if result.is_error == Some(true) {
-            return Ok(format!("【工具报告失败】{text}"));
-        }
-        Ok(text)
+        Ok(result)
     }
 }
 
@@ -772,6 +785,7 @@ impl crate::tool::Tool for McpTool {
         match hub.call(&self.server, &self.tool, args.clone()) {
             Ok(text) => Ok(crate::tool::ToolOutput {
                 text,
+                images: Vec::new(),
                 // **保守取 `true`。** 我们不知道这个外部工具改没改状态——
                 // 声称"没改"会让审批记忆永久保留，而那是不可核实的。
                 // 说"改过"最多让使用者多批一次。
@@ -1367,5 +1381,24 @@ mod tests {
         assert!(hub.list_tools().is_empty());
         assert!(hub.server_names().is_empty());
         assert!(hub.troubled().is_empty());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sync_spawn_tests {
+    #[test]
+    fn sync_connect_to_a_non_mcp_program_returns_error_without_reactor_panic() {
+        let cfg = super::McpConfig {
+            servers: vec![super::ServerSpec {
+                name: "finite".into(),
+                command: "/usr/bin/true".into(),
+                args: vec![],
+                env: Default::default(),
+                require_approval: true,
+            }],
+        };
+        let (hub, errors) = super::McpHub::connect(&cfg).unwrap();
+        assert!(hub.server_names().is_empty());
+        assert_eq!(errors.len(), 1);
     }
 }
