@@ -55,7 +55,8 @@ def checks_for(case, result, events):
     if case.get('writes'):
         checks['verified_apply_receipt'] = agenda_checks(records, True)['expected_write']
     if case.get('ask_duration'):
-        checks['asks_missing_duration'] = bool(re.search('多久|多长|多少分钟', result.stdout))
+        checks['asks_missing_duration'] = bool(re.search('多久|多长|多少分钟', result.stdout)) or (
+            case.get('past_clock') and bool(re.search('过去|补记|哪天|哪个日期|别的日期|哪种', result.stdout)))
     if case.get('clock'):
         checks['retains_corrected_clock'] = any(t in result.stdout for t in case['clock'])
     if case.get('drafts'):
@@ -95,6 +96,7 @@ def main():
     self_check()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--thinking', choices=('on', 'off'), default='on')
     parser.add_argument('--live', action='store_true', help='改为真实日历保存/修改/取消验收，结束清理合成记录')
     args = parser.parse_args()
     if args.output.exists():
@@ -102,8 +104,8 @@ def main():
     binary = ensure_fresh_binary()
     today = datetime.now().astimezone().date()
     cases = [
-        dict(name='implicit-today', session='today', text='我今天下午三点有个会', ask_duration=True),
-        dict(name='ack-is-not-duration', session='today', text='好', ask_duration=True),
+        dict(name='implicit-today', session='today', text='我今天下午三点有个会', ask_duration=True, past_clock=datetime.now().hour >= 15),
+        dict(name='ack-is-not-duration', session='today', text='好', ask_duration=True, past_clock=datetime.now().hour >= 15),
         dict(name='implicit-future', session='meeting', text='我2031年4月18日下午三点有个会，叫连续追问验收会议', ask_duration=True),
         dict(name='correct-time-before-duration', session='meeting', text='改到四点', ask_duration=True, clock=['16:00', '16点', '四点', '4点']),
         dict(name='supply-duration-after-restart', session='meeting', text='一个小时', plan=('2031-04-18', '16:00', 60)),
@@ -146,7 +148,7 @@ def main():
             original_ids = {}
             for case in cases:
                 session = case['session']
-                argv = [str(binary), 'chat', '--resume' if session in seen else '--id', session, '--thinking', 'off']
+                argv = [str(binary), 'chat', '--resume' if session in seen else '--id', session, '--thinking', args.thinking]
                 for tool in NAMES:
                     allowed = tool in READ_ONLY or (tool == 'mac_agenda_apply' and case.get('writes'))
                     argv += ['--allow' if allowed else '--deny', tool]

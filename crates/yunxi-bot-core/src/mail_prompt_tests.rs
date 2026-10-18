@@ -95,6 +95,30 @@ fn workflow_cases_have_unique_ids_and_meaningful_failure_checks() {
         .is_empty()
     );
 }
+
+#[test]
+fn relative_mail_time_accepts_only_the_date_grounded_in_fixture_receipt() {
+    let case = cases()
+        .into_iter()
+        .find(|c| c["id"] == "receive_ambiguous_time")
+        .unwrap();
+    // Live input is received on 2026-10-16; normalization is not an invented hour.
+    for (deadline, valid) in [
+        ("明天下午", true),
+        ("2026-10-17下午（时间未定）", true),
+        ("2026-10-18下午", false),
+        ("2026-10-17下午15:00", false),
+    ] {
+        assert_eq!(
+            check(
+                &case,
+                &json!({"needs_action":true,"risks":[],"deadline":deadline})
+            )
+            .is_empty(),
+            valid
+        );
+    }
+}
 #[test]
 #[ignore = "explicit DeepSeek evaluation on synthetic mail only, no native tools"]
 fn live_mail_prompt_workflows() {

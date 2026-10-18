@@ -127,7 +127,7 @@ def main():
                     'ask_user': '调用 ask_user 问我选择哪个代号，options 必须依次是「白鹭」「青竹」。获得回答后原样转述，不再追问。',
                     'knowledge_search': '调用 knowledge_search 查询星桥项目的验收口令，并原样转述口令和来源编号。',
                     'web_fetch': '调用 web_fetch 获取 https://example.com 的正文，返回它的标题和网页用途。',
-                    'web_search': '调用 web_search 搜索「Rust programming language official website」，最多3条，转述真实返回的官网链接。',
+                    'web_search': '用 web_search 查找 Rust 编程语言官网，每次最多3条。若结果不是官网，允许调整关键词或用已知官方域名限域续查，最多追加两次；转述真实返回的官网链接。',
                 }
                 case = {'case': label, 'tool': tool, 'checks': {}}
                 if tool == 'knowledge_search':

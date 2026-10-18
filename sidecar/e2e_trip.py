@@ -14,7 +14,7 @@ from e2e_agenda import NAMES, native
 from e2e_common import ensure_fresh_binary, read_ledger, real_home_dir
 
 DATES = ['2031-05-18', '2031-05-19']
-READ = {'now', 'ask_user', 'mac_trip_plan', 'mac_document_read', 'read_file'}
+READ = {'now', 'ask_user', 'mac_trip_plan', 'mac_document_read', 'read_file', 'list_dir'}
 
 
 def same_time(actual, expected):

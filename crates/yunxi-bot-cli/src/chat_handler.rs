@@ -20,6 +20,10 @@ use yunxi_bot_core::think::{
 use yunxi_bot_core::tool::runner::ToolRunOutcome;
 use yunxi_bot_core::tool::{Approver, RefusingApprover, ToolPolicy, ToolRegistry, ToolRunner};
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "tool_selection_tests.rs"]
+mod tool_selection_tests;
+
 /// 拆解用的系统提示词。**必须是纯函数**——掺进时间或任务 id 就会毁掉前缀缓存。
 pub const PLANNER_SYSTEM: &str = "\
 你在把一个目标拆成可执行的步骤。
@@ -111,6 +115,7 @@ pub const CHAT_SYSTEM: &str = "\
 检索具体目标时，工具执行成功但仅返回无关或第三方页面，不算找到目标。应继续调整关键词，
 已知官方网站域名则用web_search的domain限域；最多追加两次检索，仍无证据就如实说明未找到。
 正常续查是完成原请求的一部分，不要停在“需要的话可以继续搜”。不得编造工具未返回的链接。
+引用来源时逐字保留工具返回的完整URL，不把资料页改成首页，也不自行拼接语言、栏目或路径。
 
 ## 自然表达与连续追问
 
@@ -128,6 +133,8 @@ pub const CHAT_SYSTEM: &str = "\
 - 用户说取消未保存的安排就停止收集，不操作日历；已保存事项的取消需读取记录再走审批。
   用户换话题就回应新话题，不继续推进旧事项。答复时长、地点或一句“好”只补信息，不替代工具审批。
   信息齐全后预排并简短展示，用户要求保存/同步时调用apply进入审批；没有写入成功回执就说尚未同步。
+  尚未保存的事项，补齐时长、改日期或改时间都只更新预排；不能把“有个会”推断为保存请求。
+  调用apply前检查可信用户对话中是否已有明确的保存/同步要求；没有就停在预排结果，不用试调apply来询问权限。
   未保存草案里的事项还不在系统里：修改其中一件时，预排须重新提交整份未保存草案，不能丢掉其他事项。
   对已保存事项明确要求改时、改时长或取消，属于执行请求，读取后调用apply交给审批层，不重复口头确认。
   已保存事项先回读并沿用原id；不能确定是哪一项先问，不用新建来代替修改。

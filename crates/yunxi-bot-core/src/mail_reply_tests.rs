@@ -594,12 +594,13 @@ fn live_mail_reply_draft_bridge() {
     )
     .unwrap();
     let original = native("mac_mail_read", &loc).unwrap();
-    assert_eq!(original["subject"], "测试");
+    let subject = original["subject"].as_str().unwrap();
+    assert!(subject == "测试" || subject.starts_with("yunxi-mail-test-"));
     let now = crate::now_millis().unwrap();
     let h = Home::new();
     let mut source = item();
     source.id = loc.to_string();
-    source.subject = "测试".into();
+    source.subject = subject.into();
     source.received_at_ms = now;
     let sender = original["sender"].as_str().unwrap();
     source.from_addr = sender
@@ -649,6 +650,17 @@ fn live_mail_reply_draft_bridge() {
         assert!(first["body"].as_str().unwrap().starts_with(&reply().body));
         Ok(())
     })();
+    if loc["account_id"] == "local" {
+        assert!(
+            draft.is_none(),
+            "imported mailbox has no authorized sender identity"
+        );
+        assert!(
+            checked
+                .as_ref()
+                .is_err_and(|e| e.contains("无法唯一确认发件身份"))
+        );
+    }
     if let Some(id) = draft {
         let current = native("mac_mail_draft_get", &json!({"draft_id":id})).unwrap();
         let cleanup = native(
@@ -658,10 +670,13 @@ fn live_mail_reply_draft_bridge() {
         .unwrap();
         assert_eq!(cleanup["discarded"], true);
     }
-    checked.unwrap();
+    if loc["account_id"] != "local" {
+        checked.unwrap();
+    }
     let after = native("mac_mail_read", &loc).unwrap();
     assert_eq!(after["read"], original["read"]);
     println!(
-        "native reply bridge passed: one unsent draft, retry reused identity, discarded; source unchanged"
+        "native reply bridge checked: imported mailbox rejected without sender, or account draft created/reused/discarded; source unchanged; account={}",
+        loc["account_id"]
     );
 }
