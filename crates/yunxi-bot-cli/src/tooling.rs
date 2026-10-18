@@ -132,7 +132,7 @@ pub fn default_registry(home: &Path) -> Result<ToolRegistry, String> {
     add(Arc::new(yunxi_bot_core::tool::travel::TravelPrepare))?;
 
     #[cfg(target_os = "macos")]
-    for tool in yunxi_bot_core::tool::computer::tools() {
+    for tool in yunxi_bot_core::tool::computer::tools_at(home) {
         add(Arc::new(tool))?;
     }
 
@@ -522,7 +522,7 @@ mod tests {
     fn all_platform_tools_register_without_name_clashes() {
         // 重名会被注册表拒绝，所以这条测试同时守着"名字没撞"
         let r = default_registry(&std::env::temp_dir()).expect("默认工具集应能注册");
-        let expected = if cfg!(target_os = "macos") { 54 } else { 12 };
+        let expected = if cfg!(target_os = "macos") { 58 } else { 12 };
         assert_eq!(
             r.len(),
             expected,
@@ -610,12 +610,18 @@ mod tests {
                 | "travel_prepare"
                 | "travel_checkout"
                 | "travel_order_read"
+                | "browser_workflow"
+                | "computer_verify"
                 | "computer_schema"
                 | "computer_observe" => {
                     assert_eq!(cap, Capability::ReadOnly, "{name} 应只读");
                 }
-                "write_file" | "edit_file" => assert_eq!(cap, Capability::Write, "{name}"),
-                "run_command" => assert_eq!(cap, Capability::Execute, "{name}"),
+                "write_file" | "edit_file" | "browser_workflow_save" => {
+                    assert_eq!(cap, Capability::Write, "{name}")
+                }
+                "run_command" | "browser_workflow_run" => {
+                    assert_eq!(cap, Capability::Execute, "{name}")
+                }
                 "web_fetch" | "web_search" | "mac_places_search" | "mac_route" | "mac_weather" => {
                     assert_eq!(cap, Capability::Network, "{name}")
                 }

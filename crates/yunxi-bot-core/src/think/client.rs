@@ -330,8 +330,7 @@ impl OpenAiThinker {
 ///
 /// ## 三个细节
 ///
-/// 1. **助手消息带 `tool_calls` 时 `content` 必须是 `null`**，不能是空字符串。
-///    带 `content: ""` 的助手工具调用消息会被部分实现拒绝。
+/// 1. 工具调用有正文时保留；没有正文时发送null，避免部分服务拒绝空字符串。
 /// 2. 工具结果必须带 `tool_call_id`，否则服务端报 400。
 /// 3. 普通消息不额外打字段——多余字段会让前缀缓存失配。
 fn wire_message(m: &super::Message) -> serde_json::Value {
@@ -347,7 +346,14 @@ fn wire_message(m: &super::Message) -> serde_json::Value {
         &m.live_tool_calls
     };
     if m.role == Role::Assistant && !tool_calls.is_empty() {
-        v.insert("content".into(), serde_json::Value::Null);
+        v.insert(
+            "content".into(),
+            if content.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(content)
+            },
+        );
         v.insert("tool_calls".into(), serde_json::json!(tool_calls));
     } else if !m.images.is_empty() {
         let mut blocks = vec![serde_json::json!({"type": "text", "text": content})];
@@ -540,6 +546,7 @@ impl Thinker for OpenAiThinker {
                     !m.images.is_empty()
                         || m.live_content.is_some()
                         || !m.live_tool_calls.is_empty()
+                        || m.live_reasoning.is_some()
                 }) {
                     "图片请求失败；未记录服务端正文，以免回显图片数据".to_string()
                 } else {
@@ -570,6 +577,7 @@ impl Thinker for OpenAiThinker {
                     !m.images.is_empty()
                         || m.live_content.is_some()
                         || !m.live_tool_calls.is_empty()
+                        || m.live_reasoning.is_some()
                 }) {
                     "图片响应不是预期结构；未记录可能回显原图的解析诊断".into()
                 } else {
@@ -683,6 +691,7 @@ impl Thinker for OpenAiThinker {
                     !m.images.is_empty()
                         || m.live_content.is_some()
                         || !m.live_tool_calls.is_empty()
+                        || m.live_reasoning.is_some()
                 }) {
                     "图片请求失败；未记录服务端正文，以免回显图片数据".to_string()
                 } else {
@@ -714,6 +723,7 @@ impl Thinker for OpenAiThinker {
                     !m.images.is_empty()
                         || m.live_content.is_some()
                         || !m.live_tool_calls.is_empty()
+                        || m.live_reasoning.is_some()
                 })
             {
                 ThinkError::Malformed(
@@ -738,6 +748,20 @@ impl OpenAiThinker {
             "model": self.config.model,
             "messages": req.messages.iter().map(wire_message).collect::<Vec<_>>(),
         });
+        if self.config.thinking != Thinking::ServerDefault && !req.tools.is_empty() {
+            for (wire, message) in body["messages"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+                .zip(&req.messages)
+            {
+                if message.role == super::Role::Assistant
+                    && let Some(reasoning) = &message.live_reasoning
+                {
+                    wire["reasoning_content"] = serde_json::json!(reasoning);
+                }
+            }
+        }
         if let Some(n) = req.max_tokens {
             body["max_tokens"] = serde_json::json!(n);
         }
@@ -975,6 +999,49 @@ impl Thinker for StubThinker {
 mod tests {
     use super::*;
     use crate::think::Message;
+
+    #[test]
+    fn provider_tool_continuation_is_private_and_only_sent_with_supported_tools() {
+        let client = OpenAiThinker::new(ThinkerConfig::deepseek(), ApiKey::new("test-key"));
+        let mut message = Message::assistant_tool_calls(vec![
+            serde_json::json!({"id":"x","type":"function","function":{"name":"t","arguments":"{}"}}),
+        ]);
+        message.live_content = Some("private progress".into());
+        message.live_reasoning = Some("private continuation".into());
+        let original_chars = super::super::context::message_chars(&message);
+        let mut req = ThinkRequest::new(vec![message.clone()]);
+        assert!(
+            client.build_body(&req)["messages"][0]
+                .get("reasoning_content")
+                .is_none()
+        );
+        req.tools
+            .push(serde_json::json!({"type":"function","function":{"name":"t"}}));
+        let wire = client.build_body(&req);
+        assert_eq!(wire["messages"][0]["content"], "private progress");
+        assert_eq!(
+            wire["messages"][0]["reasoning_content"],
+            "private continuation"
+        );
+        let local = OpenAiThinker::new(
+            ThinkerConfig::local("http://127.0.0.1:1", "test"),
+            ApiKey::new(""),
+        );
+        assert!(
+            local.build_body(&req)["messages"][0]
+                .get("reasoning_content")
+                .is_none()
+        );
+        let persisted = serde_json::to_string(&message).unwrap();
+        assert!(!persisted.contains("private"));
+        let restored: Message = serde_json::from_str(&persisted).unwrap();
+        assert!(restored.live_reasoning.is_none());
+        message.live_reasoning = None;
+        assert_eq!(
+            original_chars - super::super::context::message_chars(&message),
+            "private continuation".chars().count()
+        );
+    }
 
     #[test]
     fn text_only_wire_format_is_unchanged_and_images_are_content_blocks() {

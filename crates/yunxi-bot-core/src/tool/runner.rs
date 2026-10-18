@@ -182,11 +182,14 @@ pub struct ToolRunOutcome {
 pub enum ToolLoopError {
     /// 模型调用失败。
     Think(ThinkError),
+    Resource(ToolError),
     /// 轮数用尽还没收敛。
     ///
     /// **这是一个真实的失败形态**，不能当成"模型还没说完"。
     /// 它通常意味着工具一直在返回同样的东西、模型在原地打转。
-    RoundsExhausted { rounds: u32 },
+    RoundsExhausted {
+        rounds: u32,
+    },
     /// **模型在反复做同一个动作。**
     ///
     /// 真机上抓到过（D100）：一次运行调了 40 次工具、最后 12 次里 11 次是
@@ -201,13 +204,19 @@ pub enum ToolLoopError {
     ///
     /// 而更实际的是：**这种事本来就不该磨到轮数上限**。
     /// 磨到上限意味着白花了 5 轮的钱和时间。
-    Repeating { tool: String, times: u32 },
+    Repeating {
+        tool: String,
+        times: u32,
+    },
 }
 
 impl std::fmt::Display for ToolLoopError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ToolLoopError::Think(e) => write!(f, "模型调用失败: {e}"),
+            ToolLoopError::Resource(e) => {
+                write!(f, "degraded=true：界面租约重置失败，未继续执行：{e}")
+            }
             ToolLoopError::RoundsExhausted { rounds } => {
                 write!(f, "工具循环跑了 {rounds} 轮仍未结束——模型可能在原地打转")
             }
@@ -269,6 +278,7 @@ pub struct ToolRunner<'a> {
     decision_ledger: DecisionSink<'a>,
     /// 一轮对话最多几次工具往返。
     pub max_rounds: u32,
+    nested_calls: Vec<ToolCallRecord>,
 }
 
 /// 正文增量的去处。
@@ -319,8 +329,9 @@ impl Decided<'_> {
             self,
             Decided::Run {
                 capability: Capability::ReadOnly,
+                tool,
                 ..
-            }
+            } if tool.interaction_group().is_none()
         )
     }
 }
@@ -393,6 +404,7 @@ impl<'a> ToolRunner<'a> {
             // 正是 D128 那种"看起来正常"。
             decision_ledger: None,
             max_rounds: DEFAULT_MAX_ROUNDS,
+            nested_calls: Vec::new(),
         }
     }
 
@@ -472,8 +484,39 @@ impl<'a> ToolRunner<'a> {
         layout: &mut PromptLayout,
         max_tokens: u32,
     ) -> Result<ToolRunOutcome, ToolLoopError> {
+        self.retire_observations(layout)?;
+        let result = self.run_inner(thinker, layout, max_tokens);
+        // The synchronous batch has drained before control is returned, including errors.
+        self.retire_observations(layout)?;
+        result
+    }
+
+    fn retire_observations(&self, layout: &mut PromptLayout) -> Result<(), ToolLoopError> {
+        layout.clear_tool_continuations();
+        self.registry
+            .reset_observations()
+            .map_err(ToolLoopError::Resource)?;
+        for name in self.registry.names() {
+            if self
+                .registry
+                .get(name)
+                .is_some_and(|tool| tool.interaction_group().is_some())
+            {
+                layout.retire_private_tool_results(name);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_inner(
+        &mut self,
+        thinker: &dyn Thinker,
+        layout: &mut PromptLayout,
+        max_tokens: u32,
+    ) -> Result<ToolRunOutcome, ToolLoopError> {
         let specs = self.registry.specs();
         let mut calls = Vec::new();
+        let mut progress = super::progress::Progress::default();
 
         // 轮数就是模型调用次数——一轮一次，没有别的调用点。
         // 用 `round` 本身当计数，不另开一个变量（那样 clippy 会认为它是
@@ -483,7 +526,13 @@ impl<'a> ToolRunner<'a> {
         let mut seen: Vec<(String, String)> = Vec::new();
 
         for round in 1..=self.max_rounds {
-            let messages = layout.build();
+            let mut messages = layout.build();
+            if let Some(material) = progress.evidence_message() {
+                messages.push(material);
+            }
+            if let Some(advice) = progress.advice() {
+                messages.push(Message::system(advice));
+            }
             let mut req = ThinkRequest::new(messages).with_max_tokens(max_tokens);
             // **每一轮都要带思考模式。** 只在第一轮带会让后续轮次静默退回默认，
             // 而"哪一轮思考了"在账单上分不出来。
@@ -497,7 +546,7 @@ impl<'a> ToolRunner<'a> {
 
             // **走流式入口。** 不支持的 Thinker 会退化成一次性返回
             // （`Thinker::think_stream` 的默认实现），所以这里不需要判断。
-            let resp = {
+            let mut resp = {
                 let cb = self.on_delta.clone();
                 let mut emit = |t: &str| {
                     if let Some(f) = &cb {
@@ -507,7 +556,24 @@ impl<'a> ToolRunner<'a> {
                 thinker.think_stream(&req, &mut emit)?
             };
 
-            let reqs = parse_tool_calls(&resp.tool_calls);
+            let mut reqs = parse_tool_calls(&resp.tool_calls);
+            let retained_choice = reqs.is_empty() && self.registry.requires_user_choice();
+            if retained_choice {
+                if self.registry.get("ask_user").is_none() {
+                    return Err(ToolLoopError::Resource(ToolError::Failed {
+                        detail: "user_choice_required：界面仍有待选择项，当前入口没有追问工具，保持原状，不记为完成".into(),
+                    }));
+                }
+                // Retain the model's ordinary reply, never append raw tool output or turn it into approval.
+                let summary: String = resp.content.chars().take(2000).collect();
+                let question = format!(
+                    "当前界面仍有待选择项，任务未完成，弹窗保持原状。\n本轮模型说明（不代表已操作）：{summary}\n请指定具体选项或由你接管；答复不替代动作审批。"
+                );
+                resp.tool_calls = vec![
+                    serde_json::json!({"id":format!("ui-choice-{round}"),"type":"function","function":{"name":"ask_user","arguments":serde_json::json!({"question":question}).to_string()}}),
+                ];
+                reqs = parse_tool_calls(&resp.tool_calls);
+            }
 
             // **先看它是不是在重复，再去执行。**
             //
@@ -549,6 +615,8 @@ impl<'a> ToolRunner<'a> {
             // 不能当成完整的用，也不能原样传下去。
             let mut assistant =
                 Message::assistant_tool_calls(sanitize_tool_calls(&resp.tool_calls));
+            assistant.live_content = (!resp.content.is_empty()).then(|| resp.content.clone());
+            assistant.live_reasoning = resp.reasoning.take();
             let live_calls = assistant.tool_calls.clone();
             for call in &mut assistant.tool_calls {
                 if call["function"]["name"]
@@ -566,10 +634,9 @@ impl<'a> ToolRunner<'a> {
             //
             // 判定必须串行：审批是 `&mut`，而且同时弹三个审批框
             // 使用者根本不知道自己在批哪一条。
-            let question = self
-                .defer_questions
-                .then(|| reqs.iter().position(|tr| tr.name == "ask_user"))
-                .flatten();
+            // A question hands control to the user; sibling calls cannot rely on the old screen.
+            let question = reqs.iter().position(|tr| tr.name == "ask_user");
+            let mut interaction_groups = BTreeSet::new();
             let decided: Vec<Decided<'a>> = reqs
                 .iter()
                 .enumerate()
@@ -590,12 +657,32 @@ impl<'a> ToolRunner<'a> {
                             duration_ms: 0,
                             live_output: None,
                         })
+                    } else if self.registry.get(&tr.name)
+                        .and_then(|tool| tool.interaction_group())
+                        .is_some_and(|group| !interaction_groups.insert(group)) {
+                        Decided::Settled(ToolCallRecord {
+                            tool: tr.name.clone(),
+                            arguments: tr.arguments.clone(),
+                            capability: self.registry.get(&tr.name).map_or(Capability::Unknown, |tool| tool.capability()),
+                            decision: GateDecision::Deny {
+                                reason: "stateful_batch_requires_reobserve：同一界面每轮只执行一次观察或动作，其他请求未派发。先根据本轮结果重新提出；这不是用户撤销授权，也不会自动批准下一动作".into(),
+                            },
+                            output: None,
+                            started_at_ms: 0,
+                            duration_ms: 0,
+                            live_output: None,
+                        })
                     } else {
                         self.decide_one(tr)
                     }
                 })
                 .collect();
+            let choice_before_question = question.is_some() && self.registry.requires_user_choice();
             let records = self.execute_batch(decided);
+            calls.append(&mut self.nested_calls);
+            let question_executed = question
+                .and_then(|index| records.get(index))
+                .is_some_and(|record| record.executed());
             let waiting = question
                 .and_then(|index| records.get(index))
                 .and_then(|r| r.output.as_ref())
@@ -609,9 +696,20 @@ impl<'a> ToolRunner<'a> {
                         .map(str::to_owned)
                 });
 
+            let returned_control = reqs.iter().any(|tr| tr.name == "ask_user");
             let mut observations = Vec::new();
             for (tr, mut record) in reqs.into_iter().zip(records) {
                 let live = record.live_output.take();
+                if tr.name == "computer_verify"
+                    && record.executed()
+                    && let Some(output) = live.as_ref()
+                {
+                    progress.remember_verification(&output.text);
+                }
+                if let Some(observation) = live.as_ref().and_then(|output| output.observation) {
+                    layout.retire_private_tool_results(&tr.name);
+                    progress.observe(observation);
+                }
                 let private = self.registry.get(&tr.name).is_some_and(|t| t.private_io());
                 if private {
                     record.arguments = self
@@ -657,6 +755,16 @@ impl<'a> ToolRunner<'a> {
             // answered first, and the envelope explicitly preserves tool provenance.
             for (id, images) in observations {
                 layout.push_observation(&id, images)?;
+            }
+            if (retained_choice || choice_before_question) && !question_executed {
+                return Err(ToolLoopError::Resource(ToolError::Failed {
+                    detail: "user_choice_required：正式追问被拒或不可用，界面保持原状，不记为完成"
+                        .into(),
+                }));
+            }
+            if returned_control {
+                self.retire_observations(layout)?;
+                progress = super::progress::Progress::default();
             }
             if let Some(text) = waiting {
                 layout.push_raw(Message::assistant(text.clone()));
@@ -805,6 +913,16 @@ impl<'a> ToolRunner<'a> {
                 reason,
             } => {
                 let started = crate::now_millis().unwrap_or(0);
+                #[cfg(target_os = "macos")]
+                let out = if call.name == "browser_workflow_run" {
+                    let ctx = self.ctx.clone();
+                    super::computer::recipes::replay(&call.arguments, &ctx, |name, args| {
+                        self.workflow_dispatch(name, args)
+                    })
+                } else {
+                    tool.call(&call.arguments, &mut self.ctx)
+                };
+                #[cfg(not(target_os = "macos"))]
                 let out = tool.call(&call.arguments, &mut self.ctx);
                 let duration = crate::now_millis()
                     .unwrap_or(started)
@@ -823,6 +941,47 @@ impl<'a> ToolRunner<'a> {
                 }
             }
         }
+    }
+
+    /// Deterministic planning shares the normal gate, preflight, approval and private audit path.
+    #[cfg(target_os = "macos")]
+    fn workflow_dispatch(&mut self, name: &str, arguments: Value) -> Result<ToolOutput, ToolError> {
+        if !matches!(
+            name,
+            "computer_observe" | "computer_act" | "computer_verify" | "browser_workflow"
+        ) {
+            return Err(ToolError::BadArgs {
+                detail: "workflow_tool_not_allowed".into(),
+            });
+        }
+        let call = ParsedCall {
+            id: "workflow-step".into(),
+            name: name.into(),
+            arguments,
+        };
+        let decided = self.decide_one(&call);
+        let mut record = self.finish_one(decided);
+        let live = record.live_output.take();
+        let result = match &record.output {
+            Some(Ok(text)) => Ok(live.unwrap_or_else(|| ToolOutput::read(text.clone()))),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err(ToolError::Denied {
+                reason: record.decision.reason().to_owned(),
+            }),
+        };
+        if let Some(tool) = self.registry.get(name) {
+            record.arguments = tool.audit_arguments(&call.arguments);
+            if tool.private_io() {
+                record.output = record
+                    .output
+                    .map(|r| r.map(|_| "【私有流程步骤结果：仅在本进程可见】".into()));
+            }
+        }
+        if let Some(sink) = self.sink.as_ref() {
+            sink.record(&record);
+        }
+        self.nested_calls.push(record);
+        result
     }
 
     /// 按批执行：**连续的只读调用并行，其余串行。**
@@ -1762,6 +1921,73 @@ mod tests {
         })
     }
 
+    #[test]
+    fn verified_cross_app_material_is_transient_and_cleared_on_handoff() {
+        struct Verification;
+        impl Tool for Verification {
+            fn name(&self) -> &str {
+                "computer_verify"
+            }
+            fn description(&self) -> &str {
+                "synthetic verification"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object"})
+            }
+            fn capability(&self) -> Capability {
+                Capability::ReadOnly
+            }
+            fn private_io(&self) -> bool {
+                true
+            }
+            fn interaction_group(&self) -> Option<&'static str> {
+                Some("desktop")
+            }
+            fn call(&self, _: &Value, _: &mut ToolContext) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::read(json!({"matched":true,"source":{"target_id":"browser","tab_id":"source"},"observation_id":"prior","checks":[{"matched":true,"evidence":{"kind":"text_present","text":"private-cross-app-material"}}]}).to_string()))
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(Verification)).unwrap();
+        registry
+            .register(Arc::new(DesktopFixture::default()))
+            .unwrap();
+        registry
+            .register(Arc::new(ScriptTool::new("ask_user", Capability::ReadOnly)))
+            .unwrap();
+        let thinker = ScriptThinker::new(vec![
+            ScriptThinker::tool_reply(vec![call_json("v", "computer_verify", json!({}))]),
+            ScriptThinker::tool_reply(vec![call_json("next", "desktop", json!({}))]),
+            ScriptThinker::tool_reply(vec![call_json("q", "ask_user", json!({}))]),
+            ScriptThinker::text_reply("handoff"),
+        ]);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("move material between windows");
+        let mut ap = RefusingApprover;
+        let result = runner(&registry, ToolPolicy::default(), &mut ap)
+            .run(&thinker, &mut layout, 1024)
+            .unwrap();
+        let requests = thinker.requests();
+        assert!(requests[2].messages.iter().any(|m| {
+            m.content.starts_with("【本轮工具取材")
+                && m.live_content
+                    .as_ref()
+                    .is_some_and(|text| text.contains("private-cross-app-material"))
+        }));
+        assert!(requests[3].messages.iter().all(|m| {
+            m.live_content
+                .as_ref()
+                .is_none_or(|text| !text.contains("private-cross-app-material"))
+        }));
+        for saved in [
+            serde_json::to_string(&layout).unwrap(),
+            serde_json::to_string(&result.calls).unwrap(),
+            format!("{:?}", requests[2].messages),
+        ] {
+            assert!(!saved.contains("private-cross-app-material"));
+        }
+    }
+
     fn ctx() -> ToolContext {
         ToolContext::new(std::env::temp_dir(), SandboxMode::WorkspaceWrite)
     }
@@ -1851,6 +2077,274 @@ mod tests {
         assert!(restored.build().iter().all(|m| m.images.is_empty()
             && m.live_content.is_none()
             && m.live_tool_calls.is_empty()));
+    }
+
+    #[derive(Default)]
+    struct DesktopFixture {
+        calls: AtomicUsize,
+        resets: AtomicUsize,
+        choice: std::sync::atomic::AtomicBool,
+    }
+    impl Tool for DesktopFixture {
+        fn name(&self) -> &str {
+            "desktop"
+        }
+        fn description(&self) -> &str {
+            "synthetic screen"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object"})
+        }
+        fn capability(&self) -> Capability {
+            Capability::ReadOnly
+        }
+        fn private_io(&self) -> bool {
+            true
+        }
+        fn interaction_group(&self) -> Option<&'static str> {
+            Some("desktop")
+        }
+        fn reset_observation(&self) -> Result<(), ToolError> {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            self.choice.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+        fn requires_user_choice(&self) -> bool {
+            self.choice.load(Ordering::SeqCst)
+        }
+        fn call(&self, args: &Value, _: &mut ToolContext) -> Result<ToolOutput, ToolError> {
+            self.choice.store(args["choice"] == true, Ordering::SeqCst);
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut output = ToolOutput::read(format!("private-frame-{n}"));
+            output.observation = Some(super::super::ToolObservation {
+                scope: 1,
+                state: Some(2),
+            });
+            Ok(output)
+        }
+    }
+
+    #[test]
+    fn unresolved_ui_choice_becomes_a_real_question_even_when_model_only_replies_in_text() {
+        for (deny, absent, explicit) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, false, true),
+        ] {
+            let mut reg = ToolRegistry::new();
+            reg.register(Arc::new(DesktopFixture::default())).unwrap();
+            if !absent {
+                reg.register(Arc::new(super::super::system::AskUserTool::deferred()))
+                    .unwrap();
+            }
+            let thinker = ScriptThinker::new(vec![
+                ScriptThinker::tool_reply(vec![call_json(
+                    "observe",
+                    "desktop",
+                    json!({"choice":true}),
+                )]),
+                if explicit {
+                    ScriptThinker::tool_reply(vec![call_json(
+                        "question",
+                        "ask_user",
+                        json!({"question":"保存、放弃还是取消？"}),
+                    )])
+                } else {
+                    ScriptThinker::text_reply("弹窗还在，请选择下一步")
+                },
+            ]);
+            let mut layout = PromptLayout::new("S");
+            layout.ask("continue");
+            let mut ap = RefusingApprover;
+            let mut policy = ToolPolicy::default();
+            if deny {
+                policy.deny.push(super::super::Rule::tool("ask_user"));
+            }
+            let result = runner(&reg, policy, &mut ap).with_deferred_questions().run(
+                &thinker,
+                &mut layout,
+                512,
+            );
+            if deny || absent {
+                assert!(
+                    result.is_err(),
+                    "a denied question is not a successful handoff"
+                );
+            } else {
+                let result = result.unwrap();
+                assert!(
+                    result
+                        .calls
+                        .iter()
+                        .any(|c| c.tool == "ask_user" && c.executed())
+                );
+                assert!(layout.history_mentions("waiting_for_user"));
+                assert!(
+                    !serde_json::to_string(&result.calls)
+                        .unwrap()
+                        .contains("private-frame")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_desktop_batch_dispatches_once_and_answers_every_id_without_blocking_other_reads() {
+        let screen = Arc::new(DesktopFixture::default());
+        let ordinary = ScriptTool::new("ordinary", Capability::ReadOnly);
+        let mut registry = ToolRegistry::new();
+        registry.register(screen.clone()).unwrap();
+        registry.register(Arc::new(ordinary.clone())).unwrap();
+        let thinker = ScriptThinker::new(vec![
+            ScriptThinker::tool_reply(vec![
+                call_json("a", "desktop", json!({})),
+                call_json("b", "desktop", json!({"x":1})),
+                call_json("c", "ordinary", json!({})),
+            ]),
+            ScriptThinker::text_reply("done"),
+        ]);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("test");
+        let mut ap = RefusingApprover;
+        let out = runner(&registry, ToolPolicy::default(), &mut ap)
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+        assert_eq!(screen.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(screen.resets.load(Ordering::SeqCst), 2);
+        assert_eq!(ordinary.count(), 1);
+        assert_eq!(out.calls.len(), 3);
+        assert!(
+            matches!(&out.calls[1].decision, GateDecision::Deny{reason} if reason.starts_with("stateful_batch_requires_reobserve"))
+        );
+        assert_eq!(
+            thinker.requests()[1]
+                .messages
+                .iter()
+                .filter(|m| m.tool_call_id.is_some())
+                .count(),
+            3
+        );
+        assert!(
+            !serde_json::to_string(&out.calls)
+                .unwrap()
+                .contains("private-frame")
+        );
+    }
+
+    #[test]
+    fn unchanged_screen_nudge_is_transient_and_old_private_text_is_retired_without_images() {
+        let screen = Arc::new(DesktopFixture::default());
+        let mut registry = ToolRegistry::new();
+        registry.register(screen).unwrap();
+        let mut replies: Vec<_> = (0..3)
+            .map(|n| {
+                ScriptThinker::tool_reply(vec![call_json(
+                    &format!("c{n}"),
+                    "desktop",
+                    json!({"max_nodes":n+1}),
+                )])
+            })
+            .collect();
+        replies.push(ScriptThinker::text_reply("blocked; ask user"));
+        let thinker = ScriptThinker::new(replies);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("test");
+        let mut ap = RefusingApprover;
+        runner(&registry, ToolPolicy::default(), &mut ap)
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+        let requests = thinker.requests();
+        let last = &requests.last().unwrap().messages;
+        assert!(
+            last.iter()
+                .any(|m| m.role == Role::System && m.content.starts_with("【界面进度提示】"))
+        );
+        assert_eq!(last.iter().filter(|m| m.live_content.is_some()).count(), 1);
+        assert!(
+            last.iter()
+                .any(|m| m.live_content.as_deref() == Some("private-frame-2"))
+        );
+        assert!(
+            !layout
+                .build()
+                .iter()
+                .any(|m| m.content.starts_with("【界面进度提示】"))
+        );
+    }
+
+    #[test]
+    fn returning_from_a_human_question_invalidates_old_screen_before_the_next_model_call() {
+        let screen = Arc::new(DesktopFixture::default());
+        let mut registry = ToolRegistry::new();
+        registry.register(screen.clone()).unwrap();
+        registry
+            .register(Arc::new(ScriptTool::new("ask_user", Capability::ReadOnly)))
+            .unwrap();
+        let thinker = ScriptThinker::new(vec![
+            ScriptThinker::tool_reply(vec![call_json("a", "desktop", json!({}))]),
+            ScriptThinker::tool_reply(vec![call_json("q", "ask_user", json!({}))]),
+            ScriptThinker::text_reply("reobserve"),
+        ]);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("test");
+        let mut ap = RefusingApprover;
+        runner(&registry, ToolPolicy::default(), &mut ap)
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+        assert_eq!(screen.resets.load(Ordering::SeqCst), 3);
+        assert!(
+            thinker.requests()[2]
+                .messages
+                .iter()
+                .all(|m| m.live_content.is_none())
+        );
+    }
+
+    #[test]
+    fn a_human_question_batch_cannot_dispatch_sibling_desktop_actions() {
+        let screen = Arc::new(DesktopFixture::default());
+        let mut registry = ToolRegistry::new();
+        registry.register(screen.clone()).unwrap();
+        registry
+            .register(Arc::new(ScriptTool::new("ask_user", Capability::ReadOnly)))
+            .unwrap();
+        let thinker = ScriptThinker::new(vec![
+            ScriptThinker::tool_reply(vec![
+                call_json("before", "desktop", json!({})),
+                call_json("q", "ask_user", json!({})),
+                call_json("after", "desktop", json!({"x":1})),
+            ]),
+            ScriptThinker::text_reply("reobserve"),
+        ]);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("test");
+        let mut ap = RefusingApprover;
+        let out = runner(&registry, ToolPolicy::default(), &mut ap)
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+        assert_eq!(screen.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(out.calls.len(), 3);
+    }
+
+    #[test]
+    fn thinker_failure_still_retires_the_desktop_lease() {
+        let screen = Arc::new(DesktopFixture::default());
+        let mut registry = ToolRegistry::new();
+        registry.register(screen.clone()).unwrap();
+        let thinker = ScriptThinker::new(vec![ScriptThinker::tool_reply(vec![call_json(
+            "a",
+            "desktop",
+            json!({}),
+        )])]);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("test");
+        let mut ap = RefusingApprover;
+        assert!(matches!(
+            runner(&registry, ToolPolicy::default(), &mut ap).run(&thinker, &mut layout, 512),
+            Err(ToolLoopError::Think(_))
+        ));
+        assert_eq!(screen.resets.load(Ordering::SeqCst), 2);
     }
 
     // ---- 基本循环 ----
@@ -1969,6 +2463,77 @@ mod tests {
         assert_eq!(out.rounds, 1);
         assert!(out.calls.is_empty());
         assert_eq!(out.model_calls, 1);
+    }
+
+    #[test]
+    fn tool_continuation_survives_rounds_but_not_handoff_or_storage() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ScriptTool::new("t", Capability::ReadOnly)))
+            .unwrap();
+        let mut reply = ScriptThinker::tool_reply(vec![call_json("c1", "t", json!({}))]);
+        reply.content = "private task progress".into();
+        reply.reasoning = Some("private provider continuation".into());
+        let thinker = ScriptThinker::new(vec![reply, ScriptThinker::text_reply("ok")]);
+        let mut ap = RefusingApprover;
+        let mut layout = PromptLayout::new("S");
+        layout.ask("q");
+        runner(&reg, ToolPolicy::default(), &mut ap)
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+        let reqs = thinker.requests();
+        let assistant = reqs[1]
+            .messages
+            .iter()
+            .find(|m| !m.tool_calls.is_empty())
+            .unwrap();
+        assert_eq!(
+            assistant.live_content.as_deref(),
+            Some("private task progress")
+        );
+        assert_eq!(
+            assistant.live_reasoning.as_deref(),
+            Some("private provider continuation")
+        );
+        assert!(!format!("{assistant:?}").contains("private provider continuation"));
+        assert!(layout.build().iter().all(|m| m.live_reasoning.is_none()));
+        assert!(
+            !serde_json::to_string(assistant)
+                .unwrap()
+                .contains("private")
+        );
+        assert!(!format!("{assistant:?}").contains("private task progress"));
+        assert!(
+            layout
+                .build()
+                .iter()
+                .filter(|m| !m.tool_calls.is_empty())
+                .all(|m| m.live_content.is_none())
+        );
+    }
+
+    #[test]
+    fn failed_tool_run_also_clears_transient_provider_context() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ScriptTool::new("t", Capability::ReadOnly)))
+            .unwrap();
+        let mut reply = ScriptThinker::tool_reply(vec![call_json("c1", "t", json!({}))]);
+        reply.reasoning = Some("private continuation".into());
+        reply.content = "private progress".into();
+        let thinker = ScriptThinker::new(vec![reply]);
+        let mut ap = RefusingApprover;
+        let mut layout = PromptLayout::new("S");
+        layout.ask("q");
+        assert!(
+            runner(&reg, ToolPolicy::default(), &mut ap)
+                .run(&thinker, &mut layout, 512)
+                .is_err()
+        );
+        assert!(
+            layout
+                .build()
+                .iter()
+                .all(|m| m.live_reasoning.is_none() && m.live_content.is_none())
+        );
     }
 
     #[test]

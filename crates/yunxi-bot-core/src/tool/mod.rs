@@ -58,6 +58,7 @@ pub mod mac_assistant;
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod mail_context;
+mod progress;
 pub mod runner;
 pub mod system;
 #[cfg(target_os = "macos")]
@@ -156,6 +157,14 @@ pub struct ToolOutput {
     pub changed_state: bool,
     /// 仅在当前工具循环回传，不进入台账或会话存档。
     pub images: Vec<crate::think::ImageInput>,
+    /// 界面指纹只作进度提示，不序列化，不参与定位或授权。
+    pub observation: Option<ToolObservation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolObservation {
+    pub scope: u64,
+    pub state: Option<u64>,
 }
 
 impl std::fmt::Debug for ToolOutput {
@@ -174,6 +183,7 @@ impl ToolOutput {
             text: text.into(),
             changed_state: false,
             images: Vec::new(),
+            observation: None,
         }
     }
     pub fn changed(text: impl Into<String>) -> Self {
@@ -181,6 +191,7 @@ impl ToolOutput {
             text: text.into(),
             changed_state: true,
             images: Vec::new(),
+            observation: None,
         }
     }
 }
@@ -362,6 +373,21 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// 共享同一界面的工具不能在同批中互相废弃观察。
+    fn interaction_group(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// A retained UI choice cannot be converted to completion by a plain model reply.
+    fn requires_user_choice(&self) -> bool {
+        false
+    }
+
+    /// 人工接管或新回合后，不能继续使用上次的界面租约。
+    fn reset_observation(&self) -> Result<(), ToolError> {
+        Ok(())
+    }
+
     fn audit_arguments(&self, args: &serde_json::Value) -> serde_json::Value {
         if self.private_io() {
             serde_json::json!({"private_arguments": true})
@@ -477,6 +503,17 @@ impl ToolRegistry {
 
     pub fn names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
+    }
+
+    pub(crate) fn reset_observations(&self) -> Result<(), ToolError> {
+        for tool in &self.tools {
+            tool.reset_observation()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn requires_user_choice(&self) -> bool {
+        self.tools.iter().any(|tool| tool.requires_user_choice())
     }
 
     pub fn len(&self) -> usize {

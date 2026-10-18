@@ -1,5 +1,5 @@
 //! A year omitted at checkout can only come from the real selection that opened it.
-use super::{Frame, Input};
+use super::{Frame, Input, page_url};
 use chrono::{Datelike, NaiveDate};
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -14,13 +14,6 @@ pub(super) struct HotelDates {
     rooms: u8,
     at: Instant,
     pub epoch: String,
-}
-
-pub(super) fn page_url(frame: &Frame) -> &str {
-    frame.arguments["page"]["url"]
-        .as_str()
-        .or_else(|| frame.arguments["url"].as_str())
-        .unwrap_or("")
 }
 
 fn parameter<'a>(query: &'a str, name: &str) -> Option<&'a str> {

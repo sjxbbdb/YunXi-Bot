@@ -50,16 +50,83 @@ original copyright and license are preserved as required.
    Copyright (c) 2025 Cua AI, Inc.
    Driver license: MIT; optional components and bundled third-party materials
    retain their own notices and licenses.
-   Used for: macOS native and browser computer control through a separately
-   installed CuaDriver.app. YunXi registers a reviewed subset of 35 operations.
+   Used for: macOS native and browser computer control through YunXi's bundled
+   computer host using Cua's official embedded daemon protocol. YunXi registers
+   a reviewed subset of 35 operations. The host lifecycle references
+   rust/examples/embedded-host-macos and rust/Skills/cua-driver/EMBEDDING.md
+   (Copyright (c) 2026 Cua AI, Inc., MIT).
    The unmodified Driver subproject source is included at
    third_party/cua/libs/cua-driver, with upstream license, licensing boundaries,
    version metadata and attribution at third_party/cua/.
    The generated tool schema subset and its MIT notice are also retained at
    crates/yunxi-bot-core/src/tool/computer/.
-   No upstream app binaries, optional model artifacts, browser profiles,
-   credentials, recordings or local runtime data are redistributed.
+   The installer bundles the verified 0.36.0 executable and license notices in
+   the local build output. Binaries are not stored in Git. Optional models,
+   browser profiles, credentials, recordings and runtime data are not shipped.
+
+8. browser-use  —  https://github.com/browser-use/browser-use
+   Commit: aa093a843da5edbf323c0b4145c9b6a0db3ecde8
+   License: MIT
+   Copyright (c) 2024 Gregor Zunic
+   Adapted mechanism: semantic page stagnation nudges (ActionLoopDetector) in
+   crates/yunxi-bot-core/src/tool/progress.rs. The current-observation cleanup
+   also references its message manager's replaceable browser state slot.
+   Implemented in Rust; the Python agent and browser executor are not included.
+   Upstream license and provenance: third_party/browser-use/.
+
+9. agent-browser  —  https://github.com/vercel-labs/agent-browser
+   Commit: dac13bb87468fe9d74a040d862720f6cc17a9565
+   License: Apache-2.0
+   Design reference only: document identity and stale element references.
+   No upstream source code or CDP executor included.
+
+10. UI-TARS Desktop  —  https://github.com/bytedance/UI-TARS-desktop
+    Commit: 3ac2cb8d946d78d5ff92ad17b318eaafa18c178c
+    License: Apache-2.0
+    Design reference only: stop boundaries, tool results and coordinate scaling.
+    No upstream source code, Electron runtime or model artifacts included.
+
+11. Travel Agent  —  https://github.com/Prism-Shadow/travel-agent
+    Commit: dd0ac16e1dc3d01a908cfaa907afdbcafdebe589
+    License: Apache-2.0
+    Design reference only: draining tool calls before handing control back.
+    No upstream source code, Playwright runtime or site-specific rules included.
 
 --------------------------------------------------------------------------------
+12. Peekaboo  —  https://github.com/openclaw/Peekaboo
+    Commit: 93e64709dd74a0ff0e6ce6ec9221ddc19e3892a7
+    License: MIT
+    Copyright (c) 2025 Peter Steinberger
+    Design reference only: structural parent-window/Sheet discovery, exact
+    dialog targets, ambiguity refusal and post-action verification. YunXi's
+    Rust implementation uses its existing Cua executor; no Peekaboo source,
+    binaries, Swift dependencies or automatic dismissal are included.
+
+13. Playwright  —  https://github.com/microsoft/playwright
+    Commit: b335271cdc2b57cac2be8ad37c5dd283ac6b8938
+    License: Apache-2.0
+    Design reference only: actionability, bounded observation, dialog and file
+    chooser specialization. No Playwright code or runtime is included.
+
+14. Codex CLI  —  https://github.com/openai/codex
+    Commit: 8c076942cb70fba8e5c4732c23f1faabc4aed484
+    License: Apache-2.0
+    Design reference only: bounded MCP catalog pagination in
+    codex-rs/codex-mcp/src/pagination.rs and connection_manager/tool_catalog.rs.
+    YunXi independently implements discovery using its existing rmcp client;
+    no upstream source or Codex runtime is included as a product dependency.
+    Local research checkouts retain upstream LICENSE/NOTICE and are Git-ignored.
+    Desktop package analysis is separately documented; private desktop code and
+    native binaries are not redistributed or loaded by YunXi.
+
 Design ideas are not copyrightable; the attribution above exists so that any
 code actually migrated can be traced to its origin.
+
+15. workflow-use — https://github.com/browser-use/workflow-use
+    Commit: 5d2d19fe8835cc86f1bf3e04302a5000d590f249
+    Design reference only: successful-run extraction, semantic parameterized
+    workflows and deterministic replay (README and semantic_executor.py).
+    No upstream source or Python runtime is included as a product dependency.
+    YunXi does not adopt ambiguous-first-match or fixed-delay fallbacks.
+    Playwright's locator/codegen/actionability documentation also informed the
+    independently implemented browser workflow module; attribution in item 13.

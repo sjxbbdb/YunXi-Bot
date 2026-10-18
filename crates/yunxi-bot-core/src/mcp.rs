@@ -31,7 +31,7 @@
 //! 这样 MCP 工具和自建工具走的是**同一条**审批与留痕路径——
 //! 另起一条路的话，它迟早会绕开那道门。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,10 @@ pub const PREFIX: &str = "mcp__";
 /// MCP server 是第三方进程，卡住是常态而不是异常。没有超时的话，
 /// 一个坏掉的 server 会挂住整个守护进程——而守护进程的职责是长跑。
 pub const DEFAULT_CALL_TIMEOUT_MS: u64 = 60_000;
+
+const MAX_TOOL_PAGES: usize = 128;
+const MAX_DISCOVERED_TOOLS: usize = 4096;
+const MAX_TOOL_CURSOR_BYTES: usize = 64 * 1024;
 
 /// 一个 MCP server 的配置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -367,7 +371,7 @@ impl McpHub {
             .block_on(async {
                 tokio::time::timeout(
                     Duration::from_millis(DEFAULT_CALL_TIMEOUT_MS),
-                    client.peer().list_tools(None),
+                    discover_tools(client.peer()),
                 )
                 .await
             })
@@ -381,7 +385,6 @@ impl McpHub {
             })?;
 
         let tools = listed
-            .tools
             .iter()
             .map(|t| McpToolDesc {
                 server: spec.name.clone(),
@@ -509,6 +512,47 @@ impl McpHub {
 
         Ok(result)
     }
+}
+
+async fn discover_tools(
+    peer: &rmcp::Peer<rmcp::RoleClient>,
+) -> Result<Vec<rmcp::model::Tool>, String> {
+    let mut tools = Vec::new();
+    let mut cursor = None;
+    let mut cursors = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for _ in 0..MAX_TOOL_PAGES {
+        let params = cursor
+            .map(|cursor| rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor)));
+        let page = peer
+            .list_tools(params)
+            .await
+            .map_err(|error| error.to_string())?;
+        if tools.len().saturating_add(page.tools.len()) > MAX_DISCOVERED_TOOLS {
+            return Err(format!(
+                "MCP 工具目录超过 {MAX_DISCOVERED_TOOLS} 项，拒绝注册不完整目录"
+            ));
+        }
+        for tool in page.tools {
+            if !names.insert(tool.name.to_string()) {
+                return Err("MCP 工具目录出现重名工具，拒绝注册有歧义的目录".into());
+            }
+            tools.push(tool);
+        }
+        let Some(next) = page.next_cursor else {
+            return Ok(tools);
+        };
+        if next.len() > MAX_TOOL_CURSOR_BYTES {
+            return Err("MCP 工具目录分页游标过长，拒绝注册不完整目录".into());
+        }
+        if !cursors.insert(next.clone()) {
+            return Err("MCP 工具目录分页游标重复，拒绝注册不完整目录".into());
+        }
+        cursor = Some(next);
+    }
+    Err(format!(
+        "MCP 工具目录超过 {MAX_TOOL_PAGES} 页，拒绝注册不完整目录"
+    ))
 }
 
 /// 把 MCP 的 content 块渲染成文本。
@@ -786,6 +830,7 @@ impl crate::tool::Tool for McpTool {
             Ok(text) => Ok(crate::tool::ToolOutput {
                 text,
                 images: Vec::new(),
+                observation: None,
                 // **保守取 `true`。** 我们不知道这个外部工具改没改状态——
                 // 声称"没改"会让审批记忆永久保留，而那是不可核实的。
                 // 说"改过"最多让使用者多批一次。
@@ -1400,5 +1445,182 @@ mod sync_spawn_tests {
         let (hub, errors) = super::McpHub::connect(&cfg).unwrap();
         assert!(hub.server_names().is_empty());
         assert_eq!(errors.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn discover(pages: Vec<Value>) -> Result<Vec<rmcp::model::Tool>, String> {
+        discover_with_timeout(pages, Duration::from_secs(2)).await
+    }
+
+    async fn discover_with_timeout(
+        pages: Vec<Value>,
+        timeout: Duration,
+    ) -> Result<Vec<rmcp::model::Tool>, String> {
+        let (server_io, client_io) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server_io);
+            let mut lines = BufReader::new(read).lines();
+            let mut pages = pages.into_iter();
+            let mut expected_cursor = None;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let Some(id) = request.get("id") else {
+                    continue;
+                };
+                let result = match request["method"].as_str().unwrap() {
+                    "initialize" => json!({
+                        "protocolVersion": request["params"]["protocolVersion"],
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "catalog-fixture", "version": "1"}
+                    }),
+                    "tools/list" => {
+                        assert_eq!(
+                            request["params"]["cursor"].as_str(),
+                            expected_cursor.as_deref()
+                        );
+                        let mut page = pages.next().expect("unexpected extra tools/list request");
+                        if let Some(delay) = page.as_object_mut().unwrap().remove("_testDelayMs") {
+                            tokio::time::sleep(Duration::from_millis(delay.as_u64().unwrap()))
+                                .await;
+                        }
+                        expected_cursor = page["nextCursor"].as_str().map(str::to_owned);
+                        page
+                    }
+                    method => panic!("unexpected request: {method}"),
+                };
+                let reply = json!({"jsonrpc": "2.0", "id": id, "result": result});
+                if write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = ().serve(client_io).await.unwrap();
+        let result = tokio::time::timeout(timeout, discover_tools(client.peer()))
+            .await
+            .unwrap_or_else(|_| Err("catalog deadline".into()));
+        client.cancel().await.unwrap();
+        server.await.unwrap();
+        result
+    }
+
+    fn page(names: &[&str], next: Option<&str>) -> Value {
+        let tools: Vec<Value> = names
+            .iter()
+            .map(|name| json!({"name": name, "inputSchema": {"type": "object"}}))
+            .collect();
+        let mut page = json!({"tools": tools});
+        if let Some(next) = next {
+            page["nextCursor"] = json!(next);
+        }
+        page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tools_after_the_first_page_are_discovered() {
+        let tools = discover(vec![
+            page(&["first"], Some("page-two")),
+            page(&["second"], None),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_page_with_a_cursor_does_not_end_discovery() {
+        let tools = discover(vec![page(&[], Some("next")), page(&["last"], None)])
+            .await
+            .unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "last");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_cursors_reject_the_whole_catalog() {
+        let error = discover(vec![
+            page(&["first"], Some("same")),
+            page(&["second"], Some("same")),
+        ])
+        .await
+        .unwrap_err();
+        assert!(error.contains("游标重复"), "{error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_later_invalid_page_cannot_leave_a_successful_partial_catalog() {
+        assert!(
+            discover(vec![
+                page(&["first"], Some("bad")),
+                json!({"tools": "invalid"})
+            ])
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_name_conflicts_across_pages_are_not_first_wins() {
+        let mut changed = page(&["same"], None);
+        changed["tools"][0]["inputSchema"] = json!({"type": "object", "required": ["different"]});
+        let error = discover(vec![page(&["same"], Some("next")), changed])
+            .await
+            .unwrap_err();
+        assert!(error.contains("重名"), "{error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_catalogs_fail_instead_of_truncating() {
+        let names: Vec<String> = (0..=MAX_DISCOVERED_TOOLS)
+            .map(|i| format!("tool_{i}"))
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let error = discover(vec![page(&names, None)]).await.unwrap_err();
+        assert!(error.contains("超过 4096 项"), "{error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_cursors_are_rejected_before_another_request() {
+        let error = discover(vec![page(
+            &["first"],
+            Some(&"x".repeat(MAX_TOOL_CURSOR_BYTES + 1)),
+        )])
+        .await
+        .unwrap_err();
+        assert!(error.contains("游标过长"), "{error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn endless_distinct_cursors_have_a_page_limit() {
+        let pages = (0..MAX_TOOL_PAGES)
+            .map(|i| page(&[], Some(&i.to_string())))
+            .collect();
+        let error = discover(pages).await.unwrap_err();
+        assert!(error.contains("超过 128 页"), "{error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn all_pages_share_one_deadline() {
+        let mut first = page(&["first"], Some("next"));
+        first["_testDelayMs"] = json!(80);
+        let mut second = page(&["second"], None);
+        second["_testDelayMs"] = json!(80);
+        let result = discover_with_timeout(vec![first, second], Duration::from_millis(120)).await;
+        assert_eq!(result.unwrap_err(), "catalog deadline");
     }
 }

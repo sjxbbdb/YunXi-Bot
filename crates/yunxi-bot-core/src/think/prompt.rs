@@ -20,7 +20,7 @@
 //! ┌─────────────────────────────────────┐
 //! │ 稳定段：系统提示词 + 人格 + 工具定义  │  ← 字节级稳定，跨调用完全相同
 //! ├─────────────────────────────────────┤
-//! │ 追加段：已完成步骤的历史              │  ← 只追加，绝不重写前面的
+//! │ 追加段：已完成步骤的历史              │  ← 私有界面仅保留当前有效观察
 //! ├─────────────────────────────────────┤
 //! │ 易变段：当前要问的问题                │  ← 每次不同，放最后
 //! └─────────────────────────────────────┘
@@ -40,11 +40,8 @@ use crate::memory::MemoryEntry;
 pub struct PromptLayout {
     /// 稳定前缀：系统提示词 + 人格 + 工具定义。**跨调用必须字节一致。**
     stable: String,
-    /// 追加式历史。只允许往后加，不允许改前面的。
-    ///
-    /// **唯一的例外是压缩**——它会把最老的一段换成一条摘要消息。
-    /// 那是**一次性的、有意的**前缀变更：代价是那一次缓存未命中，
-    /// 换来的是不撞上下文上限。见 [`crate::think::context`] 的模块文档。
+    /// 追加式历史；压缩替换最老的步骤，过期私有界面清除临时正文和图片。
+    /// 协议配对与持久占位保留；宁可重建缓存，也不能让旧界面冒充当前状态。
     history: Vec<Message>,
     /// 易变尾部：当前要问的问题。
     volatile: String,
@@ -86,6 +83,69 @@ fn safe_cut(history: &[Message], want: usize) -> usize {
 mod image_tests {
     use super::*;
     use crate::think::{ImageInput, Role, image::IMAGE_NOTICE};
+
+    #[test]
+    fn replacing_a_screen_also_retires_its_private_text_and_keeps_tool_pairs() {
+        let mut layout = PromptLayout::new("system");
+        layout.ask("操作临时窗口");
+        for n in 0..2 {
+            let id = format!("screen{n}");
+            layout.push_raw(Message::assistant_tool_calls(vec![serde_json::json!({
+                "id":id,"type":"function","function":{"name":"screen","arguments":"{}"}
+            })]));
+            let mut result = Message::tool_result(&id, "私有观察占位");
+            result.live_content = Some(format!("private-screen-{n}"));
+            layout.push_raw(result);
+            layout
+                .push_observation(&id, vec![ImageInput::from_bytes(b"GIF89a").unwrap()])
+                .unwrap();
+        }
+        let messages = layout.build();
+        let old = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("screen0"))
+            .unwrap();
+        let latest = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("screen1"))
+            .unwrap();
+        assert!(
+            old.live_content.is_none(),
+            "旧画面的正文也应失效，不能只移除图片"
+        );
+        assert_eq!(latest.live_content.as_deref(), Some("private-screen-1"));
+        assert_eq!(
+            messages.iter().filter(|m| m.tool_call_id.is_some()).count(),
+            2
+        );
+        assert!(
+            !serde_json::to_string(&layout)
+                .unwrap()
+                .contains("private-screen")
+        );
+    }
+
+    #[test]
+    fn reused_call_ids_do_not_retire_the_new_result_when_replacing_an_old_screen() {
+        let mut layout = PromptLayout::new("S");
+        layout.ask("test");
+        for n in 0..2 {
+            layout.push_raw(Message::assistant_tool_calls(vec![serde_json::json!({"id":"call_0","type":"function","function":{"name":"screen","arguments":"{}"}})]));
+            let mut result = Message::tool_result("call_0", "private placeholder");
+            result.live_content = Some(format!("frame-{n}"));
+            layout.push_raw(result);
+            layout
+                .push_observation("call_0", vec![ImageInput::from_bytes(b"GIF89a").unwrap()])
+                .unwrap();
+        }
+        let results: Vec<_> = layout
+            .history
+            .iter()
+            .filter(|m| m.tool_call_id.is_some())
+            .collect();
+        assert!(results[0].live_content.is_none());
+        assert_eq!(results[1].live_content.as_deref(), Some("frame-1"));
+    }
 
     #[test]
     fn images_survive_tool_roundtrips_and_followups_without_entering_saved_json() {
@@ -208,6 +268,88 @@ mod image_tests {
 }
 
 impl PromptLayout {
+    pub(crate) fn clear_tool_continuations(&mut self) {
+        for message in &mut self.history {
+            message.live_reasoning = None;
+            if message.role == super::Role::Assistant && !message.tool_calls.is_empty() {
+                message.live_content = None;
+            }
+        }
+    }
+
+    /// 旧画面的文字和图片一同退役，保留协议配对和用户附图。
+    pub fn retire_private_tool_results(&mut self, tool: &str) {
+        let mut ids = std::collections::BTreeSet::new();
+        let mut results = Vec::new();
+        for (index, message) in self.history.iter().enumerate() {
+            if !message.tool_calls.is_empty() {
+                ids = message
+                    .tool_calls
+                    .iter()
+                    .filter(|call| call["function"]["name"].as_str() == Some(tool))
+                    .filter_map(|call| call["id"].as_str())
+                    .collect();
+            }
+            if message
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| ids.contains(id))
+            {
+                results.push(index);
+            }
+        }
+        for index in results {
+            self.retire_tool_result(index);
+        }
+        self.retire_screen_images();
+    }
+
+    fn retire_tool_result(&mut self, index: usize) {
+        let id = self.history[index].tool_call_id.clone();
+        self.history[index].live_content = None;
+        // A call ID can repeat in a later assistant turn; only retire this pair.
+        if let Some(assistant) = self.history[..index]
+            .iter_mut()
+            .rev()
+            .find(|m| !m.tool_calls.is_empty())
+            && assistant
+                .tool_calls
+                .iter()
+                .any(|call| call["id"].as_str() == id.as_deref())
+        {
+            assistant.live_tool_calls.clear();
+        }
+    }
+
+    fn retire_screen_images(&mut self) {
+        let results: Vec<_> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| is_observation(m))
+            .filter_map(|(index, m)| {
+                let id = m
+                    .content
+                    .strip_prefix("【工具观察】来自工具调用 ")?
+                    .split_once(' ')?
+                    .0;
+                self.history[..index]
+                    .iter()
+                    .rposition(|m| m.tool_call_id.as_deref() == Some(id))
+            })
+            .collect();
+        for index in results {
+            self.retire_tool_result(index);
+        }
+        for old in &mut self.history {
+            if is_observation(old) && !old.images.is_empty() {
+                old.images.clear();
+                old.content
+                    .push_str("\n【该截图已失效，被更新的工具观察取代】");
+            }
+        }
+    }
+
     /// 只保留最新一帧，旧帧留下明确失效标记；不挤掉用户附图。
     pub fn push_observation(
         &mut self,
@@ -226,13 +368,7 @@ impl PromptLayout {
                 .filter(|m| !is_observation(m))
                 .chain(std::iter::once(&message)),
         )?;
-        for old in &mut self.history {
-            if is_observation(old) && !old.images.is_empty() {
-                old.images.clear();
-                old.content
-                    .push_str("\n【该截图已失效，被更新的工具观察取代】");
-            }
-        }
+        self.retire_screen_images();
         // The fixed marker survives serialization, so restored frames never count as human turns.
         message.tool_call_id = None;
         self.push_raw(message);
@@ -1550,6 +1686,7 @@ mod history_tail_tests {
             images: Vec::new(),
             live_content: None,
             live_tool_calls: Vec::new(),
+            live_reasoning: None,
             tool_calls: vec![serde_json::json!({"id": "c1", "type": "function",
                 "function": {"name": "t", "arguments": "{}"}})],
             tool_call_id: None,
@@ -1562,6 +1699,7 @@ mod history_tail_tests {
             images: Vec::new(),
             live_content: None,
             live_tool_calls: Vec::new(),
+            live_reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("c1".to_string()),
         }

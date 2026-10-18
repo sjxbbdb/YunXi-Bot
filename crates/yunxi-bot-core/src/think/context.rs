@@ -270,7 +270,10 @@ pub fn message_chars(m: &Message) -> usize {
         .unwrap_or(&m.content)
         .chars()
         .count()
-        + m.images.len() * 1024 * CHARS_PER_TOKEN;
+        + m.images.len() * 1024 * CHARS_PER_TOKEN
+        + m.live_reasoning
+            .as_deref()
+            .map_or(0, |text| text.chars().count());
     for tc in if m.live_tool_calls.is_empty() {
         &m.tool_calls
     } else {

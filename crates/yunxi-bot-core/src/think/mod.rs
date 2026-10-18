@@ -70,6 +70,9 @@ pub struct Message {
     pub live_content: Option<String>,
     #[serde(skip)]
     pub live_tool_calls: Vec<serde_json::Value>,
+    /// Provider continuation is transient protocol data, never persisted or displayed.
+    #[serde(skip)]
+    pub live_reasoning: Option<String>,
     /// 助手请求调用的工具。只出现在助手消息上。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<serde_json::Value>,
@@ -100,6 +103,7 @@ impl Message {
             images: Vec::new(),
             live_content: None,
             live_tool_calls: Vec::new(),
+            live_reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -111,6 +115,7 @@ impl Message {
             images: Vec::new(),
             live_content: None,
             live_tool_calls: Vec::new(),
+            live_reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -132,6 +137,7 @@ impl Message {
             images: Vec::new(),
             live_content: None,
             live_tool_calls: Vec::new(),
+            live_reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -145,6 +151,7 @@ impl Message {
             images: Vec::new(),
             live_content: None,
             live_tool_calls: Vec::new(),
+            live_reasoning: None,
             tool_calls,
             tool_call_id: None,
         }
@@ -158,6 +165,7 @@ impl Message {
             images: Vec::new(),
             live_content: None,
             live_tool_calls: Vec::new(),
+            live_reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
         }

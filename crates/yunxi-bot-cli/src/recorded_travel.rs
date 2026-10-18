@@ -501,6 +501,34 @@ struct RecordedTool {
     inner: yunxi_bot_core::tool::computer::ComputerTool,
     scope: Arc<Mutex<Scope>>,
 }
+impl RecordedTool {
+    fn scope_rejection(&self, args: &Value) -> Option<String> {
+        if self.name() != "computer_act"
+            || !matches!(
+                args["operation"].as_str(),
+                Some("browser_click" | "browser_type" | "browser_navigate" | "browser_pointer")
+            )
+        {
+            return None;
+        }
+        let scope = self.scope.lock().unwrap();
+        if !scope.bound(&args["arguments"]) {
+            return Some("test_scope_binding_mismatch：本轮查询已获授权，但动作的target_id/tab_id未匹配最新实际绑定，不是用户拒绝。重新get_browser_state核对返回的精确target_id及实际tab_id，再读该标签后使用最新ref；不得猜标识、扩大窗口或请求重复授权。".into());
+        }
+        if scope.current_page() == Page::Checkout
+            && args["operation"] == "browser_click"
+            && scope.node(&args["arguments"]).is_some_and(|node| {
+                (matches!(node["role"].as_str(), Some("checkbox" | "labeltext"))
+                    || (node["role"] == "statictext" && scope.named_passenger(node)))
+                    && !scope.passenger_control(node)
+            })
+        {
+            return Some("test_scope_passenger_context_required：尚无法将此复选框关联到用户已明确的本人，不是用户拒绝。姓名与复选框分离时，用实际乘车人listitem的scope_ref读取完整子树；必须只有一人、一复选框及姓名标签，再用新ref。不能按列表顺序、坐标或动作目的推断人员。".into());
+        }
+        (scope.current_page() == Page::Query && !scope.permitted(args)).then(||
+                "test_scope_action_unmatched：本轮查询已获授权，但该动作/ref/路径未匹配有限测试守卫，不是用户拒绝。不支持坐标或猜测路径，先重新观察当前实际控件与actions；无可用的已接入路径时明确报告适配限制，不要求用户重复授权。".into())
+    }
+}
 impl Tool for RecordedTool {
     fn name(&self) -> &str {
         self.inner.name()
@@ -525,28 +553,21 @@ impl Tool for RecordedTool {
         self.inner.fresh_approval()
     }
     fn preflight_rejection(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
-        self.inner.preflight_rejection(args, ctx).or_else(|| {
-            if self.name() != "computer_act"
-                || !matches!(args["operation"].as_str(), Some("browser_click" | "browser_type" | "browser_navigate" | "browser_pointer"))
-            {
-                return None;
-            }
-            let scope = self.scope.lock().unwrap();
-            if !scope.bound(&args["arguments"]) {
-                return Some("test_scope_binding_mismatch：本轮查询已获授权，但动作的target_id/tab_id未匹配最新实际绑定，不是用户拒绝。重新get_browser_state核对返回的精确target_id及实际tab_id，再读该标签后使用最新ref；不得猜标识、扩大窗口或请求重复授权。".into());
-            }
-            if scope.current_page() == Page::Checkout
-                && args["operation"] == "browser_click"
-                && scope.node(&args["arguments"]).is_some_and(|node| (matches!(node["role"].as_str(), Some("checkbox" | "labeltext")) || (node["role"] == "statictext" && scope.named_passenger(node))) && !scope.passenger_control(node))
-            {
-                return Some("test_scope_passenger_context_required：尚无法将此复选框关联到用户已明确的本人，不是用户拒绝。姓名与复选框分离时，用实际乘车人listitem的scope_ref读取完整子树；必须只有一人、一复选框及姓名标签，再用新ref。不能按列表顺序、坐标或动作目的推断人员。".into());
-            }
-            (scope.current_page() == Page::Query && !scope.permitted(args)).then(||
-                "test_scope_action_unmatched：本轮查询已获授权，但该动作/ref/路径未匹配有限测试守卫，不是用户拒绝。不支持坐标或猜测路径，先重新观察当前实际控件与actions；无可用的已接入路径时明确报告适配限制，不要求用户重复授权。".into())
-        })
+        self.scope_rejection(args)
+            .or_else(|| self.inner.preflight_rejection(args, ctx))
     }
+
     fn private_io(&self) -> bool {
         self.inner.private_io()
+    }
+    fn interaction_group(&self) -> Option<&'static str> {
+        self.inner.interaction_group()
+    }
+    fn requires_user_choice(&self) -> bool {
+        self.inner.requires_user_choice()
+    }
+    fn reset_observation(&self) -> Result<(), ToolError> {
+        self.inner.reset_observation()
     }
     fn audit_arguments(&self, args: &Value) -> Value {
         self.inner.audit_arguments(args)
@@ -734,23 +755,22 @@ fn mismatched_browser_binding_reports_a_test_guard_error_before_human_approval()
         .find(|t| t.name() == "computer_act")
         .unwrap();
     let tool = RecordedTool { inner, scope };
-    let ctx = ToolContext::new(".", yunxi_bot_core::SandboxMode::WorkspaceWrite);
     let mut req = json!({"operation":"browser_click","arguments":{"target_id":"wrong","tab_id":"tab","ref":"r"}});
-    let reason = tool.preflight_rejection(&req, &ctx).unwrap();
+    let reason = tool.scope_rejection(&req).unwrap();
     assert!(reason.starts_with("test_scope_binding_mismatch"));
     assert!(reason.contains("不是用户拒绝"));
     assert!(!reason.contains("wrong"));
     req["arguments"]["target_id"] = json!("t");
-    assert!(tool.preflight_rejection(&req, &ctx).is_none());
+    assert!(tool.scope_rejection(&req).is_none());
     req["arguments"]["ref"] = json!("unseen");
     assert!(
-        tool.preflight_rejection(&req, &ctx)
+        tool.scope_rejection(&req)
             .unwrap()
             .starts_with("test_scope_action_unmatched")
     );
     req["arguments"]["ref"] = json!("r");
     req["arguments"]["tab_id"] = json!("other");
-    assert!(tool.preflight_rejection(&req, &ctx).is_some());
+    assert!(tool.scope_rejection(&req).is_some());
     req["arguments"]["tab_id"] = json!("tab");
     {
         let mut scope = tool.scope.lock().unwrap();
@@ -758,7 +778,7 @@ fn mismatched_browser_binding_reports_a_test_guard_error_before_human_approval()
         scope.frame["refs"][0] = json!({"ref":"r","role":"checkbox","name":"按空格键进行操作"});
     }
     assert!(
-        tool.preflight_rejection(&req, &ctx)
+        tool.scope_rejection(&req)
             .unwrap()
             .starts_with("test_scope_passenger_context_required")
     );
@@ -768,7 +788,7 @@ fn mismatched_browser_binding_reports_a_test_guard_error_before_human_approval()
         scope.frame["refs"][0] = json!({"ref":"r","role":"statictext","name":"合成乘客甲(学生)"});
     }
     assert!(
-        tool.preflight_rejection(&req, &ctx)
+        tool.scope_rejection(&req)
             .unwrap()
             .starts_with("test_scope_passenger_context_required")
     );

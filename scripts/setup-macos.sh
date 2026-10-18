@@ -64,6 +64,7 @@ fi
 
 echo "[4/4] 构建 Apple 平台原生程序"
 bash scripts/build-macos-tools.sh
+"$PYTHON_BIN" scripts/build-macos-computer.py
 cargo build --release --locked
 echo "环境就绪。数据目录：$YUNXI_BOT_HOME"
 echo "启动对话：./启动.command"

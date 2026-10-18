@@ -1,2 +1,4 @@
 # 上游源码保留来源，不计入云熙自身的语言统计。
 /third_party/cua/** linguist-vendored=true
+
+/third_party/browser-use/** linguist-vendored=true

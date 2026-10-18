@@ -151,13 +151,6 @@ fn quote(i: &Request, frame: Option<&Frame>, epoch: &str, require_terms: bool) -
     Ok(json!({"kind":q.kind,"selection":q.selection,"dates":q.dates,"party":q.party}))
 }
 
-fn url(frame: &Frame) -> &str {
-    frame.arguments["page"]["url"]
-        .as_str()
-        .or_else(|| frame.arguments["url"].as_str())
-        .unwrap_or("")
-}
-
 fn platform(url: &str, kind: &str, checkout: bool) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
@@ -183,9 +176,9 @@ fn submit_name(kind: &str, name: &str) -> bool {
 }
 
 pub(super) fn is_submission(frame: &Frame, input: &Input) -> bool {
-    let kind = if platform(url(frame), "hotel", true) {
+    let kind = if platform(page_url(frame), "hotel", true) {
         "hotel"
-    } else if platform(url(frame), "rail", true) {
+    } else if platform(page_url(frame), "rail", true) {
         "rail"
     } else {
         return false;
@@ -218,7 +211,7 @@ pub(super) fn prepare(
     }
     let mut identity = quote(&i, frame, epoch, true)?;
     let frame = frame.ok_or_else(|| bad("先观察实际结算页面"))?;
-    if !platform(url(frame), &i.quote.kind, true) {
+    if !platform(page_url(frame), &i.quote.kind, true) {
         return Err(bad("未绑定受支持平台的实际结算页，不执行跳转或提交"));
     }
     let node = frame.arguments["refs"]
@@ -282,7 +275,7 @@ pub(super) fn prepare(
         valid_until,
         preview: format!(
             "真实下单核对（网页摘录匹配，不是供应商API校验，仍须人工核对所选项/总金额/条款）\n平台：{}\n产品：{}\n日期：{}\n{}\n人员/数量：{}\n全部应付金额：{}\n退改/取消：{}\n实际提交控件：{}\n可能占用库存并产生取消费用。本次不授权支付。",
-            url(frame),
+            page_url(frame),
             q.selection,
             q.dates.join(" / "),
             date_source,
@@ -324,7 +317,7 @@ pub(super) fn read_order(args: &Value, frame: Option<&Frame>, epoch: &str) -> Re
         .as_deref()
         .ok_or_else(|| bad("订单状态缺失，继续查订单"))?;
     if i.reference.is_some()
-        || !platform(url(frame), &i.quote.kind, false)
+        || !platform(page_url(frame), &i.quote.kind, false)
         || !(6..=64).contains(&id.len())
         || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
         || !frame
@@ -351,7 +344,7 @@ pub(super) fn read_order(args: &Value, frame: Option<&Frame>, epoch: &str) -> Re
     Ok(
         json!({"order_id":id,"state":state,"status_text":status,"paid":paid,
         "payment_status":if paid {"paid"} else if state=="pending_payment" {"unpaid"} else {"unknown"},
-        "source_url":url(frame),"quote":{"kind":i.quote.kind,"selection":i.quote.selection,"dates":i.quote.dates,"party":i.quote.party,"total":i.quote.total},"observation_id":i.observation_id,
+        "source_url":page_url(frame),"quote":{"kind":i.quote.kind,"selection":i.quote.selection,"dates":i.quote.dates,"party":i.quote.party,"total":i.quote.total},"observation_id":i.observation_id,
         "schedule_ready":false,"next_step":if state=="pending_payment" {"已查到待支付订单；付款由用户接管，不能标为已出票/已确认住宿。"} else {"仅回读本次网页状态；日程仍须核对真实行程，mac_trip_plan/apply审批写入，不自动付款、取消或退款。"}}),
     )
 }
