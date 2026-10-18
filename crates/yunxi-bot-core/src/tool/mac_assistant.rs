@@ -117,6 +117,9 @@ impl Tool for AssistantTool {
     fn parameters(&self) -> Value {
         self.parameters.clone()
     }
+    fn private_io(&self) -> bool {
+        matches!(self.name.as_str(), "mac_location" | "mac_weather")
+    }
     fn capability(&self) -> Capability {
         self.capability
     }
@@ -178,6 +181,19 @@ mod tests {
         tool::{GateDecision, ToolPolicy, gate},
     };
 
+    #[test]
+    fn location_and_weather_do_not_persist_coordinates_in_tool_history() {
+        let tools = tools().unwrap();
+        for name in ["mac_location", "mac_weather"] {
+            assert!(
+                tools
+                    .iter()
+                    .find(|t| t.name() == name)
+                    .unwrap()
+                    .private_io()
+            );
+        }
+    }
     #[test]
     fn malformed_native_arguments_fail_before_any_system_access() {
         let tools = tools().unwrap();

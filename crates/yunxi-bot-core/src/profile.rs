@@ -43,9 +43,8 @@ pub const PROFILE_FILE: &str = "profile.md";
 /// **必须有上限**：它进稳定前缀，而且每轮都发。一份 200KB 的"自我介绍"
 /// 会把前缀和预算一起毁掉。
 ///
-/// 比项目规则的 32KB 小得多——规则是项目级的、可能很长；画像是
-/// "你希望它怎么理解你"，几句话就够，写不下的该进记忆。
-pub const MAX_PROFILE_BYTES: usize = 8 * 1024;
+/// 为完整的已确认画像和后续追加留出空间，同时约束每轮稳定前缀的成本。
+pub const MAX_PROFILE_BYTES: usize = 32 * 1024;
 
 /// 一份画像。
 #[derive(Debug, Clone)]

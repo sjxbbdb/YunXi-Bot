@@ -130,3 +130,21 @@ code actually migrated can be traced to its origin.
     YunXi does not adopt ambiguous-first-match or fixed-delay fallbacks.
     Playwright's locator/codegen/actionability documentation also informed the
     independently implemented browser workflow module; attribution in item 13.
+
+16. Companion and memory design references (no upstream code or runtime bundled):
+    SillyTavern/SillyTavern, AGPL-3.0,
+      06bde939fb1e9c4c8d8641d810f0a916b5bce127 — scoped context and summary revision.
+    moeru-ai/airi, MIT,
+      461d34ac1f1a0db55f10c7d05c41558a39724f5a — shared persona and source-marked notices.
+    letta-ai/letta-code, Apache-2.0,
+      7be3c81f9cfce481994fe4484d59a5bf17cdb48a — bounded background memory reflection.
+    mem0ai/mem0, Apache-2.0,
+      0724291bd864cf807e88ee8981c8226644e8fb42 — scoped extraction and deduplication.
+    getzep/graphiti, Apache-2.0,
+      417c3a125ae3ac53c19b8e53fffaccf3e665a88e — source and temporal validity.
+    Open-LLM-VTuber/Open-LLM-VTuber, MIT,
+      992309c0aa19845960228f880013d4685fde93b5 — distinguish generated from delivered content.
+    Fixed source links, licensing notes and limitations are documented in
+    docs/陪伴与记忆开源参考及重构建议-20261018.md.
+    YunXi independently implements these concepts with its existing ledger,
+    model client and Mac tools; no framework, vector database or graph DB added.

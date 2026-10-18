@@ -79,7 +79,7 @@ func validate(_ action: String, _ args: [String: Any]) throws {
         let start = try date(text(args, "start")), end = try date(text(args, "end"))
         guard end > start, end.timeIntervalSince(start) <= 31 * 86400 else { throw Failure("bad_args", "结束必须晚于开始，跨度最多 31 天") }
     }
-    if action == "authorize", !["calendar", "reminders", "contacts", "mail", "notifications"].contains(try text(args, "target")) { throw Failure("bad_args", "target 只接受 calendar/reminders/contacts/mail/notifications") }
+    if action == "authorize", !["calendar", "reminders", "contacts", "mail", "notifications", "location"].contains(try text(args, "target")) { throw Failure("bad_args", "target 只接受 calendar/reminders/contacts/mail/notifications/location") }
 }
 
 @MainActor
@@ -214,11 +214,13 @@ final class Bridge {
             var result = status()
             result["notification"] = await NativeNotifications.status()
             result["contacts"] = AssistantBridge.contactsStatus()
+            result["location"] = await NativeLocation.status()
             result["mail"] = await AssistantBridge.mailPermission(ask: false)
             result["mail_write_scope"] = "approved_message_changes; yunxi_local_drafts; approved_send_via_mail"
             return result
         }
         if action == "authorize" {
+            if try text(args, "target") == "location" { return try await NativeLocation().run(authorize: true) }
             if try text(args, "target") == "notifications" { return try await NativeNotifications.authorize() }
             if ["contacts", "mail"].contains(try text(args, "target")) { return try await AssistantBridge.authorize(text(args, "target")) }
             let kind: EKEntityType = try text(args, "target") == "calendar" ? .event : .reminder
@@ -308,7 +310,7 @@ final class Bridge {
           !reminderMatches(notes: "day-1 task", completed: true, args: ["notes_prefix":"day-1"]) else { throw Failure("test_failed", "待办前缀或完成状态过滤错误") }
     print("native validation self-test: 13 passed")
     let definitions = try assistantDefinitions()
-    guard definitions.count == 19 else { throw Failure("test_failed", "工具目录数目错误") }
+    guard definitions.count == 20 else { throw Failure("test_failed", "工具目录数目错误") }
     for definition in definitions {
         guard let schema = definition["parameters"] as? [String: Any] else { throw Failure("test_failed", "工具schema缺失") }
         do { try validateAssistant(["execute": "x"], schema); throw Failure("test_failed", "未知参数未拒绝") }
@@ -326,7 +328,8 @@ final class Bridge {
     try Data([0,1,2]).write(to: temp)
     do { _ = try AssistantBridge.document(["path":temp.path]); throw Failure("test_failed", "二进制附件未拒绝") }
     catch let error as Failure where error.code == "unsupported" { }
-    print("assistant validation self-test: 23 passed")
+    print("assistant validation self-test: 24 passed")
+    try NativeLocation.selfTest()
 }
 
 @main struct Main {

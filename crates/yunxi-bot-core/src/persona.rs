@@ -44,10 +44,10 @@ pub const PERSONA_FILE: &str = "persona.md";
 
 /// 人格正文的字节上限。
 ///
-/// 比画像的 8KB 大——人格是"这个助理是谁"的完整设定，本来就该写得下。
+/// 容纳经使用者确认的完整人格，避免为旧 16 KiB 上限删减原文。
 /// 但不能无限：**它进稳定前缀而且每轮都发**，一份 200KB 的人格
 /// 会把前缀和预算一起毁掉。
-pub const MAX_PERSONA_BYTES: usize = 16 * 1024;
+pub const MAX_PERSONA_BYTES: usize = 32 * 1024;
 
 /// 名字的长度上限。
 ///

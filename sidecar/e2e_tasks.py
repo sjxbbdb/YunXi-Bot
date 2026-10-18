@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from e2e_common import ensure_fresh_binary  # noqa: E402
 
-LEDGER_HEADER = {"yunxi_bot_ledger": 1}
+LEDGER_HEADER = {"yunxi_bot_ledger": 2}
 
 
 def seq_events(events: list[dict]) -> list[str]:

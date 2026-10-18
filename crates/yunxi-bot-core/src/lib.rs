@@ -21,6 +21,7 @@ pub mod agent;
 /// 抄两份的话两边迟早漂移，而漂移的表现是"手动跑没问题，常驻跑出问题"。
 pub mod assistant;
 pub mod companion;
+pub mod continuity;
 pub mod costlog;
 pub mod decide;
 pub mod diff;

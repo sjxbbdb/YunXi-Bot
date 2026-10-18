@@ -61,7 +61,7 @@ fn tool_selection_fixture_and_scorer_reject_missing_wrong_and_changed_calls() {
 }
 
 #[test]
-#[ignore = "Explicit DeepSeek selection benchmark, all 58 schemas, synthetic context, no tool execution"]
+#[ignore = "Explicit DeepSeek selection benchmark, all 61 schemas, synthetic context, no tool execution"]
 fn live_full_catalog_model_selection() {
     let home = PathBuf::from(std::env::var("YUNXI_TEST_HOME").expect("credential home"));
     let out = PathBuf::from(std::env::var("YUNXI_SELECTION_REPORT").expect("new report path"));
@@ -74,7 +74,7 @@ fn live_full_catalog_model_selection() {
     drop(file);
     let registry = crate::tooling::default_registry(&home).unwrap();
     let specs = registry.specs();
-    assert_eq!(specs.len(), 58);
+    assert_eq!(specs.len(), 61);
     let mut cfg = ThinkerConfig::deepseek();
     cfg.timeout = std::time::Duration::from_secs(60);
     let model = OpenAiThinker::from_home(&home, cfg).unwrap();

@@ -87,7 +87,7 @@ def main():
             credentials(agent_home)
             event = dict(seq=1, at=int(time.time()*1000), kind='job_failed', job='备份',
                          data={'error': '测试情景：备份目录不存在，请检查路径'})
-            (agent_home / 'ledger.jsonl').write_text(json.dumps({'yunxi_bot_ledger': 1})+'\n'+json.dumps(event, ensure_ascii=False)+'\n')
+            (agent_home / 'ledger.jsonl').write_text(json.dumps({'yunxi_bot_ledger': 2})+'\n'+json.dumps(event, ensure_ascii=False)+'\n')
             r = run('companion_expression', ['agent', '--hour', '12', '--endpoint',
                 f'http://127.0.0.1:{server.server_port}/decide'], state=agent_home)
             report['checks']['companion_spoke_with_deepseek'] = r.returncode == 0 and model in r.stdout and '--- 它开口了 ---' in r.stdout

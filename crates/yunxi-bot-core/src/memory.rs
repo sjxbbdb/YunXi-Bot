@@ -205,9 +205,17 @@ pub struct MemoryEntry {
     ///
     /// `None` = **无作用域**，在哪儿都能召回。
     pub scope: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub source_seq: Option<u64>,
 }
 
 impl MemoryEntry {
+    pub fn is_active(&self, now: u64) -> bool {
+        self.expires_at.is_none_or(|end| now < end)
+    }
+
     /// 排序用的有效分数：权重优先，同权重看新近度。
     fn score(&self, now_ms: u64) -> f64 {
         let age_days = (now_ms.saturating_sub(self.last_used_at.unwrap_or(self.created_at)) as f64)
@@ -272,6 +280,12 @@ struct RecordedPayload {
     /// 就让旧记录读不出来。**
     #[serde(default)]
     scope: Option<String>,
+    #[serde(default)]
+    expires_at: Option<u64>,
+    #[serde(default)]
+    source_seq: Option<u64>,
+    #[serde(default)]
+    supersedes: Option<String>,
 }
 
 fn one() -> f64 {
@@ -301,6 +315,9 @@ impl Memory {
                     if id.is_empty() {
                         continue;
                     }
+                    if let Some(old) = &p.supersedes {
+                        mem.entries.remove(old);
+                    }
                     mem.entries.insert(
                         id.clone(),
                         MemoryEntry {
@@ -310,6 +327,8 @@ impl Memory {
                             weight: p.weight.clamp(0.0, 10.0),
                             created_at: e.at,
                             last_used_at: None,
+                            expires_at: p.expires_at,
+                            source_seq: p.source_seq,
                             // 只有 `Workspace` 类带作用域。别的类即使事件里
                             // 写了 scope 也丢掉——关于"这个人"的记忆
                             // 不该跟着目录走。
@@ -364,7 +383,11 @@ impl Memory {
     /// 分类别是为了**能核对分层对不对**——比如"这条明明是偏好，
     /// 怎么记成事实了"。
     pub fn all_sorted(&self, now_ms: u64) -> Vec<&MemoryEntry> {
-        let mut v: Vec<&MemoryEntry> = self.entries.values().collect();
+        let mut v: Vec<&MemoryEntry> = self
+            .entries
+            .values()
+            .filter(|e| e.is_active(now_ms))
+            .collect();
         v.sort_by(|a, b| {
             a.kind.cmp(&b.kind).then_with(|| {
                 b.score(now_ms)
@@ -417,13 +440,19 @@ impl Memory {
         use crate::embedding::{CHANNEL_DEPTH, RRF_K, embed_with_idf, lexical_overlap, rrf_fuse};
 
         // 语料 = 全部记忆的正文。IDF 要它来算"哪些字到处都是"。
-        let idf = crate::embedding::Idf::fit(self.entries.values().map(|e| e.text.as_str()));
+        let idf = crate::embedding::Idf::fit(
+            self.entries
+                .values()
+                .filter(|e| e.is_active(now_ms))
+                .map(|e| e.text.as_str()),
+        );
 
         // 定序的载体：`self.entries` 是 BTreeMap，遍历顺序按 id，
         // **是确定的**——所以下标能稳定地代表某一条。
         let items: Vec<&MemoryEntry> = self
             .entries
             .values()
+            .filter(|e| e.is_active(now_ms))
             .filter(|e| match (e.kind, e.scope.as_deref()) {
                 // 工作目录记忆：**只有当前目录对得上才给**。
                 // 没有作用域的 `Workspace` 记忆是坏数据（记的时候一定会填），
@@ -613,6 +642,7 @@ impl Memory {
         let mut v: Vec<&MemoryEntry> = self
             .entries
             .values()
+            .filter(|e| e.expires_at.is_none())
             .filter(|e| matches!(e.kind, MemoryKind::Fact | MemoryKind::Preference))
             .collect();
         v.sort_by(|a, b| {
@@ -681,7 +711,11 @@ impl Memory {
 
     /// 按类别召回，按有效分数降序。
     pub fn recall(&self, kind: MemoryKind, now_ms: u64, limit: usize) -> Vec<&MemoryEntry> {
-        let mut v: Vec<&MemoryEntry> = self.entries.values().filter(|e| e.kind == kind).collect();
+        let mut v: Vec<&MemoryEntry> = self
+            .entries
+            .values()
+            .filter(|e| e.kind == kind && e.is_active(now_ms))
+            .collect();
         v.sort_by(|a, b| {
             b.score(now_ms)
                 .partial_cmp(&a.score(now_ms))

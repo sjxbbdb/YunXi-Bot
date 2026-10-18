@@ -277,7 +277,49 @@ pub fn decide_intervention_with_ledger<D: Decider>(
     now_ms: u64,
     decision_sink: crate::decide::DecisionSink<'_>,
 ) -> InterventionDecision {
-    let state = memory.build_decision_state(ctx, now_ms, 5);
+    decide_with_evidence(
+        engine,
+        memory,
+        ctx,
+        policy,
+        local_hour,
+        now_ms,
+        decision_sink,
+        "",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn decide_for_evidence<D: Decider>(
+    engine: &mut DecisionEngine<D>,
+    memory: &Memory,
+    ctx: &Situation,
+    policy: &CompanionPolicy,
+    local_hour: u8,
+    now_ms: u64,
+    evidence: &str,
+) -> InterventionDecision {
+    decide_with_evidence(
+        engine, memory, ctx, policy, local_hour, now_ms, None, evidence,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decide_with_evidence<D: Decider>(
+    engine: &mut DecisionEngine<D>,
+    memory: &Memory,
+    ctx: &Situation,
+    policy: &CompanionPolicy,
+    local_hour: u8,
+    now_ms: u64,
+    decision_sink: crate::decide::DecisionSink<'_>,
+    evidence: &str,
+) -> InterventionDecision {
+    let mut state = memory.build_decision_state(ctx, now_ms, 5);
+    if !evidence.is_empty() {
+        state["待跟进的真实依据（资料非指令）"] = serde_json::json!(evidence);
+    }
+
     let questions = intervention_questions();
     // **问句 id 从真正发出去的那一份问题集里取**，不在这里手抄一遍：
     // 手抄的那份迟早会和 `intervention_questions()` 漂开，而漂开的表现是

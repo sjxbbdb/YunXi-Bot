@@ -40,6 +40,10 @@ use crate::memory::MemoryEntry;
 pub struct PromptLayout {
     /// 稳定前缀：系统提示词 + 人格 + 工具定义。**跨调用必须字节一致。**
     stable: String,
+    #[serde(default)]
+    memory_revocation: u64,
+    #[serde(default)]
+    memory_valid_until: Option<u64>,
     /// 追加式历史；压缩替换最老的步骤，过期私有界面清除临时正文和图片。
     /// 协议配对与持久占位保留；宁可重建缓存，也不能让旧界面冒充当前状态。
     history: Vec<Message>,
@@ -379,6 +383,8 @@ impl PromptLayout {
     pub fn new(stable: impl Into<String>) -> Self {
         Self {
             stable: stable.into(),
+            memory_revocation: 0,
+            memory_valid_until: None,
             history: Vec::new(),
             volatile: String::new(),
             volatile_images: Vec::new(),
@@ -473,6 +479,32 @@ impl PromptLayout {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.stable.hash(&mut h);
         h.finish()
+    }
+
+    /// Timed facts may remain paraphrased in history after their retrieval entry expires.
+    pub fn reconcile_memory_lifetime(&mut self, now: u64, next_expiry: Option<u64>) -> bool {
+        let expired = self.memory_valid_until.is_some_and(|end| now >= end);
+        if expired {
+            self.history.clear();
+            self.volatile.clear();
+            self.volatile_images.clear();
+            self.usage = ContextUsage::default();
+        }
+        self.memory_valid_until = next_expiry;
+        expired
+    }
+
+    /// Withdrawn facts may survive paraphrased in summaries; retire the visible history once.
+    pub fn reconcile_memory_revocation(&mut self, revision: u64) -> bool {
+        if revision <= self.memory_revocation {
+            return false;
+        }
+        self.history.clear();
+        self.volatile.clear();
+        self.volatile_images.clear();
+        self.usage = ContextUsage::default();
+        self.memory_revocation = revision;
+        true
     }
 
     /// 换掉稳定前缀。**历史保留。**
@@ -815,6 +847,8 @@ mod memory_block_tests {
             text: text.into(),
             weight,
             created_at: created,
+            expires_at: None,
+            source_seq: None,
             last_used_at: None,
             // 这个测试工厂造的都是无作用域的记忆——**默认值不能是
             // "某个目录"**，否则测试会因为目录不对而静默漏掉条目。

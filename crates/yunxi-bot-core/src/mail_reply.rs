@@ -347,7 +347,12 @@ fn context(
         Ok(raw) if raw.len() <= crate::profile::MAX_PROFILE_BYTES => {
             String::from_utf8(raw).map_err(|_| "画像不是UTF-8")?
         }
-        Ok(_) => return Err("画像超过8192字节，未截断拟回复".into()),
+        Ok(_) => {
+            return Err(format!(
+                "画像超过{}字节，未截断拟回复",
+                crate::profile::MAX_PROFILE_BYTES
+            ));
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(_) => return Err("画像读取失败，未静默省略".into()),
     };

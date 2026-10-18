@@ -21,7 +21,7 @@ use crate::{CoreError, now_millis};
 /// 当前台账格式版本。
 ///
 /// 变更格式时必须**新增相邻迁移**（vN → vN+1），不可跳版、不可重命名。
-pub const LEDGER_FORMAT_VERSION: u32 = 1;
+pub const LEDGER_FORMAT_VERSION: u32 = 2;
 
 /// 台账文件头。第一行固定是它。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +126,12 @@ pub enum EventKind {
     FeedbackRecorded,
 
     // —— 记忆（由 memory::Memory::from_events 投影）——
+    /// Only the real owner input enters this stream, never tool or prompt text.
+    ConversationObserved,
+    MemoryProposed,
+    MemoryProposalResolved,
+    CompanionFollowupChanged,
+    CompanionGenerated,
     MemoryRecorded,
     MemoryReinforced,
     MemoryForgotten,
@@ -325,7 +331,7 @@ impl Ledger {
                 .map_err(|e| LedgerError::Io(e.to_string()))?;
             let header: Header = serde_json::from_str(&head)
                 .map_err(|e| LedgerError::Format(format!("头部不可解析: {e}")))?;
-            if header.yunxi_bot_ledger != LEDGER_FORMAT_VERSION {
+            if !matches!(header.yunxi_bot_ledger, 1 | LEDGER_FORMAT_VERSION) {
                 return Err(LedgerError::Format(format!(
                     "不支持的台账版本 {}，本程序只支持 {}",
                     header.yunxi_bot_ledger, LEDGER_FORMAT_VERSION
@@ -339,6 +345,8 @@ impl Ledger {
                 let ev: Event = serde_json::from_str(&line).map_err(|e| {
                     LedgerError::Format(format!("第 {} 条事件不可解析: {e}", i + 1))
                 })?;
+                crate::continuity::validate_payload(ev.kind, &ev.data)
+                    .map_err(LedgerError::Format)?;
                 events.push(ev);
             }
         }
@@ -431,7 +439,7 @@ impl Ledger {
             let head = head.map_err(|e| LedgerError::Io(e.to_string()))?;
             let header: Header = serde_json::from_str(&head)
                 .map_err(|e| LedgerError::Format(format!("头部不可解析: {e}")))?;
-            if header.yunxi_bot_ledger != LEDGER_FORMAT_VERSION {
+            if !matches!(header.yunxi_bot_ledger, 1 | LEDGER_FORMAT_VERSION) {
                 return Err(LedgerError::Format(format!(
                     "不支持的台账版本 {}，本程序只支持 {}",
                     header.yunxi_bot_ledger, LEDGER_FORMAT_VERSION
@@ -445,6 +453,7 @@ impl Ledger {
             }
             let ev: Event = serde_json::from_str(&line)
                 .map_err(|e| LedgerError::Format(format!("第 {} 条事件不可解析: {e}", i + 1)))?;
+            crate::continuity::validate_payload(ev.kind, &ev.data).map_err(LedgerError::Format)?;
             self.events.push(ev);
         }
         self.seq = self.events.last().map(|e| e.seq).unwrap_or(0);
@@ -538,6 +547,29 @@ impl Ledger {
             return Err(LedgerError::AuditOutsideSpan(kind));
         }
         is_lossless_json(&data).map_err(LedgerError::LossyJson)?;
+        crate::continuity::validate_payload(kind, &data).map_err(LedgerError::Format)?;
+        if matches!(
+            kind,
+            EventKind::ConversationObserved
+                | EventKind::MemoryProposed
+                | EventKind::MemoryProposalResolved
+                | EventKind::CompanionFollowupChanged
+                | EventKind::CompanionGenerated
+        ) || (kind == EventKind::MemoryRecorded
+            && (data.get("expires_at").is_some() || data.get("supersedes").is_some()))
+        {
+            let mut line = String::new();
+            BufReader::new(File::open(&self.path).map_err(|e| LedgerError::Io(e.to_string()))?)
+                .read_line(&mut line)
+                .map_err(|e| LedgerError::Io(e.to_string()))?;
+            let header: Header =
+                serde_json::from_str(&line).map_err(|e| LedgerError::Format(e.to_string()))?;
+            if header.yunxi_bot_ledger != LEDGER_FORMAT_VERSION {
+                return Err(LedgerError::Format(
+                    "陪伴记忆写入需要先停止后台并执行 memory --upgrade".into(),
+                ));
+            }
+        }
 
         // **每次追加前先对齐磁盘序号。** 同一个进程里可能有另一个
         // `Ledger` 刚写过（工具调用记录就是这样），不对齐会产生重复 seq。

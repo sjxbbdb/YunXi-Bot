@@ -746,5 +746,16 @@
       ],
       "additionalProperties": false
     }
+  },
+  {
+    "name": "mac_location",
+    "capability": "read_only",
+    "description": "读取Mac当前近似位置（系统定位，约10公里网格）；只请求一次，不追踪。需先由用户在macOS允许定位，失败不使用IP或VPN位置。结果和参数不持久化。",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
   }
 ]

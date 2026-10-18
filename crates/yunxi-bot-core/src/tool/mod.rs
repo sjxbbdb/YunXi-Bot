@@ -49,6 +49,7 @@ use crate::policy::SandboxMode;
 
 #[cfg(target_os = "macos")]
 pub mod agenda;
+pub mod companion;
 #[cfg(target_os = "macos")]
 pub mod computer;
 pub mod files;
@@ -789,7 +790,7 @@ pub fn gate_with_ledger(
 
     if tool.fresh_approval() {
         return GateDecision::Ask {
-            reason: "通用界面动作须逐次人工批准，预批准规则不适用".into(),
+            reason: "此工具须逐次人工批准，预批准规则不适用".into(),
         };
     }
 

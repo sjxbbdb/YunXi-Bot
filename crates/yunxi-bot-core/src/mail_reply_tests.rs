@@ -265,8 +265,13 @@ fn malformed_profile_and_oversized_thread_are_not_silently_omitted() {
     let h = Home::new();
     fs::write(h.0.join("profile.md"), [0xff]).unwrap();
     assert!(context(&h.0, &item(), NOW, None, &mut call).is_err());
-    fs::write(h.0.join("profile.md"), "x".repeat(8193)).unwrap();
-    assert!(context(&h.0, &item(), NOW, None, &mut call).is_err());
+    let profile = "x".repeat(crate::profile::MAX_PROFILE_BYTES);
+    fs::write(h.0.join("profile.md"), &profile).unwrap();
+    let (loaded, _) = context(&h.0, &item(), NOW, None, &mut call).unwrap();
+    assert_eq!(loaded["profile"], profile);
+    fs::write(h.0.join("profile.md"), format!("{profile}x")).unwrap();
+    let error = context(&h.0, &item(), NOW, None, &mut call).unwrap_err();
+    assert!(error.contains(&crate::profile::MAX_PROFILE_BYTES.to_string()));
     fs::remove_file(h.0.join("profile.md")).unwrap();
     assert!(
         context(&h.0, &item(), NOW, None, &mut |a, v| {

@@ -294,6 +294,7 @@ func nativeWrite<T>(_ body: (URL) throws -> T) throws -> T {
         case "mac_places_search": return try await places(args)
         case "mac_route": return try await route(args)
         case "mac_weather": return try await weather(args)
+        case "mac_location": return try await NativeLocation().run(authorize: false)
         case "mac_document_read": return try document(args)
         default:
             guard action.hasPrefix("mac_mail_") else { throw Failure("bad_args", "未知工具") }
