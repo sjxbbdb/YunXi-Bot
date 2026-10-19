@@ -837,7 +837,7 @@ impl ModelRouter {
 
         let question = Question::choice(
             "input_kind",
-            "这句话是要我办事，还是随口聊聊？",
+            crate::prompts::decisions::INPUT,
             &TaskKind::input_kind_criteria(),
         );
         let req = DecisionRequest::new(serde_json::json!({ "input": text }), vec![question]);

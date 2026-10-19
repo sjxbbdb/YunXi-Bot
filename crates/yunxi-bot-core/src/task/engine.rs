@@ -42,6 +42,8 @@ pub const STEP_MAX_TOKENS: u32 = 1024;
 
 /// 拆解输出的上限。步骤清单本身不长，但思考过程要占位置。
 pub const PLAN_MAX_TOKENS: u32 = 2048;
+/// 只用于一次无工具重新规划，包含思考和正文，不扩大任务调用次数。
+pub const PLAN_RETRY_MAX_TOKENS: u32 = 8192;
 
 /// **开了思考时，输出预算要额外加的余量。**
 ///
@@ -243,6 +245,8 @@ fn strip_mark(s: &str, mark: &str) -> String {
 /// "可选模型"（可变）和"观测"（可变）两个东西，塞进同一个 struct 会让
 /// 每次调用都撞借用检查。把观测当参数传，借用关系就一目了然。
 pub trait TaskHandler {
+    /// 真实客户端在每次发送处执行；替身仍沿用引擎的逻辑调用上限。
+    fn configure_request_budget(&mut self, _task_id: &str, _limit: u32) {}
     /// 把目标拆成步骤清单（模型的原始回复）。
     fn plan(
         &mut self,
@@ -275,6 +279,8 @@ pub struct PlanRequest {
     pub goal: String,
     /// 最多允许几个步骤。
     pub max_steps: u32,
+    /// 正文额度；handler 沿用相同思考模式另加固定余量。
+    pub max_tokens: u32,
 }
 
 /// 单步执行的输入。
@@ -284,6 +290,7 @@ pub struct StepRequest {
     pub goal: String,
     pub step_id: String,
     pub instruction: String,
+    pub required_tools: Option<Vec<String>>,
     /// 已完成的依赖步骤 → 其结果。**只给依赖的结果**，不给全部历史：
     /// 无关步骤的输出既浪费 token 又会干扰。
     pub inputs: Vec<(String, String)>,
@@ -491,6 +498,8 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
     /// **每轮都从台账重新投影**，不用内存里的状态推进。这样"状态"永远只是
     /// 台账的函数，不存在内存与台账不一致的可能。
     pub fn run(&mut self, task_id: &str) -> Result<EngineOutcome, TaskError> {
+        self.handler
+            .configure_request_budget(task_id, self.budget.max_model_calls);
         let mut ledger = BudgetLedger::new(self.budget);
         // 本轮所有模型调用的用量。跑完一次性写台账——
         // **一次 flush 一条，而不是每次调用都写**：调用期间崩掉留下的
@@ -738,27 +747,53 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
         // 否则 `do` 里的简单步骤还是会直直打到 17872 上。
         self.prepare_local_model(&mut routing);
         ledger.try_charge()?;
-        let req = PlanRequest {
+        let mut req = PlanRequest {
             task_id: task.id.clone(),
             goal: task.goal.clone(),
             max_steps: self.budget.max_steps,
+            max_tokens: PLAN_MAX_TOKENS,
         };
-        let raw = self.handler.plan(&routing, &req, records)?;
+        let raw = match self.handler.plan(&routing, &req, records) {
+            Err(TaskError::OutputLimit) => {
+                self.store.write(&task.id, EventKind::TaskPlanning, serde_json::json!({
+                    "task":task.id, "degraded":true, "reason":"规划输出被截断；最多一次有界重新规划", "retry":1, "max_output_tokens":PLAN_RETRY_MAX_TOKENS
+                }))?;
+                if let Err(error) = ledger.try_charge() {
+                    self.store.write(&task.id, EventKind::TaskPlanning, serde_json::json!({
+                        "task":task.id,"degraded":true,"reason":error.to_string(),"retry_not_started":true
+                    }))?;
+                    return Err(error);
+                }
+                req.max_tokens = PLAN_RETRY_MAX_TOKENS
+                    - if routing.thinking {
+                        THINKING_OUTPUT_HEADROOM
+                    } else {
+                        0
+                    };
+                eprintln!(
+                    "规划输出被截断，保留思考模式，最多再规划一次（输出上限 {PLAN_RETRY_MAX_TOKENS} token）"
+                );
+                match self.handler.plan(&routing, &req, records) {
+                    Err(TaskError::OutputLimit) => {
+                        self.store.write(&task.id, EventKind::TaskPlanning, serde_json::json!({
+                            "task":task.id,"degraded":true,"reason":"规划重试仍被截断，停止且未执行工具","retry_exhausted":true
+                        }))?;
+                        return Err(TaskError::NeedsHuman {
+                            reason: "两次规划均达到输出上限，未执行任务；请缩小目标后重新规划"
+                                .into(),
+                        });
+                    }
+                    result => result?,
+                }
+            }
+            result => result?,
+        };
 
         let planned = parse_plan(&raw)?;
         ledger.steps_allowed(planned.len())?;
 
         // 落成 Step：类型由模型给，没给就按文本兜底判
-        let steps: Vec<Step> = planned
-            .iter()
-            .map(|p| {
-                let kind = p.kind.unwrap_or_else(|| {
-                    TaskKind::classify(&p.instruction).unwrap_or(TaskKind::Generation)
-                });
-                Step::new(p.id.clone(), p.instruction.clone(), kind)
-                    .with_depends_on(p.depends_on.clone())
-            })
-            .collect();
+        let steps = super::plan::planned_to_steps(&planned);
         validate_dependencies(&steps)?;
 
         // 一次写完拆解结果：崩在中间不会留下"半个步骤清单"
@@ -922,6 +957,7 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
             goal: task.goal.clone(),
             step_id: step_id.to_string(),
             instruction: step.instruction.clone(),
+            required_tools: step.required_tools.clone(),
             inputs,
         };
 
@@ -964,6 +1000,22 @@ impl<'a, H: TaskHandler, S: TaskStore> Engine<'a, H, S> {
                     }
                 }
                 Ok(StepRun::Settled)
+            }
+            Err(TaskError::OutputLimit) => {
+                self.store.write(
+                    task_id,
+                    EventKind::StepFailed,
+                    serde_json::json!({
+                        "task":task_id,"step":step_id,"blocked":true,"degraded":true,
+                        "error":"步骤响应截断；可能已有工具产物，先核对再恢复，不自动重放动作"
+                    }),
+                )?;
+                Ok(StepRun::Settled)
+            }
+            Err(e) if e.needs_human() => {
+                // 额度或人工边界不是步骤失败，不能自动重试并烧光步骤次数。
+                self.reset_step(task_id, &step, true)?;
+                Err(e)
             }
             Err(e) => {
                 // 单步失败不立刻判死，但**只有还能重试时才写 StepFailed**。
@@ -1492,7 +1544,7 @@ pub fn create_task<S: TaskStore>(
     store.write(
         task_id,
         EventKind::TaskCreated,
-        serde_json::json!({ "task": task_id, "goal": goal }),
+        serde_json::json!({ "task": task_id, "goal": goal, "request_budget_version":4 }),
     )?;
     store.write(
         task_id,
@@ -1716,6 +1768,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct ScriptedHandler {
         plan_needs_human: bool,
+        plan_truncations: usize,
+        seen_plan_tokens: Vec<u32>,
         plans: Vec<String>,
         steps: Vec<Result<String, TaskError>>,
         observes: Vec<String>,
@@ -1748,7 +1802,7 @@ mod tests {
         fn plan(
             &mut self,
             routing: &Routing,
-            _run: &PlanRequest,
+            run: &PlanRequest,
             records: &mut Vec<CallRecord>,
         ) -> Result<String, TaskError> {
             if std::mem::take(&mut self.plan_needs_human) {
@@ -1757,6 +1811,7 @@ mod tests {
                 });
             }
             self.plan_calls += 1;
+            self.seen_plan_tokens.push(run.max_tokens);
             self.seen_providers.push(routing.spec.provider.to_string());
             self.seen_thinking.push(routing.thinking);
             self.seen_kinds.push(routing.kind);
@@ -1768,6 +1823,10 @@ mod tests {
                 )
                 .with_thinking(routing.thinking),
             );
+            if self.plan_truncations > 0 {
+                self.plan_truncations -= 1;
+                return Err(TaskError::OutputLimit);
+            }
             Ok(self.plans.remove(0))
         }
 
@@ -1797,6 +1856,13 @@ mod tests {
                     Err(e) => Err(match e {
                         TaskError::StepFailed { step, reason } => TaskError::StepFailed {
                             step: step.clone(),
+                            reason: reason.clone(),
+                        },
+                        TaskError::OutputLimit => TaskError::OutputLimit,
+                        TaskError::BudgetExhausted { limit } => {
+                            TaskError::BudgetExhausted { limit: *limit }
+                        }
+                        TaskError::NeedsHuman { reason } => TaskError::NeedsHuman {
                             reason: reason.clone(),
                         },
                         other => TaskError::Core(crate::CoreError::Ledger(other.to_string())),
@@ -1902,6 +1968,88 @@ mod tests {
         assert_eq!(store.costs.len(), 3, "拆解 1 次 + 两步，共 3 次调用");
         assert_eq!(store.costs[0].provider, "deepseek", "拆解走深度档");
         assert!(store.costs[0].thinking, "拆解要开思考");
+    }
+
+    #[test]
+    fn truncated_planning_retries_once_with_budget_usage_and_same_thinking() {
+        for (truncations, limit) in [(1, 20), (2, 20), (1, 1)] {
+            let router = ModelRouter::default();
+            let decider = StubDecider::succeeding();
+            let mut handler = ScriptedHandler::with_plan(&plan_json(&[("s1", &[])]));
+            handler.plan_truncations = truncations;
+            let mut store = MemoryTaskStore::new();
+            create_task(&mut store, "retry", "生成一段文字").unwrap();
+            let result = engine(
+                &router,
+                &decider,
+                &mut handler,
+                &mut store,
+                Budget {
+                    max_model_calls: limit,
+                    ..Budget::default()
+                },
+            )
+            .run("retry");
+            assert_eq!(handler.plan_calls, if limit == 1 { 1 } else { 2 });
+            assert!(
+                store
+                    .events()
+                    .iter()
+                    .any(|e| e.kind == EventKind::TaskPlanning && e.data["degraded"] == true)
+            );
+            assert_eq!(store.costs.len(), handler.plan_calls + handler.step_calls);
+            if limit == 1 {
+                assert!(matches!(result, Err(TaskError::BudgetExhausted { .. })));
+                assert_eq!(handler.step_calls, 0);
+            } else {
+                assert_eq!(handler.seen_thinking[0], handler.seen_thinking[1]);
+                assert_eq!(handler.seen_providers[0], handler.seen_providers[1]);
+                assert_eq!(
+                    handler.seen_plan_tokens[1]
+                        + if handler.seen_thinking[1] {
+                            THINKING_OUTPUT_HEADROOM
+                        } else {
+                            0
+                        },
+                    8192
+                );
+                assert_eq!(
+                    result.unwrap().task.state,
+                    if truncations == 1 {
+                        TaskState::Done
+                    } else {
+                        TaskState::AwaitingHuman
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_execution_does_not_replay_tools() {
+        let router = ModelRouter::default();
+        let decider = StubDecider::succeeding();
+        let mut handler = ScriptedHandler::with_plan(&plan_json(&[("s1", &[])]))
+            .push_step(Err(TaskError::OutputLimit));
+        let mut store = MemoryTaskStore::new();
+        create_task(&mut store, "cut", "写测试文件").unwrap();
+        let result = engine(
+            &router,
+            &decider,
+            &mut handler,
+            &mut store,
+            Budget::default(),
+        )
+        .run("cut")
+        .unwrap();
+        assert_ne!(result.task.state, TaskState::Done);
+        assert_eq!(handler.step_calls, 1);
+        assert!(
+            store
+                .events()
+                .iter()
+                .any(|e| e.kind == EventKind::StepFailed && e.data["degraded"] == true)
+        );
     }
 
     #[test]
@@ -2863,6 +3011,50 @@ mod tests {
             d["why"].as_str().is_some_and(|w| !w.is_empty()),
             "要说清为什么升级人工：{d}"
         );
+    }
+
+    #[test]
+    fn request_budget_stops_do_not_retry_or_exhaust_step_attempts() {
+        for unavailable in [false, true] {
+            let router = ModelRouter::default();
+            let decider = StubDecider::succeeding();
+            let mut handler = ScriptedHandler::with_plan(&plan_json(&[("a", &[])]));
+            for _ in 0..3 {
+                handler = handler.push_step(Err(if unavailable {
+                    TaskError::NeedsHuman {
+                        reason: "request accounting unavailable".into(),
+                    }
+                } else {
+                    TaskError::BudgetExhausted { limit: 2 }
+                }));
+            }
+            let mut store = MemoryTaskStore::new();
+            create_task(&mut store, "budget-stop", "read only").unwrap();
+            for run in 1..=3 {
+                let out = engine(
+                    &router,
+                    &decider,
+                    &mut handler,
+                    &mut store,
+                    Budget::default(),
+                )
+                .run("budget-stop")
+                .unwrap();
+                assert_eq!(out.task.state, TaskState::AwaitingHuman);
+                assert_eq!(out.task.step("a").unwrap().attempts, 0);
+                assert_eq!(
+                    handler.step_calls, run,
+                    "budget stop must not automatically retry"
+                );
+                store
+                    .write(
+                        "budget-stop",
+                        EventKind::TaskStateChanged,
+                        serde_json::json!({"task":"budget-stop","state":"running"}),
+                    )
+                    .unwrap();
+            }
+        }
     }
 
     #[test]

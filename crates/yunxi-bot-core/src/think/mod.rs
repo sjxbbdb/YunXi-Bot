@@ -7,6 +7,7 @@ pub mod cost;
 pub mod image;
 pub mod local_health;
 pub mod prompt;
+pub mod request_budget;
 pub mod router;
 pub mod session;
 /// 路由阈值。**集中在一处**，便于按实际账单调整。
@@ -175,6 +176,8 @@ impl Message {
 /// 一次思考请求。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThinkRequest {
+    /// 本机任务额度元数据，不进入提供方请求正文。
+    pub request_budget: Option<request_budget::RequestBudget>,
     pub messages: Vec<Message>,
     pub max_tokens: Option<u32>,
     /// 采样温度。陪伴场景宜低——要的是稳定，不是花哨。
@@ -196,6 +199,7 @@ pub struct ThinkRequest {
 impl ThinkRequest {
     pub fn new(messages: Vec<Message>) -> Self {
         Self {
+            request_budget: None,
             messages,
             max_tokens: None,
             temperature: None,
@@ -262,6 +266,10 @@ pub struct ThinkResponse {
 /// 常驻进程对这两者的处理必须不同。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkError {
+    RequestBudgetExhausted {
+        limit: u32,
+    },
+    BudgetUnavailable(String),
     /// 401：密钥无效
     Auth(String),
     /// 402：余额或配额不足
@@ -276,15 +284,27 @@ pub enum ThinkError {
         retry_after: Option<Duration>,
     },
     /// 400 / 413 / 422：请求本身有问题，重试无用
-    BadRequest { status: u16, detail: String },
+    BadRequest {
+        status: u16,
+        detail: String,
+    },
     /// 408 / 5xx：服务端问题，值得重试
-    Transient { status: Option<u16>, detail: String },
+    Transient {
+        status: Option<u16>,
+        detail: String,
+    },
     /// 网络层失败
     Network(String),
     /// 响应结构不是预期的
     Malformed(String),
+    /// 提供方明确报告输出截断；部分正文和工具参数不能执行，用量仍须记账。
+    OutputLimit {
+        usage: Usage,
+    },
     /// 本地限流：还没到下次可发送的时间
-    LocalThrottle { wait: Duration },
+    LocalThrottle {
+        wait: Duration,
+    },
 }
 
 impl ThinkError {
@@ -306,6 +326,10 @@ impl ThinkError {
 impl std::fmt::Display for ThinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ThinkError::RequestBudgetExhausted { limit } => {
+                write!(f, "实际模型请求预算用尽（上限 {limit} 次），未发送请求")
+            }
+            ThinkError::BudgetUnavailable(reason) => write!(f, "{reason}"),
             ThinkError::Auth(m) => write!(f, "密钥无效或被拒绝: {m}"),
             ThinkError::Payment(m) => write!(f, "余额或配额不足: {m}"),
             ThinkError::Forbidden(m) => write!(f, "无权访问该模型: {m}"),
@@ -326,6 +350,11 @@ impl std::fmt::Display for ThinkError {
             },
             ThinkError::Network(m) => write!(f, "网络失败: {m}"),
             ThinkError::Malformed(m) => write!(f, "响应结构异常: {m}"),
+            ThinkError::OutputLimit { usage } => write!(
+                f,
+                "输出额度耗尽，响应未完成（已生成 {} token）；未接受部分结果",
+                usage.completion_tokens
+            ),
             ThinkError::LocalThrottle { wait } => {
                 write!(f, "本地限流：还需等待 {}s", wait.as_secs())
             }

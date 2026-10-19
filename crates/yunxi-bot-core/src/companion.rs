@@ -118,21 +118,15 @@ pub fn intervention_questions() -> Vec<Question> {
     vec![
         Question::choice(
             "intervention",
-            "此刻应当如何介入？",
+            crate::prompts::decisions::INTERVENTION,
             &[
                 ("speak", "有值得主动说明的信息，且现在说不会打扰"),
                 ("hold", "有信息但现在不适合说，应留到合适时机"),
                 ("quiet", "没有需要主动说明的信息，保持静默即可"),
             ],
         ),
-        Question::noul(
-            "needs_support",
-            "使用者此刻是否处于明确需要情绪支持的状态（而非只是没说话）？",
-        ),
-        Question::noul(
-            "is_anomaly",
-            "近期的运行结果中是否出现了显著偏离常态、需要人知道的情况？",
-        ),
+        Question::noul("needs_support", crate::prompts::decisions::SUPPORT),
+        Question::noul("is_anomaly", crate::prompts::decisions::ANOMALY),
     ]
 }
 

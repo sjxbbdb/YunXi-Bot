@@ -2,7 +2,7 @@
 //!
 //! ## 一条从 Claude Code 抄来的硬规则：先读后写
 //!
-//! `edit_file` 在本次会话里**必须先读过目标文件**才能改它。这不是洁癖：
+//! `edit_file` 在当前工具循环里**必须先读过目标文件**才能改它。这不是洁癖：
 //! 它挡掉的是"模型凭印象改文件"——模型记得这个文件大概长什么样，
 //! 于是给一个看起来对、实际对不上的修改，然后文件被改坏。
 //!
@@ -37,6 +37,16 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::tool::{Capability, Tool, ToolContext, ToolError, ToolOutput};
+
+fn verify_written(path: &Path, expected: &[u8]) -> Result<(), ToolError> {
+    match std::fs::read(path) {
+        Ok(actual) if actual == expected => Ok(()),
+        _ => Err(ToolError::Failed {
+            detail: "写入已发生，但回读与预期不符或读取失败；结果未知，先检查文件，不要自动重写"
+                .into(),
+        }),
+    }
+}
 
 /// 不传 `limit` 时读多少行。
 ///
@@ -830,7 +840,7 @@ impl Tool for WriteFileTool {
     }
 
     fn description(&self) -> &str {
-        "把内容写入文件，新建或整体覆盖，父目录会自动创建。覆盖已存在的文件前必须先 read_file 读过它。只改一小段用 edit_file 更安全。"
+        "把内容写入文件，新建或整体覆盖，父目录会自动创建。覆盖已存在的文件前必须在本轮先 read_file；上一轮或恢复会话中的历史读取不能替代本轮读取。只改一小段用 edit_file 更安全。"
     }
 
     fn parameters(&self) -> Value {
@@ -891,7 +901,7 @@ impl Tool for WriteFileTool {
         if existed && !ctx.has_read(&abs) {
             return Err(ToolError::Denied {
                 reason: format!(
-                    "覆盖已存在的文件前必须先 read_file 读过它（当前会话里还没读过 {raw}）；只是想加内容就用 edit_file"
+                    "覆盖已存在的文件前必须在本轮先 read_file（本轮还没读过 {raw}）；只是想加内容就用 edit_file"
                 ),
             });
         }
@@ -906,6 +916,7 @@ impl Tool for WriteFileTool {
         std::fs::write(&abs, content.as_bytes()).map_err(|e| ToolError::Failed {
             detail: format!("写不了 {}: {e}", abs.display()),
         })?;
+        verify_written(&abs, content.as_bytes())?;
         // 刚写下去的内容就是文件的全部内容，模型手里已经有它了。
         // 不记这一笔的话，紧接着的 edit_file 会被"没读过"挡下来，
         // 逼模型白读一遍自己刚写的文件。
@@ -913,7 +924,7 @@ impl Tool for WriteFileTool {
 
         let action = if existed { "覆盖" } else { "新建" };
         Ok(ToolOutput::changed(format!(
-            "已{action} {}（{} 字节）",
+            "已{action} {}（{} 字节）。写入已完成，接下来用 read_file 回读此路径核验内容，再报告任务结果；不要重复写入来代替核验。",
             display_path(&abs, &ctx.cwd),
             content.len()
         )))
@@ -931,7 +942,7 @@ impl Tool for EditFileTool {
     }
 
     fn description(&self) -> &str {
-        "把文件里的 old_string 替换成 new_string，用于定点修改。必须先 read_file 读过该文件。old_string 必须在文件中恰好出现一次（除非 replace_all=true）。"
+        "把文件里的 old_string 替换成 new_string，用于定点修改。必须在本轮先 read_file；上一轮或恢复会话中的历史读取不能替代本轮读取。old_string 必须在文件中恰好出现一次（除非 replace_all=true）。"
     }
 
     fn parameters(&self) -> Value {
@@ -1038,7 +1049,7 @@ impl Tool for EditFileTool {
         if !ctx.has_read(&abs) {
             return Err(ToolError::Denied {
                 reason: format!(
-                    "改文件前必须先 read_file 读过它（当前会话里还没读过 {raw}），否则就是凭印象改"
+                    "改文件前必须在本轮先 read_file（本轮还没读过 {raw}），历史读取不能代替"
                 ),
             });
         }
@@ -1093,9 +1104,10 @@ impl Tool for EditFileTool {
         std::fs::write(&abs, updated.as_bytes()).map_err(|e| ToolError::Failed {
             detail: format!("写不了 {}: {e}", abs.display()),
         })?;
+        verify_written(&abs, updated.as_bytes())?;
 
         Ok(ToolOutput::changed(format!(
-            "已修改 {}：替换 {count} 处",
+            "已修改 {}：替换 {count} 处。写入已完成，接下来用 read_file 回读此路径核验内容，再报告任务结果；不要重复修改来代替核验。",
             display_path(&abs, &ctx.cwd)
         )))
     }
@@ -1423,6 +1435,16 @@ mod preview_tests {
 mod tests {
     use super::*;
     use crate::policy::SandboxMode;
+
+    #[test]
+    fn full_write_readback_rejects_same_length_corruption_and_missing_file() {
+        let temp = TempDir::new("full-write-readback");
+        let path = temp.seed("result.txt", "abc");
+        assert!(verify_written(&path, b"abc").is_ok());
+        assert!(verify_written(&path, b"abd").is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(verify_written(&path, b"abc").is_err());
+    }
 
     /// 使用本平台的绝对路径；Windows 盘符在 Unix 上只是相对文件名。
     fn spec_ctx() -> ToolContext {

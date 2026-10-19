@@ -503,6 +503,26 @@ struct WireMessage {
 
 impl Thinker for OpenAiThinker {
     fn think(&self, req: &ThinkRequest) -> Result<ThinkResponse, ThinkError> {
+        self.budgeted(req, || self.send(req))
+    }
+    fn think_stream(
+        &self,
+        req: &ThinkRequest,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<ThinkResponse, ThinkError> {
+        self.budgeted(req, || self.send_stream(req, on_delta))
+    }
+    fn model(&self) -> &str {
+        &self.config.model
+    }
+}
+
+impl OpenAiThinker {
+    fn budgeted(
+        &self,
+        req: &ThinkRequest,
+        send: impl FnOnce() -> Result<ThinkResponse, ThinkError>,
+    ) -> Result<ThinkResponse, ThinkError> {
         if self.api_key.is_empty() {
             return Err(ThinkError::Auth("密钥为空".into()));
         }
@@ -513,13 +533,24 @@ impl Thinker for OpenAiThinker {
                 detail: "消息列表为空".into(),
             });
         }
-
-        // 本地限流：拿不到配额就如实报告，让调用方决定跳过还是等待。
-        // 不在这里 sleep——常驻循环不该为一次远端调用卡住整轮调度。
         if let Some(wait) = self.limiter.try_acquire() {
             return Err(ThinkError::LocalThrottle { wait });
         }
+        let reservation = req
+            .request_budget
+            .as_ref()
+            .map(|b| b.reserve(&self.config.model))
+            .transpose()?;
+        let result = send();
+        if let Some(r) = reservation {
+            r.settle(&result)?;
+        }
+        result
+    }
+}
 
+impl OpenAiThinker {
+    fn send(&self, req: &ThinkRequest) -> Result<ThinkResponse, ThinkError> {
         let thinking = req.effective_thinking(self.config.thinking);
         let body = self.build_body(req);
         let resp = self
@@ -592,6 +623,9 @@ impl Thinker for OpenAiThinker {
             .next()
             .ok_or_else(|| ThinkError::Malformed("响应里没有 choices".into()))?;
 
+        if choice.finish_reason.as_deref() == Some("length") {
+            return Err(ThinkError::OutputLimit { usage: wire.usage });
+        }
         let msg = choice.message;
         let tool_calls = msg.tool_calls;
         // content 为 null 是合法的——只要带回了工具调用。
@@ -644,25 +678,11 @@ impl Thinker for OpenAiThinker {
     ///
     /// 所以要**按 index 拼**，拼完的形状必须和非流式一致——
     /// 不然下游（工具循环）会看到两种不一样的 `tool_calls`。
-    fn think_stream(
+    fn send_stream(
         &self,
         req: &ThinkRequest,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<ThinkResponse, ThinkError> {
-        if self.api_key.is_empty() {
-            return Err(ThinkError::Auth("密钥为空".into()));
-        }
-        super::image::validate_messages(&req.messages)?;
-        if req.messages.is_empty() {
-            return Err(ThinkError::BadRequest {
-                status: 0,
-                detail: "消息列表为空".into(),
-            });
-        }
-        if let Some(wait) = self.limiter.try_acquire() {
-            return Err(ThinkError::LocalThrottle { wait });
-        }
-
         let mut body = self.build_body(req);
         body["stream"] = serde_json::json!(true);
         // **不带上这个就拿不到 usage**，而锚点全靠它
@@ -733,10 +753,6 @@ impl Thinker for OpenAiThinker {
                 error
             }
         })
-    }
-
-    fn model(&self) -> &str {
-        &self.config.model
     }
 }
 
@@ -897,6 +913,9 @@ impl OpenAiThinker {
             .filter_map(ToolCallAccum::into_wire)
             .collect();
 
+        if finish_reason.as_deref() == Some("length") {
+            return Err(ThinkError::OutputLimit { usage });
+        }
         if content.is_empty() && tool_calls.is_empty() {
             // **分清三种情况。** 混成一句会把人送到错的地方：
             // - 全都解析失败 → 我们的解析器不认这个形状（产品 bug）
@@ -1068,10 +1087,25 @@ mod tests {
     }
 
     #[test]
+    fn truncated_stream_is_never_a_successful_tool_response() {
+        let client = OpenAiThinker::new(ThinkerConfig::default(), ApiKey::new("test"));
+        let chunk = serde_json::json!({
+            "choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"write_file","arguments":"{}"}}]},"finish_reason":"length"}],
+            "usage":{"prompt_tokens":100,"completion_tokens":4096,"total_tokens":4196}
+        });
+        let wire = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        assert!(
+            client
+                .read_sse(std::io::Cursor::new(wire), Thinking::Enabled, &mut |_| {})
+                .is_err()
+        );
+    }
+
+    #[test]
     fn image_http_requests_work_in_both_modes_and_error_bodies_are_not_exposed() {
         use std::io::{Read, Write};
         for streaming in [false, true] {
-            for response_kind in [0, 1, 2] {
+            for response_kind in [0, 1, 2, 3] {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let address = listener.local_addr().unwrap();
                 let server = std::thread::spawn(move || {
@@ -1121,6 +1155,20 @@ mod tests {
                                 "{\"choices\":\"private-image-echo-R0lGODlh\"}",
                             )
                         }
+                    } else if response_kind == 3 {
+                        if streaming {
+                            (
+                                "200 OK",
+                                "text/event-stream",
+                                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private-image-echo\"},\"finish_reason\":\"length\"}],\"usage\":{\"completion_tokens\":4096}}\n\ndata: [DONE]\n\n",
+                            )
+                        } else {
+                            (
+                                "200 OK",
+                                "application/json",
+                                "{\"choices\":[{\"message\":{\"content\":null,\"reasoning_content\":\"private-image-echo\"},\"finish_reason\":\"length\"}],\"usage\":{\"completion_tokens\":4096}}",
+                            )
+                        }
                     } else if streaming {
                         assert_eq!(body["stream"], true);
                         (
@@ -1142,19 +1190,63 @@ mod tests {
                     ThinkerConfig {
                         base_url: format!("http://{address}/v1"),
                         timeout: Duration::from_secs(5),
+                        rpm: 0,
                         ..Default::default()
                     },
                     ApiKey::new("unit-test-dummy"),
                 );
                 let image = super::super::ImageInput::from_bytes(b"GIF89a").unwrap();
-                let req = ThinkRequest::new(vec![Message::user_with_images("看图", vec![image])]);
+                let home = std::env::temp_dir().join(format!(
+                    "yunxi-wire-budget-{}-{streaming}-{response_kind}",
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_dir_all(&home);
+                std::fs::create_dir_all(&home).unwrap();
+                let mut req =
+                    ThinkRequest::new(vec![Message::user_with_images("看图", vec![image])]);
+                req.request_budget = Some(super::super::request_budget::RequestBudget {
+                    home: home.clone(),
+                    task: "wire-test".into(),
+                    limit: 1,
+                });
+                assert!(client.build_body(&req).get("request_budget").is_none());
                 let mut output = String::new();
                 let result = if streaming {
                     client.think_stream(&req, &mut |s| output.push_str(s))
                 } else {
                     client.think(&req)
                 };
+                assert!(matches!(
+                    client.think(&req),
+                    Err(ThinkError::RequestBudgetExhausted { limit: 1 })
+                ));
+                assert!(matches!(
+                    client.think_stream(&req, &mut |_| {}),
+                    Err(ThinkError::RequestBudgetExhausted { limit: 1 })
+                ));
+                let ledger = crate::ledger::Ledger::open(home.join("ledger.jsonl")).unwrap();
+                assert_eq!(
+                    ledger
+                        .events()
+                        .iter()
+                        .filter(|e| e.kind == crate::ledger::EventKind::ModelRequestReserved)
+                        .count(),
+                    1
+                );
+                let settled = ledger
+                    .events()
+                    .iter()
+                    .find(|e| e.kind == crate::ledger::EventKind::ModelRequestSettled)
+                    .unwrap();
+                if response_kind == 1 || response_kind == 2 {
+                    assert!(settled.data["usage"].is_null());
+                }
                 if response_kind != 0 {
+                    if response_kind == 3 {
+                        assert!(
+                            matches!(&result, Err(ThinkError::OutputLimit { usage }) if usage.completion_tokens == 4096)
+                        );
+                    }
                     let err = result.unwrap_err().to_string();
                     assert!(!err.contains("private-image-echo"));
                     assert!(!err.contains("R0lGODlh"));
@@ -1165,6 +1257,7 @@ mod tests {
                     }
                 }
                 server.join().unwrap();
+                std::fs::remove_dir_all(home).unwrap();
             }
         }
     }
@@ -1191,6 +1284,38 @@ mod tests {
             ));
         }
         assert!(client.limiter.peek_wait().is_none());
+    }
+
+    #[test]
+    fn local_throttle_and_invalid_input_do_not_reserve_network_quota() {
+        let home = std::env::temp_dir().join(format!("yunxi-no-request-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let client = OpenAiThinker::new(
+            ThinkerConfig {
+                rpm: 1,
+                ..Default::default()
+            },
+            ApiKey::new("test"),
+        );
+        let mut req = ThinkRequest::new(vec![]);
+        req.request_budget = Some(super::super::request_budget::RequestBudget {
+            home: home.clone(),
+            task: "t".into(),
+            limit: 1,
+        });
+        assert!(matches!(
+            client.budgeted(&req, || panic!("must not send")),
+            Err(ThinkError::BadRequest { .. })
+        ));
+        req.messages.push(Message::user("hello"));
+        assert!(client.limiter.try_acquire().is_none());
+        assert!(matches!(
+            client.budgeted(&req, || panic!("must not send")),
+            Err(ThinkError::LocalThrottle { .. })
+        ));
+        assert!(!home.join("ledger.jsonl").exists());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

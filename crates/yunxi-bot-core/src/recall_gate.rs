@@ -269,7 +269,7 @@ pub fn gate_questions() -> Vec<crate::decide::Question> {
     use crate::decide::Question;
     vec![Question::choice(
         GATE_QUESTION,
-        "为了回答使用者这一句话，需要去查关于他本人的记忆吗？",
+        crate::prompts::decisions::RECALL,
         &[
             (
                 "none",

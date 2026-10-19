@@ -48,6 +48,7 @@ pub mod notify_windows;
 pub mod persona;
 pub mod policy;
 pub mod profile;
+pub mod prompts;
 pub mod recall_gate;
 pub mod retrieval;
 pub mod rules;

@@ -65,16 +65,7 @@ const ROLE_MARKERS: [&str; 3] = ["system", "assistant", "developer"];
 ///
 /// **它必须是常量。** 任何随调用变化的字节混进来，缓存前缀就作废
 /// （见 [`crate::think::prompt`]）：目标与步骤是易变内容，只能进用户消息。
-const OPTIONS_SYSTEM_PROMPT: &str = r#"你是任务执行框架里的方案生成器。你的唯一职责是：针对给定的步骤，列出几种互不相同的处理方式，然后停下。
-
-硬性要求：
-1. 只输出一个 JSON 对象，不要解释、不要前后缀、不要 Markdown 代码块。
-2. 形状固定为 {"question":"...","options":["...","..."]}。
-3. options 至少 2 项、至多 6 项，互不重复。
-4. 每一项是一句可以直接执行的做法，不超过 120 个字符，不换行、不编号。
-5. 任何一项里都不要出现 system / assistant 这类角色名——框架会把它们当注入拦掉，整份响应作废。
-6. question 用一句话写清楚这一步要在哪些做法里选。
-7. 你只负责给选项。选哪一个由本地决策模型决定，你不要替它选，也不要推荐。"#;
+const OPTIONS_SYSTEM_PROMPT: &str = crate::prompts::OPTIONS;
 
 /// 决策点的结果。
 ///
@@ -103,7 +94,7 @@ pub enum TaskDecision {
 pub fn options_request(goal: &str, step: &str, max_tokens: u32) -> ThinkRequest {
     let volatile = format!("# 任务目标\n{goal}\n\n# 当前步骤\n{step}\n\n只输出那个 JSON 对象。");
 
-    let mut layout = PromptLayout::new(OPTIONS_SYSTEM_PROMPT);
+    let mut layout = PromptLayout::new(crate::prompts::internal(OPTIONS_SYSTEM_PROMPT));
     layout.ask(volatile);
 
     ThinkRequest::new(layout.build())
@@ -309,7 +300,8 @@ pub(super) fn decision_point_with_context(
         "criteria": criteria_map,
         "context": context,
     });
-    let req = DecisionRequest::new(state, vec![Question::choice(key, question, criteria)]);
+    let instructions = format!("{}{question}", crate::prompts::decisions::TASK_CHOICE);
+    let req = DecisionRequest::new(state, vec![Question::choice(key, &instructions, criteria)]);
 
     // 问过模型之后**全部**出口都收在这里，然后一次性留痕。
     //
@@ -716,9 +708,10 @@ mod tests {
         let system = &options_request("目标", "步骤", 256).messages[0].content;
 
         assert!(system.contains("\"options\""), "{system}");
-        assert!(system.contains("至少 2 项"), "{system}");
-        assert!(system.contains("至多 6 项"), "{system}");
-        assert!(system.contains("120"), "{system}");
+        assert!(system.contains("2至6条"), "{system}");
+        assert!(system.contains("40个字符"), "{system}");
+        let candidate = serde_json::json!({"question":"如何处理", "options":["甲".repeat(40), "乙".repeat(40)]});
+        assert!(parse_options(&candidate.to_string()).is_ok());
     }
 
     #[test]

@@ -642,7 +642,7 @@ impl Tool for AskUserTool {
                 detail: format!(
                     "使用者提交了空回答（可能误按了回车）。你问的是：{}。\n\
                      下一步：换一种更具体的问法再问一次（给出可选项通常更好答），\
-                     或者以 BLOCKED: 开头说明你缺什么。",
+                     或者遵循本轮输出契约说明你缺什么。",
                     head(&question, 200)
                 ),
             }),
@@ -653,7 +653,7 @@ impl Tool for AskUserTool {
                     "当前无人可问：没有任何人应答（守护进程里没有交互通道，或者这次是非交互运行）。\
                      你问的是：{}。\n\
                      下一步：不要自己编一个答案顶上去，也不要原样重试（重试还是没人应答）。\
-                     请以 BLOCKED: 开头说明你缺哪条信息、为什么没有它就没法继续——\
+                     请遵循本轮输出契约说明你缺哪条信息、为什么没有它就没法继续——\
                      使用者下次打开会话时能直接补上。",
                     head(&question, 200)
                 ),
@@ -1061,8 +1061,8 @@ mod tests {
 
         let msg = err.to_string();
         assert!(
-            msg.contains("BLOCKED:"),
-            "要告诉模型下一步用 BLOCKED：{msg}"
+            msg.contains("本轮输出契约") && !msg.contains("BLOCKED:"),
+            "共享工具错误不能指定步骤专用格式：{msg}"
         );
         assert!(
             msg.contains("你的仓库叫什么？"),
@@ -1084,7 +1084,10 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("空回答"), "{msg}");
-        assert!(msg.contains("BLOCKED:"), "{msg}");
+        assert!(
+            msg.contains("本轮输出契约") && !msg.contains("BLOCKED:"),
+            "{msg}"
+        );
     }
 
     #[test]

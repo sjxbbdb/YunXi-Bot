@@ -168,6 +168,13 @@ pub struct Step {
     pub id: String,
     /// 这一步要干什么。给模型看的就是它。
     pub instruction: String,
+    /// None 保留旧任务的保守匹配；Some([]) 明确表示无必需工具。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_required_tools"
+    )]
+    pub required_tools: Option<Vec<String>>,
     /// 依赖的步骤 id。**空表示第一步就能跑。**
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -190,6 +197,7 @@ impl Step {
         Self {
             id: id.into(),
             instruction: instruction.into(),
+            required_tools: None,
             depends_on: Vec::new(),
             kind,
             state: StepState::Pending,
@@ -203,6 +211,30 @@ impl Step {
         self.depends_on = deps;
         self
     }
+
+    pub fn with_required_tools(mut self, tools: Option<Vec<String>>) -> Self {
+        self.required_tools = tools;
+        self
+    }
+}
+
+pub(crate) fn deserialize_required_tools<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    let tools = Vec::<String>::deserialize(deserializer)?;
+    let mut seen = std::collections::BTreeSet::new();
+    if tools.len() > 128
+        || tools.iter().any(|name| {
+            name.is_empty()
+                || name.len() > 128
+                || name.chars().any(char::is_whitespace)
+                || name.chars().any(char::is_control)
+                || !seen.insert(name)
+        })
+    {
+        return Err(serde::de::Error::custom("required_tools 含无效或重复名称"));
+    }
+    Ok(Some(tools))
 }
 
 /// 步骤状态。
@@ -342,6 +374,8 @@ impl BudgetLedger {
 #[derive(Debug)]
 pub enum TaskError {
     Core(CoreError),
+    /// 输出被提供方截断；仅规划阶段可按显式预算恢复。
+    OutputLimit,
     /// 预算用尽。
     BudgetExhausted {
         limit: u32,
@@ -384,6 +418,7 @@ impl std::fmt::Display for TaskError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TaskError::Core(e) => write!(f, "{e}"),
+            TaskError::OutputLimit => write!(f, "模型输出额度耗尽，未接受不完整结果"),
             TaskError::BudgetExhausted { limit } => {
                 write!(f, "模型调用预算用尽（上限 {limit} 次），任务停在原地")
             }

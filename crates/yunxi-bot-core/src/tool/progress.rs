@@ -80,9 +80,7 @@ impl Progress {
     }
 
     pub fn advice(&self) -> Option<&'static str> {
-        (self.stagnant >= 2).then_some(
-            "【界面进度提示】反复访问的观察范围未见内容变化，可能在多个窗口间循环。这不证明动作失败或任务成功。先查看本轮已核验的带来源evidence和动作回执，列清已完成与剩余步骤；只为一个明确缺失条件继续观察，不要重新读取已取材的来源窗口。已核验用户要求的结果就结束；没有可用核验手段则如实说明未验证部分，不无限循环。需要人工选择时用ask_user，不重复未知送达的动作。此提示不提供任何新授权。",
-        )
+        (self.stagnant >= 2).then_some(crate::prompts::RECOVERY)
     }
 }
 
@@ -166,7 +164,7 @@ mod tests {
             progress
                 .advice()
                 .unwrap()
-                .contains("不证明动作失败或任务成功")
+                .contains("不证明先前动作失败，也不证明任务已经完成")
         );
         progress.observe(ToolObservation {
             state: Some(3),

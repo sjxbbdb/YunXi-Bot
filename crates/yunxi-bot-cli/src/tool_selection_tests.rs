@@ -94,6 +94,9 @@ fn live_full_catalog_model_selection() {
                 continue;
             }
             let mut messages = vec![Message::system(super::Intent::Chat.system())];
+            messages.push(Message::system(yunxi_bot_core::prompts::tool_catalog(
+                &specs,
+            )));
             if let Some(history) = case["history"].as_array() {
                 for m in history {
                     messages.push(if m["role"] == "user" {
@@ -111,6 +114,8 @@ fn live_full_catalog_model_selection() {
             let result = model.think(
                 &ThinkRequest::new(messages)
                     .with_tools(specs.clone())
+                    .with_temperature(0.0)
+                    .with_thinking(yunxi_bot_core::think::Thinking::Enabled)
                     .with_max_tokens(4096),
             );
             let row = match result {
@@ -135,4 +140,91 @@ fn live_full_catalog_model_selection() {
         "selection failures saved in {}",
         out.display()
     );
+}
+
+#[test]
+#[ignore = "Explicit real location/weather + DeepSeek probe; saves only coordinate-free forecast for independent comparison"]
+fn live_weather_reply_retains_independent_forecast_evidence() {
+    use std::sync::Arc;
+    use yunxi_bot_core::tool::{Rule, ToolPolicy};
+    let home = PathBuf::from(std::env::var("YUNXI_TEST_HOME").expect("isolated test home"));
+    assert!(
+        home.join("acceptance-only").exists(),
+        "must use isolated data"
+    );
+    let out = PathBuf::from(std::env::var("YUNXI_WEATHER_REPORT").expect("new report path"));
+    drop(
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&out)
+            .unwrap(),
+    );
+    let identity: Vec<_> = ["persona.md", "profile.md"]
+        .iter()
+        .map(|n| fs::read(home.join(n)).unwrap())
+        .collect();
+    let registry = crate::tooling::default_registry(&home).unwrap();
+    let allowed = ["now", "mac_location", "mac_weather"];
+    let policy = ToolPolicy {
+        allow: allowed.iter().map(|n| Rule::tool(*n)).collect(),
+        deny: registry
+            .specs()
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap())
+            .filter(|n| !allowed.contains(n))
+            .map(Rule::tool)
+            .collect(),
+        ..ToolPolicy::default()
+    };
+    let mut handler = super::ChatHandler::new(
+        home.clone(),
+        "云熙",
+        super::DEFAULT_PERSONA,
+        super::default_rules(),
+    )
+    .with_tools(registry)
+    .with_policy(policy)
+    .with_sink(Arc::new(
+        crate::tool_sink::LedgerToolSink::open(home.join("ledger.jsonl")).unwrap(),
+    ))
+    .with_decider(Arc::new(yunxi_bot_core::decide::LayaDecider::new(
+        "http://127.0.0.1:17870/decide",
+    )));
+    let mut rows = Vec::new();
+    for input in [
+        "请查询我这里明天下午三点的预报，只回答温度、降雨概率以及是不是一定会下雨。",
+        "再解释一下：这个百分比能证明三点开始下、四点就停吗？不要查其他资料。",
+    ] {
+        let route = handler
+            .route_for(input, yunxi_bot_core::think::ReasoningEffort::Auto)
+            .unwrap();
+        let mut records = Vec::new();
+        let reply = handler.chat_turn(&route, input, &mut records).unwrap();
+        let forecasts: Vec<Value> = handler
+            .chat_layout()
+            .unwrap()
+            .build()
+            .iter()
+            .filter(|m| m.role == yunxi_bot_core::think::Role::Tool)
+            .filter_map(|m| {
+                m.live_content
+                    .as_ref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            })
+            .filter(|v| v.get("forecast").is_some())
+            .collect();
+        assert!(!forecasts.is_empty());
+        for data in &forecasts {
+            assert!(data["forecast"].get("latitude").is_none());
+            assert!(data["forecast"].get("longitude").is_none());
+            assert_eq!(data["source_url"], "https://open-meteo.com/");
+        }
+        rows.push(json!({"input":input,"reply":reply,"forecasts":forecasts}));
+        fs::write(&out, serde_json::to_vec_pretty(&json!({"scope":"real ChatHandler with native weather; semantic evaluation is independent/manual", "turns":rows})).unwrap()).unwrap();
+    }
+    for (index, name) in ["persona.md", "profile.md"].iter().enumerate() {
+        assert_eq!(fs::read(home.join(name)).unwrap(), identity[index]);
+    }
 }

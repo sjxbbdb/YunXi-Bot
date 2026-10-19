@@ -50,6 +50,12 @@ const PLANNER_NAME: &str = "云熙";
 pub struct PlannedStep {
     pub id: String,
     pub instruction: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::model::deserialize_required_tools"
+    )]
+    pub required_tools: Option<Vec<String>>,
     #[serde(default)]
     pub depends_on: Vec<String>,
     /// 步骤类型。模型可以不填，由 Rust 侧按文本兜底判。
@@ -208,31 +214,10 @@ fn rule_lines(rules: &str) -> Vec<String> {
 /// 上限写进提示词是**提前劝住**，不是约束——提示词拦不住模型，
 /// 所以 [`parse_plan`] 还会照着同一个上限再卡一次。
 fn plan_instructions(max_steps: u32) -> String {
-    let mut out = String::new();
-    out.push_str("\n\n# 任务拆解\n\n");
-    out.push_str("把目标拆成可独立执行、可验收的步骤，只输出 JSON，不要写解释或寒暄。\n\n");
-    out.push_str("## 输出格式\n\n");
-    out.push_str("推荐 {\"steps\":[...]}，也接受直接输出数组。每个步骤形如：\n\n");
-    out.push_str(
-        "{\"id\":\"s1\",\"instruction\":\"做什么\",\"depends_on\":[],\"kind\":\"edit\"}\n\n",
-    );
-    out.push_str("## 字段规则\n\n");
-    out.push_str("- id：非空且唯一，用 s1、s2 这类短标识；\n");
-    out.push_str(
-        "- instruction：写清做到什么算完成，不要写\"继续\"\"处理一下\"这种没法验收的话；\n",
-    );
-    out.push_str(
-        "- depends_on：只能引用本次清单里出现过的 id；没有依赖就写空数组，不要写 null；\n",
-    );
-    out.push_str(
-        "- kind：可选，取值 conversation / lookup / generation / edit / analysis / planning / execution；\
-         拿不准就省略，由本地按指令文本判定。\n\n",
-    );
-    out.push_str("## 步数\n\n");
-    out.push_str(&format!(
-        "最多 {max_steps} 步。一步能做完就不要拆两步；目标本身很简单时，只给一步也是正确答案。\n"
-    ));
-    out
+    format!(
+        "\n\n# 任务拆解\n{}\n最多 {max_steps} 步。",
+        crate::prompts::internal(crate::prompts::PLAN)
+    )
 }
 
 /// 不可解析时的统一错误构造。
@@ -493,6 +478,20 @@ fn check_usable(steps: &[PlannedStep], raw: &str) -> Result<(), TaskError> {
 
     let mut seen = BTreeSet::new();
     for (index, step) in steps.iter().enumerate() {
+        if step
+            .instruction
+            .trim_start()
+            .starts_with(super::engine::DECIDE_PREFIX)
+            && step
+                .required_tools
+                .as_ref()
+                .is_some_and(|names| !names.is_empty())
+        {
+            return Err(unparsable(
+                "决策步骤不执行工具，required_tools 必须为空",
+                raw,
+            ));
+        }
         if step.id.trim().is_empty() {
             return Err(unparsable(
                 format!("第 {} 个步骤的 id 是空白", index + 1),
@@ -531,11 +530,51 @@ fn planned_to_step(planned: &PlannedStep) -> Step {
     });
     Step::new(planned.id.clone(), planned.instruction.clone(), kind)
         .with_depends_on(planned.depends_on.clone())
+        .with_required_tools(planned.required_tools.clone())
 }
 
 #[cfg(test)]
 mod decide_kind_tests {
     use super::*;
+
+    #[test]
+    fn required_tool_evidence_survives_plan_conversion() {
+        let raw = r#"{"steps":[{"id":"s1","instruction":"读取文件，不得调用 run_command；有歧义再询问","required_tools":["read_file"]}]}"#;
+        let steps = planned_to_steps(&parse_plan(raw).unwrap());
+        assert_eq!(
+            serde_json::to_value(&steps[0]).unwrap()["required_tools"],
+            serde_json::json!(["read_file"])
+        );
+    }
+
+    #[test]
+    fn malformed_required_tools_are_rejected_instead_of_ignored() {
+        for value in [
+            serde_json::json!(["read_file", "read_file"]),
+            serde_json::json!([""]),
+            serde_json::json!([" read_file"]),
+            serde_json::json!("read_file"),
+            serde_json::json!([1]),
+        ] {
+            let raw = serde_json::json!({"steps":[{"id":"s1","instruction":"读文件","required_tools":value}]}).to_string();
+            assert!(parse_plan(&raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn decision_steps_cannot_claim_tool_execution_and_legacy_steps_stay_legacy() {
+        assert!(parse_plan(r#"{"steps":[{"id":"s1","instruction":"decide: 选什么","required_tools":["read_file"]}]}"#).is_err());
+        let old = planned_to_steps(
+            &parse_plan(r#"{"steps":[{"id":"s1","instruction":"用 read_file 读取"}]}"#).unwrap(),
+        );
+        assert!(old[0].required_tools.is_none());
+        assert!(
+            serde_json::to_value(&old[0])
+                .unwrap()
+                .get("required_tools")
+                .is_none()
+        );
+    }
 
     fn plan(steps: serde_json::Value) -> String {
         serde_json::json!({ "steps": steps }).to_string()

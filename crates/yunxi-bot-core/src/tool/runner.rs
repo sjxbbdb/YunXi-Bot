@@ -18,7 +18,7 @@
 //!
 //! **1. 被拒绝也是结果，要回灌给模型。**
 //! 拒绝不是"这次调用没了"，而是"这条路走不通"。模型需要知道，
-//! 才能换个做法或者用 `BLOCKED:` 说明情况。静默失败会让它一头撞死在同一处。
+//! 才能按当前职责说明阻塞。静默失败会让它一头撞死在同一处。
 //!
 //! **2. 工具失败不是任务失败。**
 //! 网络不通、文件不存在——这些都要变成一段文本回灌。只有"审批门禁本身出错"
@@ -116,10 +116,12 @@ impl Approver for RefusingApprover {
 }
 
 /// 一次工具调用留痕。**要进台账**，否则事后说不清机器做过什么。
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallRecord {
     pub tool: String,
     pub arguments: Value,
+    #[serde(skip)]
+    pub live_arguments: Option<Value>,
     pub capability: Capability,
     pub decision: GateDecision,
     /// 执行结果。`None` 表示没执行（被拒绝 / 需人工但没人应答）。
@@ -144,6 +146,17 @@ impl ToolCallRecord {
     /// 这次调用真的动了系统吗。
     pub fn executed(&self) -> bool {
         matches!(self.output, Some(Ok(_)))
+    }
+}
+
+impl std::fmt::Debug for ToolCallRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCallRecord")
+            .field("tool", &self.tool)
+            .field("arguments", &self.arguments)
+            .field("decision", &self.decision)
+            .field("output", &self.output)
+            .finish()
     }
 }
 
@@ -239,6 +252,7 @@ impl From<ThinkError> for ToolLoopError {
 
 /// 工具循环。
 pub struct ToolRunner<'a> {
+    review_identity: Option<String>,
     registry: &'a ToolRegistry,
     /// 拥有而不是借用：`Approval::Always` 要往白名单里写东西。
     policy: ToolPolicy,
@@ -390,6 +404,7 @@ impl<'a> ToolRunner<'a> {
         ctx: ToolContext,
     ) -> Self {
         Self {
+            review_identity: None,
             registry,
             policy,
             approver,
@@ -411,6 +426,12 @@ impl<'a> ToolRunner<'a> {
     /// 配合 AskUserTool::deferred 让出当前轮，同批动作不能使用尚未得到的答案。
     pub fn with_deferred_questions(mut self) -> Self {
         self.defer_questions = true;
+        self
+    }
+
+    /// 一次无工具的表达校对，计入轮数上限；未经校对的草稿不流出。
+    pub fn with_reply_review(mut self, identity: impl Into<String>) -> Self {
+        self.review_identity = Some(identity.into());
         self
     }
 
@@ -515,18 +536,31 @@ impl<'a> ToolRunner<'a> {
         max_tokens: u32,
     ) -> Result<ToolRunOutcome, ToolLoopError> {
         let specs = self.registry.specs();
+        let catalog = crate::prompts::tool_catalog(&specs);
         let mut calls = Vec::new();
         let mut progress = super::progress::Progress::default();
 
-        // 轮数就是模型调用次数——一轮一次，没有别的调用点。
-        // 用 `round` 本身当计数，不另开一个变量（那样 clippy 会认为它是
-        // 显式循环计数器，而且两者一旦漂移就是账目不对）。
+        // 每轮一次生成；启用最终校对时必须在同一个轮数上限内再留一次请求。
         // 这个运行里请求过的每一次工具调用（工具名 + 参数）。
         // 用来发现"原地打转"——见 `detect_repeat`。
         let mut seen: Vec<(String, String)> = Vec::new();
 
         for round in 1..=self.max_rounds {
+            let now = crate::now_millis().map_err(|e| {
+                ToolLoopError::Resource(ToolError::Failed {
+                    detail: e.to_string(),
+                })
+            })?;
+            let weather_context = layout.weather_context(now);
             let mut messages = layout.build();
+            if let Some(context) = weather_context.as_ref() {
+                messages.push(context.clone());
+            }
+            // 不存入历史；下一次调用按当前注册表替换整份目录。
+            // 纯规划没有执行工具，不能用空目录否定其后续执行阶段的能力参考。
+            if !specs.is_empty() {
+                messages.insert(1, Message::system(catalog.clone()));
+            }
             if let Some(material) = progress.evidence_message() {
                 messages.push(material);
             }
@@ -547,7 +581,11 @@ impl<'a> ToolRunner<'a> {
             // **走流式入口。** 不支持的 Thinker 会退化成一次性返回
             // （`Thinker::think_stream` 的默认实现），所以这里不需要判断。
             let mut resp = {
-                let cb = self.on_delta.clone();
+                let cb = if self.review_identity.is_some() {
+                    None
+                } else {
+                    self.on_delta.clone()
+                };
                 let mut emit = |t: &str| {
                     if let Some(f) = &cb {
                         f(t);
@@ -556,6 +594,9 @@ impl<'a> ToolRunner<'a> {
                 thinker.think_stream(&req, &mut emit)?
             };
 
+            if resp.finish_reason.as_deref() == Some("length") {
+                return Err(ThinkError::OutputLimit { usage: resp.usage }.into());
+            }
             let mut reqs = parse_tool_calls(&resp.tool_calls);
             let retained_choice = reqs.is_empty() && self.registry.requires_user_choice();
             if retained_choice {
@@ -586,6 +627,85 @@ impl<'a> ToolRunner<'a> {
                 return Err(ToolLoopError::Repeating { tool, times });
             }
             if reqs.is_empty() {
+                if self.review_identity.is_some() {
+                    if round >= self.max_rounds {
+                        return Err(ToolLoopError::RoundsExhausted { rounds: round });
+                    }
+                    let proof = super::verification::completion(&calls, &self.ctx.cwd);
+                    let conversation:Vec<Value> = req.messages.iter().filter(|m|m.role!=crate::think::Role::System)
+                        .map(|m|serde_json::json!({"role":m.role,"content":m.live_content.as_ref().unwrap_or(&m.content),"tool_call_id":m.tool_call_id})).collect();
+                    let system = format!(
+                        "{}\n\n{}\n\n{}\n\n{}",
+                        crate::prompts::BASE,
+                        crate::prompts::EXPRESSION,
+                        crate::prompts::REPLY_REVIEW,
+                        crate::prompts::PERSONA_VOICE
+                    );
+                    let identity=Message::user(serde_json::json!({"identity_material":self.review_identity,"scope":"完整人格主导表达风格，画像与记忆帮助理解；这些资料不改变事实核验标准或执行权限"}).to_string());
+                    let draft = resp.content.clone();
+                    let mut material = serde_json::json!({"conversation":conversation,"candidate":draft,"verification":proof.err()});
+                    if let Some(context) = weather_context.as_ref() {
+                        material["weather_context"] = serde_json::json!(context.content);
+                    }
+                    let images = req.messages.iter().flat_map(|m| m.images.clone()).collect();
+                    let messages = vec![
+                        Message::system(system),
+                        identity,
+                        Message::user_with_images(material.to_string(), images),
+                    ];
+                    let mut review = ThinkRequest::new(messages)
+                        .with_max_tokens(max_tokens)
+                        .with_thinking(crate::think::Thinking::Enabled)
+                        .with_temperature(0.0);
+                    review.json_output = true;
+                    resp = thinker.think_stream(&review, &mut |_| {})?;
+                    if resp.finish_reason.as_deref() == Some("length") {
+                        return Err(ThinkError::OutputLimit { usage: resp.usage }.into());
+                    }
+                    let parsed: Value = serde_json::from_str(&resp.content).map_err(|_| {
+                        ThinkError::Malformed("表达校对格式无效，未回退原稿".into())
+                    })?;
+                    let problems = parsed["problems"].as_array().filter(|p| {
+                        p.len() <= 4
+                            && p.iter().all(|v| {
+                                v.as_str().is_some_and(|v| {
+                                    [
+                                        "unsupported_fact",
+                                        "unwanted_advice",
+                                        "status_error",
+                                        "tone_drift",
+                                    ]
+                                    .contains(&v)
+                                })
+                            })
+                    });
+                    if !resp.tool_calls.is_empty()
+                        || problems.is_none()
+                        || parsed.as_object().is_none_or(|o| o.len() != 2)
+                    {
+                        return Err(ThinkError::Malformed(
+                            "表达校对协议无效，未派发动作或回退原稿".into(),
+                        )
+                        .into());
+                    }
+                    let reviewed = parsed["reply"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty() && s.len() <= 65536)
+                        .ok_or_else(|| ThinkError::Malformed("表达校对正文无效".into()))?;
+                    // 无问题的判定不应成为把人格原稿重新润色成通用话术的机会。
+                    let final_text = if problems.is_some_and(Vec::is_empty) {
+                        draft.as_str()
+                    } else {
+                        reviewed
+                    };
+                    if final_text.trim().is_empty() || final_text.len() > 65536 {
+                        return Err(ThinkError::Malformed("最终表达正文无效".into()).into());
+                    }
+                    resp.content = final_text.to_string();
+                    if let Some(emit) = &self.on_delta {
+                        emit(&resp.content);
+                    }
+                }
                 // 没有工具调用 → 这一轮就是最终答复。
                 // 记进历史，让后续轮次的前缀能续上。
                 layout.push_raw(Message::assistant(resp.content.clone()));
@@ -593,7 +713,7 @@ impl<'a> ToolRunner<'a> {
                     text: resp.content,
                     rounds: round,
                     calls,
-                    model_calls: round,
+                    model_calls: round + u32::from(self.review_identity.is_some()),
                 });
             }
 
@@ -643,6 +763,7 @@ impl<'a> ToolRunner<'a> {
                 .map(|(index, tr)| {
                     if question.is_some_and(|q| q != index) {
                         Decided::Settled(ToolCallRecord {
+            live_arguments: None,
                             tool: tr.name.clone(),
                             arguments: tr.arguments.clone(),
                             capability: self
@@ -661,6 +782,7 @@ impl<'a> ToolRunner<'a> {
                         .and_then(|tool| tool.interaction_group())
                         .is_some_and(|group| !interaction_groups.insert(group)) {
                         Decided::Settled(ToolCallRecord {
+            live_arguments: None,
                             tool: tr.name.clone(),
                             arguments: tr.arguments.clone(),
                             capability: self.registry.get(&tr.name).map_or(Capability::Unknown, |tool| tool.capability()),
@@ -712,6 +834,7 @@ impl<'a> ToolRunner<'a> {
                 }
                 let private = self.registry.get(&tr.name).is_some_and(|t| t.private_io());
                 if private {
+                    record.live_arguments = Some(record.arguments.clone());
                     record.arguments = self
                         .registry
                         .get(&tr.name)
@@ -739,6 +862,11 @@ impl<'a> ToolRunner<'a> {
                 // **无论成败都要回灌。** 被拒绝、失败、成功——模型都得知道，
                 // 否则它会以为工具没被调用过而重复请求同一个。
                 let text = render_tool_result(&record);
+                if tr.name == "computer_verify" && record.executed() {
+                    record.live_output = live
+                        .as_ref()
+                        .and_then(|o| super::verification::computer_receipt(&o.text));
+                }
                 calls.push(record);
                 let mut message = Message::tool_result(tr.id.clone(), text);
                 if let Some(output) = live {
@@ -810,6 +938,7 @@ impl<'a> ToolRunner<'a> {
                 format!("没有这个工具: {}", tr.name)
             };
             return Decided::Settled(ToolCallRecord {
+                live_arguments: None,
                 tool: tr.name.clone(),
                 arguments: tr.arguments.clone(),
                 capability: Capability::ReadOnly,
@@ -837,6 +966,7 @@ impl<'a> ToolRunner<'a> {
 
         match decision {
             GateDecision::Deny { .. } => Decided::Settled(ToolCallRecord {
+                live_arguments: None,
                 tool: tr.name.clone(),
                 arguments: tr.arguments.clone(),
                 capability: cap,
@@ -871,6 +1001,7 @@ impl<'a> ToolRunner<'a> {
                 };
                 match self.approver.approve(&req) {
                     Approval::Deny => Decided::Settled(ToolCallRecord {
+                        live_arguments: None,
                         tool: tr.name.clone(),
                         arguments: tr.arguments.clone(),
                         capability: cap,
@@ -928,6 +1059,7 @@ impl<'a> ToolRunner<'a> {
                     .unwrap_or(started)
                     .saturating_sub(started);
                 ToolCallRecord {
+                    live_arguments: None,
                     tool: call.name.clone(),
                     arguments: call.arguments.clone(),
                     capability,
@@ -970,6 +1102,9 @@ impl<'a> ToolRunner<'a> {
             }),
         };
         if let Some(tool) = self.registry.get(name) {
+            if tool.private_io() {
+                record.live_arguments = Some(call.arguments.clone());
+            }
             record.arguments = tool.audit_arguments(&call.arguments);
             if tool.private_io() {
                 record.output = record
@@ -979,6 +1114,12 @@ impl<'a> ToolRunner<'a> {
         }
         if let Some(sink) = self.sink.as_ref() {
             sink.record(&record);
+        }
+        if name == "computer_verify" {
+            record.live_output = result
+                .as_ref()
+                .ok()
+                .and_then(|o| super::verification::computer_receipt(&o.text));
         }
         self.nested_calls.push(record);
         result
@@ -1078,6 +1219,7 @@ impl<'a> ToolRunner<'a> {
             // 不能因为走了并行路径就失效
             self.ctx.read_files.extend(read);
             out.push(ToolCallRecord {
+                live_arguments: None,
                 tool: call.name.clone(),
                 arguments: call.arguments.clone(),
                 capability,
@@ -1234,12 +1376,12 @@ pub fn render_tool_result(rec: &ToolCallRecord) -> String {
         None => match &rec.decision {
             GateDecision::Deny { reason } => format!(
                 "工具 {} 被拒绝，不会执行：{reason}。不要重复请求同一个调用，\
-                 请换一种做法，或者用 BLOCKED: 说明你缺什么。",
+                 不换工具绕过拒绝；遵循本轮输出契约说明未执行及继续所需条件。",
                 rec.tool
             ),
             GateDecision::Ask { reason } => format!(
                 "工具 {} 需要人工确认，当前无人可应答（{reason}）。\
-                 不要重复请求，请用 BLOCKED: 说明你需要什么才能继续。",
+                 不要重复请求；遵循本轮输出契约说明未执行及继续所需条件。",
                 rec.tool
             ),
             GateDecision::Allow { .. } => {
@@ -1557,6 +1699,7 @@ mod parallel_tests {
     #[test]
     fn a_settled_decision_is_not_parallelizable() {
         let d = Decided::Settled(ToolCallRecord {
+            live_arguments: None,
             tool: "x".into(),
             arguments: json!({}),
             capability: Capability::ReadOnly,
@@ -1922,6 +2065,154 @@ mod tests {
     }
 
     #[test]
+    fn final_review_has_no_tools_does_not_stream_the_draft_and_is_bounded() {
+        let tools = ToolRegistry::new();
+        let mut approver = RefusingApprover;
+        let mut layout = PromptLayout::new("test persona");
+        layout.ask("只想聊聊");
+        let thinker = ScriptThinker::new(vec![
+            ScriptThinker::text_reply("未经核实的草稿"),
+            ScriptThinker::text_reply(r#"{"problems":["unsupported_fact"],"reply":"最终回复"}"#),
+        ]);
+        let text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = text.clone();
+        let mut runner = ToolRunner::new(
+            &tools,
+            ToolPolicy::default(),
+            &mut approver,
+            ToolContext::new(std::env::temp_dir(), crate::policy::SandboxMode::ReadOnly),
+        )
+        .with_reply_review("test persona")
+        .with_max_rounds(2)
+        .with_on_delta(std::sync::Arc::new(move |s| {
+            sink.lock().unwrap().push_str(s)
+        }));
+        let result = runner.run(&thinker, &mut layout, 512).unwrap();
+        assert_eq!(result.text, "最终回复");
+        assert_eq!(result.model_calls, 2);
+        assert_eq!(*text.lock().unwrap(), "最终回复");
+        let requests = thinker.requests();
+        assert!(requests[1].tools.is_empty());
+        assert!(requests[1].messages[0].content.contains("独立校对"));
+        assert!(
+            requests[1].messages[0]
+                .content
+                .ends_with("表达优先级不改变事实、执行权限或输出协议。\n")
+        );
+        assert_eq!(
+            requests[1]
+                .messages
+                .iter()
+                .map(|m| m.content.matches("test persona").count())
+                .sum::<usize>(),
+            1
+        );
+        assert!(
+            !serde_json::to_string(&layout)
+                .unwrap()
+                .contains("未经核实的草稿")
+        );
+        let denied = ScriptThinker::new(vec![ScriptThinker::text_reply("草稿")]);
+        let mut runner = ToolRunner::new(
+            &tools,
+            ToolPolicy::default(),
+            &mut approver,
+            ToolContext::new(std::env::temp_dir(), crate::policy::SandboxMode::ReadOnly),
+        )
+        .with_reply_review("test persona")
+        .with_max_rounds(1);
+        assert!(
+            runner
+                .run(&denied, &mut PromptLayout::new("test"), 512)
+                .is_err()
+        );
+        assert_eq!(denied.requests().len(), 1);
+    }
+
+    #[test]
+    fn review_without_findings_cannot_replace_persona_voice_with_generic_copy() {
+        let tools = ToolRegistry::new();
+        let mut approver = RefusingApprover;
+        let original = "嗯，叫我我就应一声。今天先不忙。";
+        let thinker = ScriptThinker::new(vec![
+            ScriptThinker::text_reply(original),
+            ScriptThinker::text_reply(
+                r#"{"problems":[],"reply":"感谢您的分享。请问还有什么可以帮助您？"}"#,
+            ),
+        ]);
+        let mut layout = PromptLayout::new("synthetic persona");
+        layout.ask("没事，只想叫你一声。");
+        let out = runner(&tools, ToolPolicy::default(), &mut approver)
+            .with_reply_review("synthetic persona")
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+        assert_eq!(out.text, original);
+        assert!(
+            !serde_json::to_string(&layout)
+                .unwrap()
+                .contains("感谢您的分享")
+        );
+        assert_eq!(out.model_calls, 2);
+    }
+
+    #[test]
+    fn no_findings_still_requires_valid_review_and_nonempty_bounded_draft() {
+        let tools = ToolRegistry::new();
+        let mut approver = RefusingApprover;
+        for (draft, review) in [
+            (String::new(), r#"{"problems":[],"reply":"替代"}"#),
+            ("字".repeat(22000), r#"{"problems":[],"reply":"替代"}"#),
+            ("原稿".into(), r#"{"problems":[],"reply":""}"#),
+            (
+                "原稿".into(),
+                r#"{"problems":[],"reply":"替代","extra":true}"#,
+            ),
+            ("原稿".into(), r#"{"problems":["unknown"],"reply":"替代"}"#),
+        ] {
+            let thinker = ScriptThinker::new(vec![
+                ScriptThinker::text_reply(&draft),
+                ScriptThinker::text_reply(review),
+            ]);
+            let mut layout = PromptLayout::new("synthetic persona");
+            layout.ask("叫你一声。");
+            assert!(
+                runner(&tools, ToolPolicy::default(), &mut approver)
+                    .with_reply_review("synthetic persona")
+                    .run(&thinker, &mut layout, 512)
+                    .is_err()
+            );
+            assert_eq!(thinker.requests().len(), 2);
+        }
+    }
+
+    #[test]
+    fn review_tool_requests_are_never_dispatched_or_retried() {
+        let tools = ToolRegistry::new();
+        let mut approver = RefusingApprover;
+        let thinker = ScriptThinker::new(vec![
+            ScriptThinker::text_reply("草稿"),
+            ScriptThinker::tool_reply(vec![call_json(
+                "x",
+                "write_file",
+                json!({"path":"must-not-exist"}),
+            )]),
+        ]);
+        let mut runner = ToolRunner::new(
+            &tools,
+            ToolPolicy::default(),
+            &mut approver,
+            ToolContext::new(std::env::temp_dir(), crate::policy::SandboxMode::ReadOnly),
+        )
+        .with_reply_review("test persona");
+        assert!(
+            runner
+                .run(&thinker, &mut PromptLayout::new("test"), 512)
+                .is_err()
+        );
+        assert_eq!(thinker.requests().len(), 2);
+    }
+
+    #[test]
     fn verified_cross_app_material_is_transient_and_cleared_on_handoff() {
         struct Verification;
         impl Tool for Verification {
@@ -1967,6 +2258,21 @@ mod tests {
         let result = runner(&registry, ToolPolicy::default(), &mut ap)
             .run(&thinker, &mut layout, 1024)
             .unwrap();
+        let receipt = result.calls[0]
+            .live_output
+            .as_ref()
+            .expect("current-run verification receipt");
+        assert!(!receipt.text.contains("private-cross-app-material"));
+        let mut act = result.calls[0].clone();
+        act.tool = "computer_act".into();
+        act.live_arguments = Some(json!({"arguments":{"target_id":"browser","tab_id":"source"}}));
+        assert!(
+            super::super::verification::completion(
+                &[act, result.calls[0].clone()],
+                &std::env::temp_dir()
+            )
+            .is_ok()
+        );
         let requests = thinker.requests();
         assert!(requests[2].messages.iter().any(|m| {
             m.content.starts_with("【本轮工具取材")
@@ -1985,6 +2291,26 @@ mod tests {
             format!("{:?}", requests[2].messages),
         ] {
             assert!(!saved.contains("private-cross-app-material"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut nested = runner(&registry, ToolPolicy::default(), &mut ap);
+            let args = json!({"target_id":"browser","tab_id":"source"});
+            nested
+                .workflow_dispatch("computer_verify", args.clone())
+                .unwrap();
+            let record = &nested.nested_calls[0];
+            assert_eq!(record.live_arguments.as_ref(), Some(&args));
+            let receipt = record
+                .live_output
+                .as_ref()
+                .expect("workflow verification receipt");
+            assert!(!receipt.text.contains("private-cross-app-material"));
+            assert!(
+                !serde_json::to_string(record)
+                    .unwrap()
+                    .contains("private-cross-app-material")
+            );
         }
     }
 
@@ -2348,6 +2674,52 @@ mod tests {
     }
 
     // ---- 基本循环 ----
+
+    #[test]
+    fn truncated_model_response_cannot_dispatch_even_a_complete_tool_call() {
+        let tool = ScriptTool::new("write", Capability::ReadOnly);
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(tool.clone())).unwrap();
+        let mut reply = ScriptThinker::tool_reply(vec![call_json("a", "write", json!({}))]);
+        reply.finish_reason = Some("length".into());
+        let thinker = ScriptThinker::new(vec![reply, ScriptThinker::text_reply("OK: done")]);
+        let mut layout = PromptLayout::new("S");
+        layout.ask("test");
+        let mut ap = RefusingApprover;
+        assert!(
+            runner(&reg, ToolPolicy::default(), &mut ap)
+                .run(&thinker, &mut layout, 512)
+                .is_err()
+        );
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn no_execution_tools_does_not_erase_planning_capability_reference() {
+        let reg = ToolRegistry::new();
+        let thinker = ScriptThinker::new(vec![ScriptThinker::text_reply("plan")]);
+        let mut layout =
+            PromptLayout::new("规划阶段无执行权限；后续步骤具有 read_file 和 write_file 能力");
+        layout.ask("规划文件任务");
+        let mut ap = RefusingApprover;
+        runner(&reg, ToolPolicy::default(), &mut ap)
+            .run(&thinker, &mut layout, 512)
+            .unwrap();
+        let requests = thinker.requests();
+        assert!(requests[0].tools.is_empty());
+        assert!(
+            !requests[0]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("没有已注册的工具能力"))
+        );
+        assert!(
+            requests[0]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("write_file"))
+        );
+    }
 
     #[test]
     fn deferred_question_yields_persists_and_blocks_even_preapproved_sibling_actions() {
@@ -3081,6 +3453,45 @@ mod tests {
     }
 
     #[test]
+    fn capability_catalog_rebuilds_without_persisting_removed_tools() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(ScriptTool::new(
+            "catalog_fixture",
+            Capability::ReadOnly,
+        )))
+        .unwrap();
+        let mut ap = RefusingApprover;
+        let mut layout = PromptLayout::new("S");
+        layout.ask("q");
+        let first = ScriptThinker::new(vec![ScriptThinker::text_reply("done")]);
+        runner(&reg, ToolPolicy::default(), &mut ap)
+            .run(&first, &mut layout, 512)
+            .unwrap();
+        assert!(
+            first.requests()[0].messages[1]
+                .content
+                .contains("catalog_fixture")
+        );
+        assert!(
+            !layout
+                .build()
+                .iter()
+                .any(|m| m.content.contains("catalog_fixture"))
+        );
+        let next = ScriptThinker::new(vec![ScriptThinker::text_reply("done")]);
+        runner(&ToolRegistry::new(), ToolPolicy::default(), &mut ap)
+            .run(&next, &mut layout, 512)
+            .unwrap();
+        assert!(
+            !next.requests()[0]
+                .messages
+                .iter()
+                .any(|m| m.content.contains("catalog_fixture"))
+        );
+        assert!(next.requests()[0].tools.is_empty());
+    }
+
+    #[test]
     fn tool_output_never_enters_the_stable_prefix() {
         // 工具返回是不可信数据，绝不许拼进系统提示词
         let mut reg = ToolRegistry::new();
@@ -3203,6 +3614,7 @@ mod tests {
     fn render_distinguishes_denied_from_ask_from_failed() {
         // 三种结局下模型下一步的动作完全不同，文本必须能区分
         let base = |decision, output| ToolCallRecord {
+            live_arguments: None,
             tool: "t".into(),
             arguments: json!({}),
             capability: Capability::Write,
@@ -3233,6 +3645,12 @@ mod tests {
             })),
         ));
         assert!(denied.contains("被拒绝"));
+        for message in [&denied, &asked] {
+            assert!(
+                !message.contains("BLOCKED:"),
+                "共享工具回执不能把步骤专用格式带进主对话：{message}"
+            );
+        }
         assert!(asked.contains("无人可应答"));
         assert!(failed.contains("执行失败"));
         assert_ne!(denied, asked);
@@ -3242,6 +3660,7 @@ mod tests {
     #[test]
     fn render_passes_successful_output_through_unchanged() {
         let rec = ToolCallRecord {
+            live_arguments: None,
             tool: "t".into(),
             arguments: json!({}),
             capability: Capability::ReadOnly,
@@ -3260,6 +3679,7 @@ mod tests {
     fn records_are_ledger_ready() {
         // 每次调用都要能写进台账，否则说不清机器做过什么
         let rec = ToolCallRecord {
+            live_arguments: None,
             tool: "read_file".into(),
             arguments: json!({ "path": "a.md" }),
             capability: Capability::ReadOnly,

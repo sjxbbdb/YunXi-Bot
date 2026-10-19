@@ -379,7 +379,7 @@ pub fn triage_questions() -> Vec<Question> {
     vec![
         Question::choice(
             "triage",
-            "这一封邮件此刻应当如何处置？",
+            crate::prompts::decisions::TRIAGE,
             &[
                 ("speak", "值得现在就告诉使用者，晚了他会不方便"),
                 ("hold", "有内容但不必现在说，攒着等他自己看"),

@@ -237,7 +237,7 @@ pub fn enabled(home: &Path) -> Result<bool, String> {
 
 pub struct MailReview {
     path: PathBuf,
-    _lock: fs::File,
+    _lock: crate::instance::ExclusiveFileLock,
     state: State,
     calls_this_round: u32,
 }

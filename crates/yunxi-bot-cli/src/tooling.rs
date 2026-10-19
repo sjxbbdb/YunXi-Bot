@@ -535,6 +535,17 @@ mod tests {
             "工具数变了要同步更新这个断言：{:?}",
             r.names()
         );
+        let catalog = yunxi_bot_core::prompts::tool_catalog(&r.specs());
+        let entries: serde_json::Value =
+            serde_json::from_str(catalog.lines().last().unwrap()).unwrap();
+        for entry in entries.as_array().unwrap() {
+            assert!(
+                entry["purpose"].as_str().is_some_and(|s| !s.is_empty())
+                    && entry["checks"].as_str().is_some_and(|s| !s.is_empty()),
+                "内置工具缺少选择与核验说明：{}",
+                entry["name"]
+            );
+        }
         #[cfg(target_os = "macos")]
         for name in yunxi_bot_core::tool::macos::NAMES {
             assert!(r.get(name).is_some(), "缺少原生工具 {name}");

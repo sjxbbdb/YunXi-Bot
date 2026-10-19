@@ -88,7 +88,7 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --mail-source mac|imap  邮件来源（Mac默认本机Mail，其他平台默认IMAP）
       --assistant-interval <秒>  邮件巡检周期（默认300，0关闭）
       --agent               开启记忆候选整理与已确认跟进（每60秒检查）
-      --startup-care        每日本次启动问候；日间系统定位查天气，深夜提醒休息
+      --startup-care        每次系统开机问候一次；人格、时间与天气共同生成
       --judge-every <n>      兼容旧开关；0关闭陪伴，正数启用
       --require-os-isolation  要求 OS 级写入隔离，拿不到就拒绝执行
 
@@ -106,7 +106,7 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --kind <类别>         fact / preference / relationship / event（默认 fact）
   yunxi-bot memory --pending|--followups  查看记忆候选或跟进
   yunxi-bot memory --accept <id>|--reject <id>  处置记忆候选
-  yunxi-bot memory --upgrade 停止全部写入后备份并升级v1台账
+  yunxi-bot memory --upgrade 停止全部写入后备份并逐版升级台账
   yunxi-bot knowledge add <文件>   导入 UTF-8 .md/.txt 副本
   yunxi-bot knowledge list         列出已导入的知识文档
   yunxi-bot knowledge search <问题> 语义检索（自动启动本地编码器）
@@ -122,7 +122,7 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
 
   —— 任务执行框架（给目标，不是给命令）——
   yunxi-bot do \"<目标>\"       拆解目标、逐步执行、完成一个做一个
-      --budget <n>          模型调用次数上限（默认 20）
+      --budget <n>          本任务累计生成请求上限，含续跑（默认 20）
       --max-steps <n>       拆解出的步骤上限（默认 12）
       --dry-run             不调模型，只展示会怎么拆分与路由（不花钱）
       --show-prompt         打印三段稳定前缀（核对缓存前提，不花钱）
@@ -492,6 +492,34 @@ fn cmd_tick() -> Result<i32, Box<dyn std::error::Error>> {
     let r = tick(&mut l, &TickOptions::default())?;
     print_report(&r);
     Ok(0)
+}
+
+fn print_request_budget(task: &str) {
+    use yunxi_bot_core::ledger::{EventKind, Ledger};
+    let Ok(ledger) = Ledger::open(ledger_path()) else {
+        eprintln!("实际请求累计：无法读取预算台账");
+        return;
+    };
+    let reserved = ledger
+        .events()
+        .iter()
+        .filter(|e| e.kind == EventKind::ModelRequestReserved && e.data["task"] == task)
+        .count();
+    let known = ledger
+        .events()
+        .iter()
+        .filter(|e| {
+            e.kind == EventKind::ModelRequestSettled
+                && e.data["task"] == task
+                && !e.data["usage"].is_null()
+        })
+        .count();
+    if reserved > 0 {
+        println!(
+            "实际请求累计 : {reserved} 次（跨恢复；{} 次用量未知）",
+            reserved.saturating_sub(known)
+        );
+    }
 }
 
 fn print_report(r: &yunxi_bot_core::TickReport) {
@@ -1049,7 +1077,7 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         use yunxi_bot_core::decide::LayaDecider;
         let endpoint = flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide");
         if agent_on {
-            println!("  Agent  : 开启（每60秒检查候选；模型计算不阻塞巡检）");
+            println!("  Agent  : 开启（每60秒检查跟进/记忆；每15分钟Laya判断冒泡）");
         }
         println!("  判断   : {endpoint}（本地）");
         Some(agent_engine(LayaDecider::new(endpoint)))
@@ -1929,23 +1957,7 @@ fn cmd_remember(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 /// 而且明确允许**一条都不提炼**。不写这句的话模型会硬凑，
 /// 而硬凑出来的东西会堆进待确认列表，让人懒得看——
 /// **那比不提议更坏**，因为待确认列表一废，这个机制就废了。
-const LEARN_SYSTEM: &str = "\
-你在帮一个个人助理维护「使用者画像」。
-
-只提炼**关于使用者这个人**的可复用信息：他的身份、职业、习惯、偏好、
-正在做的事、明确表达过的要求。
-
-**不要提炼这些：**
-- 通用知识、概念解释、教程（那些问的是世界，不是他）
-- 一次性的临时问答（比如「帮我看看这个文件」——它不说明他是谁）
-- 秘密、密钥、密码、证件号、银行卡号（进档案是最坏的一种错）
-- 你自己说过的话（那不是他说的）
-
-输出格式：每行一条，以「- 」开头，一句话，不超过 30 字。
-最多 3 条。
-
-**如果这段对话里没有任何值得记住的、关于这个人的信息，
-就什么都不要输出。** 一条都没有是正常结果，不要硬凑。";
+const LEARN_SYSTEM: &str = yunxi_bot_core::prompts::PROFILE_LEARN;
 
 /// 解析提炼结果。
 ///
@@ -2059,20 +2071,16 @@ fn cmd_profile(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             println!("还没有对话记录——先 `yunxi-bot chat` 聊几轮再来。");
             return Ok(0);
         };
-        // 从历史里取使用者说过的话。**只取 User**：
-        // 助理自己的话会污染提取（它会把"我理解你在杭州"当成使用者说的）。
-        let said: Vec<String> = session
-            .layout
-            .build()
-            .into_iter()
-            .filter(|m: &Message| m.role == yunxi_bot_core::think::Role::User)
-            .map(|m| m.content)
-            .collect();
+        let source_ledger = Ledger::open(ledger_path())?;
+        let said = yunxi_bot_core::continuity::profile_statements(
+            &session.layout.build(),
+            source_ledger.events(),
+        );
         if said.is_empty() {
-            println!("这个会话里还没有你说过的话。");
+            println!("这个会话中没有可由台账核实、且未撤回的用户原话；旧记录不猜测来源。");
             return Ok(0);
         }
-        let transcript = said.join("\n---\n");
+        let transcript = serde_json::Value::Array(said).to_string();
 
         let config = ModelSpec::DEEPSEEK_FLASH.thinker_config();
         let thinker = match OpenAiThinker::from_home(&home, config) {
@@ -2339,8 +2347,22 @@ fn cmd_memory(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 
     if args.iter().any(|a| a == "--upgrade") {
         let _guard = yunxi_bot_core::instance::InstanceLock::acquire(lock_path())?;
-        let backup = yunxi_bot_core::continuity::upgrade_ledger(&ledger_path())?;
-        println!("已迁移到v2，旧台账备份：{}", backup.display());
+        loop {
+            use std::io::BufRead;
+            let mut line = String::new();
+            std::io::BufReader::new(std::fs::File::open(ledger_path())?).read_line(&mut line)?;
+            let header: yunxi_bot_core::ledger::Header = serde_json::from_str(&line)?;
+            if header.yunxi_bot_ledger == yunxi_bot_core::ledger::LEDGER_FORMAT_VERSION {
+                println!("台账已是v{}", header.yunxi_bot_ledger);
+                break;
+            }
+            let backup = yunxi_bot_core::continuity::upgrade_ledger(&ledger_path())?;
+            println!(
+                "已迁移到v{}，旧台账备份：{}",
+                header.yunxi_bot_ledger + 1,
+                backup.display()
+            );
+        }
         return Ok(0);
     }
     if args.iter().any(|a| a == "--pending") {
@@ -3220,7 +3242,8 @@ fn cmd_do(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     println!();
     print!("{}", summarize(&outcome.task));
     println!();
-    println!("本次模型调用 : {} 次", outcome.used_model_calls);
+    println!("本次引擎调用 : {} 次", outcome.used_model_calls);
+    print_request_budget(&task_id);
     let (done, failed, skipped) = outcome.task.tally();
     match &outcome.advance {
         yunxi_bot_core::task::Advance::Finished => {
@@ -4299,7 +4322,8 @@ fn cmd_resume(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             .run(id)?
     };
     print!("{}", summarize(&outcome.task));
-    println!("\n本次模型调用 : {} 次", outcome.used_model_calls);
+    println!("\n本次引擎调用 : {} 次", outcome.used_model_calls);
+    print_request_budget(id);
     let (done, failed, skipped) = outcome.task.tally();
     match &outcome.advance {
         yunxi_bot_core::task::Advance::Finished => {

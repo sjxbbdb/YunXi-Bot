@@ -160,6 +160,11 @@ impl Tool for AssistantTool {
     fn call(&self, args: &Value, ctx: &mut ToolContext) -> Result<ToolOutput, ToolError> {
         let args = self.resolved(args, ctx)?;
         let result = macos::request(&macos::bundled_app(), &self.name, &args)?;
+        let result = if self.name == "mac_weather" {
+            super::weather::evidence(&args, result)?
+        } else {
+            result
+        };
         if self.name == "mac_document_read"
             && let Some(path) = args["path"].as_str()
         {

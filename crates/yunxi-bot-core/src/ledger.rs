@@ -21,7 +21,42 @@ use crate::{CoreError, now_millis};
 /// 当前台账格式版本。
 ///
 /// 变更格式时必须**新增相邻迁移**（vN → vN+1），不可跳版、不可重命名。
-pub const LEDGER_FORMAT_VERSION: u32 = 2;
+pub const LEDGER_FORMAT_VERSION: u32 = 4;
+
+fn request_budget_data(kind: EventKind, data: &Value) -> bool {
+    matches!(
+        kind,
+        EventKind::ModelRequestReserved | EventKind::ModelRequestSettled
+    ) || (kind == EventKind::TaskCreated && data.get("request_budget_version").is_some())
+}
+
+fn structured_task_evidence(kind: EventKind, data: &Value) -> bool {
+    kind == EventKind::TaskPlanned
+        && data
+            .get("steps")
+            .and_then(Value::as_array)
+            .is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|step| step.get("required_tools").is_some())
+            })
+}
+
+fn validate_event_payload(kind: EventKind, data: &Value) -> Result<(), String> {
+    if kind == EventKind::TaskCreated
+        && data.get("request_budget_version").is_some()
+        && data["request_budget_version"] != 4
+    {
+        return Err("任务请求预算版本无效".into());
+    }
+    crate::think::request_budget::validate(kind, data)?;
+    crate::continuity::validate_payload(kind, data)?;
+    if structured_task_evidence(kind, data) {
+        let _: Vec<crate::task::model::Step> = serde_json::from_value(data["steps"].clone())
+            .map_err(|e| format!("任务证据结构无效：{e}"))?;
+    }
+    Ok(())
+}
 
 /// 台账文件头。第一行固定是它。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +107,10 @@ pub enum EventKind {
     /// 存的是回执里的原始计数，不是算出来的钱：单价会变、时段会变，
     /// 而 token 数是既成事实。**先记账，后算钱。**
     ModelCalled,
+    /// 请求发送前的持久额度预留；崩溃后也计入任务上限。
+    ModelRequestReserved,
+    /// 无用量的失败明确记录 null，预留未结算也不返还额度。
+    ModelRequestSettled,
 
     // —— 助理链路：信息 → 判断 → 通知（全程留痕）——
     //
@@ -331,7 +370,7 @@ impl Ledger {
                 .map_err(|e| LedgerError::Io(e.to_string()))?;
             let header: Header = serde_json::from_str(&head)
                 .map_err(|e| LedgerError::Format(format!("头部不可解析: {e}")))?;
-            if !matches!(header.yunxi_bot_ledger, 1 | LEDGER_FORMAT_VERSION) {
+            if !(1..=LEDGER_FORMAT_VERSION).contains(&header.yunxi_bot_ledger) {
                 return Err(LedgerError::Format(format!(
                     "不支持的台账版本 {}，本程序只支持 {}",
                     header.yunxi_bot_ledger, LEDGER_FORMAT_VERSION
@@ -345,8 +384,13 @@ impl Ledger {
                 let ev: Event = serde_json::from_str(&line).map_err(|e| {
                     LedgerError::Format(format!("第 {} 条事件不可解析: {e}", i + 1))
                 })?;
-                crate::continuity::validate_payload(ev.kind, &ev.data)
-                    .map_err(LedgerError::Format)?;
+                if structured_task_evidence(ev.kind, &ev.data) && header.yunxi_bot_ledger < 3 {
+                    return Err(LedgerError::Format("结构化任务证据必须使用v3台账".into()));
+                }
+                if request_budget_data(ev.kind, &ev.data) && header.yunxi_bot_ledger < 4 {
+                    return Err(LedgerError::Format("请求预算事件必须使用v4台账".into()));
+                }
+                validate_event_payload(ev.kind, &ev.data).map_err(LedgerError::Format)?;
                 events.push(ev);
             }
         }
@@ -434,12 +478,14 @@ impl Ledger {
 
         let f = File::open(&self.path).map_err(|e| LedgerError::Io(e.to_string()))?;
         let mut lines = BufReader::new(f).lines();
+        let mut format_version = LEDGER_FORMAT_VERSION;
         // 头部再校验一次：文件可能在两次读之间被换掉
         if let Some(head) = lines.next() {
             let head = head.map_err(|e| LedgerError::Io(e.to_string()))?;
             let header: Header = serde_json::from_str(&head)
                 .map_err(|e| LedgerError::Format(format!("头部不可解析: {e}")))?;
-            if !matches!(header.yunxi_bot_ledger, 1 | LEDGER_FORMAT_VERSION) {
+            format_version = header.yunxi_bot_ledger;
+            if !(1..=LEDGER_FORMAT_VERSION).contains(&header.yunxi_bot_ledger) {
                 return Err(LedgerError::Format(format!(
                     "不支持的台账版本 {}，本程序只支持 {}",
                     header.yunxi_bot_ledger, LEDGER_FORMAT_VERSION
@@ -453,7 +499,13 @@ impl Ledger {
             }
             let ev: Event = serde_json::from_str(&line)
                 .map_err(|e| LedgerError::Format(format!("第 {} 条事件不可解析: {e}", i + 1)))?;
-            crate::continuity::validate_payload(ev.kind, &ev.data).map_err(LedgerError::Format)?;
+            if structured_task_evidence(ev.kind, &ev.data) && format_version < 3 {
+                return Err(LedgerError::Format("结构化任务证据必须使用v3台账".into()));
+            }
+            if request_budget_data(ev.kind, &ev.data) && format_version < 4 {
+                return Err(LedgerError::Format("请求预算事件必须使用v4台账".into()));
+            }
+            validate_event_payload(ev.kind, &ev.data).map_err(LedgerError::Format)?;
             self.events.push(ev);
         }
         self.seq = self.events.last().map(|e| e.seq).unwrap_or(0);
@@ -547,7 +599,7 @@ impl Ledger {
             return Err(LedgerError::AuditOutsideSpan(kind));
         }
         is_lossless_json(&data).map_err(LedgerError::LossyJson)?;
-        crate::continuity::validate_payload(kind, &data).map_err(LedgerError::Format)?;
+        validate_event_payload(kind, &data).map_err(LedgerError::Format)?;
         if matches!(
             kind,
             EventKind::ConversationObserved
@@ -555,8 +607,10 @@ impl Ledger {
                 | EventKind::MemoryProposalResolved
                 | EventKind::CompanionFollowupChanged
                 | EventKind::CompanionGenerated
-        ) || (kind == EventKind::MemoryRecorded
-            && (data.get("expires_at").is_some() || data.get("supersedes").is_some()))
+        ) || request_budget_data(kind, &data)
+            || structured_task_evidence(kind, &data)
+            || (kind == EventKind::MemoryRecorded
+                && (data.get("expires_at").is_some() || data.get("supersedes").is_some()))
         {
             let mut line = String::new();
             BufReader::new(File::open(&self.path).map_err(|e| LedgerError::Io(e.to_string()))?)
@@ -564,10 +618,17 @@ impl Ledger {
                 .map_err(|e| LedgerError::Io(e.to_string()))?;
             let header: Header =
                 serde_json::from_str(&line).map_err(|e| LedgerError::Format(e.to_string()))?;
-            if header.yunxi_bot_ledger != LEDGER_FORMAT_VERSION {
-                return Err(LedgerError::Format(
-                    "陪伴记忆写入需要先停止后台并执行 memory --upgrade".into(),
-                ));
+            let minimum = if request_budget_data(kind, &data) {
+                4
+            } else if structured_task_evidence(kind, &data) {
+                3
+            } else {
+                2
+            };
+            if header.yunxi_bot_ledger < minimum {
+                return Err(LedgerError::Format(format!(
+                    "本次写入需要v{minimum}台账；先停止后台并执行 memory --upgrade"
+                )));
             }
         }
 
@@ -1033,6 +1094,45 @@ mod tests {
         assert_eq!(j.attempts, 1);
         assert_eq!(j.spec.name, "备份");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn structured_task_evidence_requires_v3_and_survives_restart() {
+        let path = tmp("task-evidence-v3");
+        std::fs::write(&path, "{\"yunxi_bot_ledger\":2}\n").unwrap();
+        let mut ledger = Ledger::open(&path).unwrap();
+        let step = crate::task::model::Step::new("s1", "读取文件", crate::think::TaskKind::Lookup)
+            .with_required_tools(Some(vec!["read_file".into()]));
+        let payload = json!({"task":"t","steps":[step]});
+        assert!(
+            ledger
+                .append(EventKind::TaskPlanned, None, payload.clone())
+                .is_err()
+        );
+        drop(ledger);
+        crate::continuity::upgrade_ledger(&path).unwrap();
+        let mut ledger = Ledger::open(&path).unwrap();
+        ledger
+            .append(
+                EventKind::TaskCreated,
+                None,
+                json!({"task":"t","goal":"读文件"}),
+            )
+            .unwrap();
+        ledger
+            .append(EventKind::TaskPlanned, None, payload)
+            .unwrap();
+        drop(ledger);
+        let ledger = Ledger::open(&path).unwrap();
+        assert_eq!(
+            task_from_events(ledger.events())["t"].steps[0].required_tools,
+            Some(vec!["read_file".into()])
+        );
+        let raw = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("[\"read_file\"]", "[1]");
+        std::fs::write(&path, raw).unwrap();
+        assert!(Ledger::open(&path).is_err());
     }
 
     #[test]

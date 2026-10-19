@@ -215,6 +215,7 @@ mod tests {
         output: Option<Result<String, ToolError>>,
     ) -> ToolCallRecord {
         ToolCallRecord {
+            live_arguments: None,
             tool: tool.into(),
             arguments: json!({"path": "a.txt"}),
             capability: Capability::Write,

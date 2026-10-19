@@ -203,9 +203,35 @@ impl Drop for InstanceLock {
     }
 }
 
-/// 内核文件锁保护跨进程读改写；文件关闭释放，锁文件不能删除。
+/// 显式解锁，避免并发创建子进程时继承的描述符延长锁的生命周期。
+pub(crate) struct ExclusiveFileLock(std::fs::File);
+
+impl Drop for ExclusiveFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            loop {
+                // SAFETY: File 仍存活；LOCK_UN 只释放本守卫取得的锁，不删除锁文件。
+                if unsafe { flock(self.0.as_raw_fd(), 0x08) } == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    eprintln!("操作锁释放失败：{error}");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// 内核文件锁保护跨进程读改写；守卫释放时解锁，锁文件不能删除。
 #[cfg(unix)]
-pub(crate) fn exclusive_file_lock(path: &Path) -> Result<std::fs::File, String> {
+pub(crate) fn exclusive_file_lock(path: &Path) -> Result<ExclusiveFileLock, String> {
     use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -222,16 +248,32 @@ pub(crate) fn exclusive_file_lock(path: &Path) -> Result<std::fs::File, String> 
     if unsafe { flock(file.as_raw_fd(), 0x02 | 0x04) } != 0 {
         return Err("另一个进程正在处理，请稍后重试".into());
     }
-    Ok(file)
+    Ok(ExclusiveFileLock(file))
 }
 #[cfg(not(unix))]
-pub(crate) fn exclusive_file_lock(_: &Path) -> Result<std::fs::File, String> {
+pub(crate) fn exclusive_file_lock(_: &Path) -> Result<ExclusiveFileLock, String> {
     Err("邮件理解当前只支持本机Mac".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_owner_releases_lock_despite_an_inherited_descriptor() {
+        let path = tmp("inherited-file-lock");
+        let owner = exclusive_file_lock(&path).unwrap();
+        let inherited = owner.0.try_clone().unwrap();
+        assert!(exclusive_file_lock(&path).is_err());
+        drop(owner);
+        let next = exclusive_file_lock(&path)
+            .expect("进程创建期间继承的描述符不应延长原持有者的锁生命周期");
+        drop(inherited);
+        assert!(exclusive_file_lock(&path).is_err());
+        drop(next);
+        assert!(exclusive_file_lock(&path).is_ok());
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();

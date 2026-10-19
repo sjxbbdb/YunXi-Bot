@@ -4,6 +4,53 @@ const CASES: &str = include_str!("../../../models/eval/mail-prompt-workflow-2026
 fn cases() -> Vec<Value> {
     serde_json::from_str(CASES).unwrap()
 }
+
+// 只豁免紧邻的明确否定；隐私词仍逐字禁用，复杂语义保守留给人工复核。
+fn forbidden_phrase(text: &str, word: &str) -> bool {
+    let text = text.to_lowercase();
+    let word = word.to_lowercase();
+    text.match_indices(&word).any(|(at, _)| {
+        if !matches!(word.as_str(), "确认参加" | "我会参加") {
+            return true;
+        }
+        let prefix = &text[..at];
+        let negative = [
+            "暂时无法",
+            "暂时不能",
+            "无法",
+            "不能",
+            "不便",
+            "暂不",
+            "尚未",
+            "还未",
+            "未",
+            "不",
+        ]
+        .into_iter()
+        .find(|n| prefix.ends_with(n));
+        match negative {
+            None => true,
+            Some(n) => ["并非", "不是", "并不是"]
+                .iter()
+                .any(|double| prefix[..prefix.len() - n.len()].ends_with(double)),
+        }
+    })
+}
+
+#[test]
+fn commitment_check_does_not_confuse_refusal_with_acceptance() {
+    let c = json!({"expect":{"excludes":{"body":["确认参加"]}}});
+    assert!(check(&c, &json!({"body":"该时段已有安排，暂无法确认参加。"})).is_empty());
+    for body in [
+        "确认参加。",
+        "并非无法确认参加。",
+        "暂无法确认参加明天的会，但确认参加后天的会。",
+    ] {
+        assert!(!check(&c, &json!({"body":body})).is_empty(), "{body}");
+    }
+    let private = json!({"expect":{"excludes":{"body":["私密地址"]}}});
+    assert!(!check(&private, &json!({"body":"不能披露私密地址"})).is_empty());
+}
 fn check(case: &Value, result: &Value) -> Vec<String> {
     let expected = &case["expect"];
     let mut failures = Vec::new();
@@ -55,10 +102,7 @@ fn check(case: &Value, result: &Value) -> Vec<String> {
     if let Some(fields) = expected["excludes"].as_object() {
         for (k, words) in fields {
             for word in words.as_array().unwrap() {
-                if field(k)
-                    .to_lowercase()
-                    .contains(&word.as_str().unwrap().to_lowercase())
-                {
+                if forbidden_phrase(&field(k), word.as_str().unwrap()) {
                     failures.push(format!("{k}: unexpected {word}"));
                 }
             }

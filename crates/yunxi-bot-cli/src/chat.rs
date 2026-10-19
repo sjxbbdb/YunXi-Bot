@@ -70,42 +70,27 @@ impl ModelSummarizer {
     }
 }
 
+fn summary_material(dropped: &[yunxi_bot_core::think::Message]) -> String {
+    let rows: Vec<_> = dropped.iter().map(|m| {
+        serde_json::json!({"role":m.role.as_str(), "content":m.content,
+            "tool_call_id":m.tool_call_id,
+            "requested_tools":m.tool_calls.iter().map(|tc| serde_json::json!({"id":tc["id"],"name":tc["function"]["name"]})).collect::<Vec<_>>(),
+            "transport_role_is_not_owner_proof":m.role==yunxi_bot_core::think::Role::User,
+            "images_omitted":!m.images.is_empty()})
+    }).collect();
+    serde_json::Value::Array(rows).to_string()
+}
+
 impl yunxi_bot_core::think::context::Summarizer for ModelSummarizer {
     fn summarize(&self, dropped: &[yunxi_bot_core::think::Message]) -> Result<String, String> {
         use yunxi_bot_core::think::{Message, ThinkRequest, Thinker};
 
-        // 把要丢的消息拼成一段文本交给模型。**工具调用要说出工具名**——
-        // "调用了 web_search" 比 "调用了某工具" 有用得多。
-        let mut body = String::new();
-        for m in dropped {
-            if !m.tool_calls.is_empty() {
-                let names: Vec<String> = m
-                    .tool_calls
-                    .iter()
-                    .filter_map(|tc| {
-                        tc.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|n| n.as_str())
-                            .map(str::to_string)
-                    })
-                    .collect();
-                body.push_str(&format!("[调用了工具：{}]\n", names.join("、")));
-            }
-            if !m.content.trim().is_empty() {
-                body.push_str(&m.content);
-                body.push('\n');
-            }
-        }
+        let body = summary_material(dropped);
 
         let req = ThinkRequest {
+            request_budget: None,
             messages: vec![
-                Message::system(
-                    "你在压缩一段即将被丢弃的对话历史。\
-                     写一段简洁的摘要，保留：① 使用者说过的偏好与约束 \
-                     ② 已经做了什么、结果如何 ③ 还没做完的事 \
-                     ④ 重要的具体值（路径、文件名、数字）。\
-                     丢掉寒暄和重复。直接给摘要，不要开场白。",
-                ),
+                Message::system(yunxi_bot_core::prompts::SUMMARY),
                 Message::user(body),
             ],
             max_tokens: Some(800),
@@ -232,7 +217,7 @@ pub fn run(
     }
     println!();
 
-    // **只有交互式这条链路才流式。**
+    // **只有交互式这条链路使用显示回调；最终校对开启时先缓冲，校对通过再显示。**
     //
     // 常驻循环、定时任务、测试都不需要"边生成边显示"——
     // 而它们为它付的代价是：多一条 SSE 解析路径、多一种失败模式。
@@ -663,5 +648,29 @@ mod image_tests {
         let mut images = vec![yunxi_bot_core::think::ImageInput::from_bytes(b"GIF89a").unwrap()];
         assert!(attach_image(&mut images, std::path::Path::new(".")).is_err());
         assert_eq!(images.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod prompt_provenance_tests {
+    use super::*;
+    use yunxi_bot_core::think::Message;
+    #[test]
+    fn summary_preserves_roles_and_call_identity_without_private_transport() {
+        let mut tool = Message::tool_result("call-17", "发送结果未知");
+        tool.live_content = Some("PRIVATE_LIVE_BODY".into());
+        let messages = [
+            Message::user("只起草，不发送"),
+            Message::assistant("建议发送"),
+            tool,
+        ];
+        let material = summary_material(&messages);
+        let rows: serde_json::Value =
+            serde_json::from_str(&material).expect("资料应是带角色的结构，不能拼成匿名正文");
+        assert_eq!(rows[0]["role"], "user");
+        assert_eq!(rows[1]["role"], "assistant");
+        assert_eq!(rows[2]["role"], "tool");
+        assert_eq!(rows[2]["tool_call_id"], "call-17");
+        assert!(!material.contains("PRIVATE_LIVE_BODY"));
     }
 }

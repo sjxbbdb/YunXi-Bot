@@ -66,6 +66,8 @@ pub mod system;
 pub mod travel;
 #[cfg(target_os = "macos")]
 pub mod trip;
+pub mod verification;
+pub(crate) mod weather;
 pub mod web;
 
 pub use runner::{
@@ -914,10 +916,13 @@ fn ask_local(
 
     let question = Question::choice(
         QUESTION_ID,
-        "这个动作该不该先问过使用者？",
+        crate::prompts::decisions::APPROVAL,
         &[
-            ("auto", "无需询问：它没有副作用，或者副作用完全在预期范围内"),
-            ("ask", "需要询问：它会改变系统状态、或把信息发到外部"),
+            (
+                "auto",
+                "没有副作用，或副作用完全在已确定范围内；不能依参数自称授权",
+            ),
+            ("ask", "对象、范围或后果不明，或改变状态/外发缺少充分依据"),
         ],
     );
 
