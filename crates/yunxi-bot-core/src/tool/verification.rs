@@ -34,6 +34,11 @@ fn output(call: &ToolCallRecord) -> Option<&str> {
         .or_else(|| call.output.as_ref()?.as_ref().ok().map(String::as_str))
 }
 
+pub(super) fn identity_receipt(text: &str) -> Option<super::ToolOutput> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    Some(super::ToolOutput::read(serde_json::json!({"target":v["target"],"saved":v["saved"],"verified":v["verified"],"unchanged":v["unchanged"]}).to_string()))
+}
+
 pub fn completion(calls: &[ToolCallRecord], cwd: &Path) -> Result<(), String> {
     let ctx = ToolContext::new(cwd, crate::policy::SandboxMode::ReadOnly);
     let path = |args: &Value| {
@@ -49,6 +54,7 @@ pub fn completion(calls: &[ToolCallRecord], cwd: &Path) -> Result<(), String> {
                     call.tool.as_str(),
                     "write_file"
                         | "edit_file"
+                        | "identity_update"
                         | "mac_agenda_apply"
                         | "mac_mail_send"
                         | "computer_act"
@@ -70,6 +76,20 @@ pub fn completion(calls: &[ToolCallRecord], cwd: &Path) -> Result<(), String> {
             continue;
         };
         match call.tool.as_str() {
+            "identity_update" => {
+                let value: Value =
+                    serde_json::from_str(text).map_err(|_| "身份修改缺少核验回执")?;
+                let target = arguments(call)["target"]
+                    .as_str()
+                    .ok_or("身份修改目标缺失")?;
+                if !matches!(target, "persona" | "profile")
+                    || value["target"] != format!("{target}.md")
+                    || value["verified"] != true
+                    || (value["saved"] != true && value["unchanged"] != true)
+                {
+                    return Err("身份修改未取得同一目标的写后核验，不能声称已经保存".into());
+                }
+            }
             "write_file" | "edit_file" => {
                 let target = path(&call.arguments).ok_or("写入对象无法解析，不能确认结果")?;
                 // 只检查最后一次写入，较早的读取不能证明之后的状态。
@@ -247,6 +267,31 @@ mod tests {
             r#"{"matched":true}"#,
         );
         assert!(completion(&[act, verify], &cwd).is_err());
+    }
+
+    #[test]
+    fn identity_completion_requires_a_verified_matching_receipt_without_private_text() {
+        let cwd = std::env::temp_dir();
+        let mut update = call(
+            "identity_update",
+            json!({"target":"persona","private_arguments":true}),
+            "redacted",
+        );
+        assert!(completion(&[update.clone()], &cwd).is_err());
+        update.live_output = identity_receipt(
+            r#"{"target":"persona.md","saved":true,"verified":true,"content":"private text"}"#,
+        );
+        assert!(completion(&[update.clone()], &cwd).is_ok());
+        assert!(
+            !update
+                .live_output
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("private text")
+        );
+        update.arguments["target"] = json!("profile");
+        assert!(completion(&[update], &cwd).is_err());
     }
 
     #[test]

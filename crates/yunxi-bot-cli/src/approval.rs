@@ -161,6 +161,16 @@ mod tests {
     }
 
     #[test]
+    fn identity_edits_and_commands_cannot_use_yes_to_skip_fresh_approval() {
+        for tool in ["identity_update", "run_command"] {
+            let mut request = req(tool, Capability::Write);
+            request.require_human = true;
+            let mut approver = StdinApprover::new().assume_yes().dry_run();
+            assert_eq!(approver.approve(&request), Approval::Deny);
+        }
+    }
+
+    #[test]
     fn assume_yes_approves_once_not_always() {
         // 自动化场景下也不该写长期规则——那是使用者的决定，不是脚本的
         let mut a = StdinApprover::new().assume_yes();

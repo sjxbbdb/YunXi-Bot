@@ -832,6 +832,67 @@ impl Tool for SearchFilesTool {
 // ---------- write_file ----------
 
 /// 整体写文件（新建或覆盖）。
+/// Bot 的文件工具不得修改自己的安装目录、数据目录及可执行文件。
+/// shortcut: 这是文件工具的路径约束；外部程序和 GUI 不受此文件层约束，仍须独立审批。
+pub struct ProtectedWrite {
+    pub inner: std::sync::Arc<dyn Tool>,
+    pub roots: Vec<PathBuf>,
+}
+impl Tool for ProtectedWrite {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters(&self) -> Value {
+        self.inner.parameters()
+    }
+    fn capability(&self) -> Capability {
+        self.inner.capability()
+    }
+    fn private_io(&self) -> bool {
+        true
+    }
+    fn audit_arguments(&self, args: &Value) -> Value {
+        serde_json::json!({"path":args["path"],"private_arguments":true})
+    }
+    fn specifier(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
+        self.inner.specifier(args, ctx)
+    }
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
+        self.inner.preview(args, ctx)
+    }
+    fn preflight_rejection(&self, args: &Value, ctx: &ToolContext) -> Option<String> {
+        let check = || -> Option<()> {
+            let (_, path) = path_arg(args, ctx).ok()?;
+            let path = super::normalize_existing(&path)?;
+            for root in &self.roots {
+                if path.starts_with(super::normalize_existing(root)?) {
+                    return None;
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                match std::fs::metadata(&path) {
+                    Ok(m) if m.nlink() > 1 => return None,
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return None,
+                    _ => {}
+                }
+            }
+            Some(())
+        };
+        check().is_none().then(|| "禁止通过通用文件工具修改 Bot 自身文件，或目标无法安全解析；persona/profile 请使用 identity_read → identity_update，通用提示词、源码、配置与权限不可由自身设定修改。不得换命令或电脑工具绕过。".into())
+    }
+    fn call(&self, args: &Value, ctx: &mut ToolContext) -> Result<ToolOutput, ToolError> {
+        if let Some(reason) = self.preflight_rejection(args, ctx) {
+            return Err(ToolError::Denied { reason });
+        }
+        self.inner.call(args, ctx)
+    }
+}
+
 pub struct WriteFileTool;
 
 impl Tool for WriteFileTool {

@@ -117,6 +117,9 @@ pub fn default_registry(home: &Path) -> Result<ToolRegistry, String> {
             write,
         }))?;
     }
+    for tool in yunxi_bot_core::tool::identity::tools(home)? {
+        add(Arc::new(tool))?;
+    }
     add(Arc::new(WebFetchTool::new()))?;
     add(Arc::new(WebSearchTool::new(search_provider(home))))?;
     add(Arc::new(KnowledgeSearch(home.to_path_buf())))?;
@@ -126,8 +129,20 @@ pub fn default_registry(home: &Path) -> Result<ToolRegistry, String> {
     add(Arc::new(ReadFileTool))?;
     add(Arc::new(ListDirTool))?;
     add(Arc::new(SearchFilesTool))?;
-    add(Arc::new(WriteFileTool))?;
-    add(Arc::new(EditFileTool))?;
+    let roots = vec![
+        home.to_path_buf(),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+        std::env::current_exe().map_err(|e| format!("无法确定程序路径：{e}"))?,
+    ];
+    for inner in [
+        Arc::new(WriteFileTool) as Arc<dyn yunxi_bot_core::tool::Tool>,
+        Arc::new(EditFileTool),
+    ] {
+        add(Arc::new(yunxi_bot_core::tool::files::ProtectedWrite {
+            inner,
+            roots: roots.clone(),
+        }))?;
+    }
 
     // —— 动作 ——
     add(Arc::new(RunCommandTool))?;
@@ -525,10 +540,52 @@ mod tests {
     }
 
     #[test]
+    fn self_configuration_has_fixed_targets_and_generic_writes_cannot_replace_it() {
+        use yunxi_bot_core::tool::{GateDecision, Rule, ToolContext, gate};
+        let home = std::env::temp_dir().join(format!("yunxi-identity-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let registry = default_registry(&home).unwrap();
+        let mut ctx = ToolContext::new(&home, yunxi_bot_core::SandboxMode::WorkspaceWrite);
+        for name in ["write_file", "edit_file"] {
+            let tool = registry.get(name).unwrap();
+            let args = serde_json::json!({"path":home.join("persona.md"),"content":"changed","old_string":"old","new_string":"new"});
+            let policy = ToolPolicy {
+                allow: vec![Rule::tool(name)],
+                ..Default::default()
+            };
+            assert!(
+                gate(tool, &args, &policy, &ctx, None).is_deny(),
+                "{name} must not write identity through allow rules"
+            );
+            assert!(tool.call(&args, &mut ctx).is_err());
+        }
+        assert!(registry.get("identity_read").is_some());
+        let update = registry.get("identity_update").unwrap();
+        assert!(update.fresh_approval());
+        assert!(update.private_io());
+        let command = registry.get("run_command").unwrap();
+        let policy = ToolPolicy {
+            allow: vec![Rule::tool("run_command")],
+            ..Default::default()
+        };
+        assert!(matches!(
+            gate(
+                command,
+                &serde_json::json!({"command":["echo","hello"]}),
+                &policy,
+                &ctx,
+                None
+            ),
+            GateDecision::Ask { .. }
+        ));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
     fn all_platform_tools_register_without_name_clashes() {
         // 重名会被注册表拒绝，所以这条测试同时守着"名字没撞"
         let r = default_registry(&std::env::temp_dir()).expect("默认工具集应能注册");
-        let expected = if cfg!(target_os = "macos") { 61 } else { 14 };
+        let expected = if cfg!(target_os = "macos") { 63 } else { 16 };
         assert_eq!(
             r.len(),
             expected,
@@ -539,9 +596,14 @@ mod tests {
         let entries: serde_json::Value =
             serde_json::from_str(catalog.lines().last().unwrap()).unwrap();
         for entry in entries.as_array().unwrap() {
+            let identity = matches!(
+                entry["name"].as_str(),
+                Some("identity_read" | "identity_update")
+            );
             assert!(
-                entry["purpose"].as_str().is_some_and(|s| !s.is_empty())
-                    && entry["checks"].as_str().is_some_and(|s| !s.is_empty()),
+                (identity && entry["description"].as_str().is_some_and(|s| !s.is_empty()))
+                    || (entry["purpose"].as_str().is_some_and(|s| !s.is_empty())
+                        && entry["checks"].as_str().is_some_and(|s| !s.is_empty())),
                 "内置工具缺少选择与核验说明：{}",
                 entry["name"]
             );
@@ -622,6 +684,7 @@ mod tests {
                 | "now"
                 | "ask_user"
                 | "companion_read"
+                | "identity_read"
                 | "knowledge_search"
                 | "mail_review_pending"
                 | "mail_reply_pending"
@@ -634,7 +697,11 @@ mod tests {
                 | "computer_observe" => {
                     assert_eq!(cap, Capability::ReadOnly, "{name} 应只读");
                 }
-                "write_file" | "edit_file" | "browser_workflow_save" | "companion_update" => {
+                "write_file"
+                | "edit_file"
+                | "browser_workflow_save"
+                | "companion_update"
+                | "identity_update" => {
                     assert_eq!(cap, Capability::Write, "{name}")
                 }
                 "run_command" | "browser_workflow_run" => {

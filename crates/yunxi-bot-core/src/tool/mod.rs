@@ -53,6 +53,7 @@ pub mod companion;
 #[cfg(target_os = "macos")]
 pub mod computer;
 pub mod files;
+pub mod identity;
 #[cfg(target_os = "macos")]
 pub mod mac_assistant;
 #[cfg(target_os = "macos")]

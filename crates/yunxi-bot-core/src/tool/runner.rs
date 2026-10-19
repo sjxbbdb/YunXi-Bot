@@ -867,6 +867,11 @@ impl<'a> ToolRunner<'a> {
                         .as_ref()
                         .and_then(|o| super::verification::computer_receipt(&o.text));
                 }
+                if tr.name == "identity_update" && record.executed() {
+                    record.live_output = live
+                        .as_ref()
+                        .and_then(|o| super::verification::identity_receipt(&o.text));
+                }
                 calls.push(record);
                 let mut message = Message::tool_result(tr.id.clone(), text);
                 if let Some(output) = live {

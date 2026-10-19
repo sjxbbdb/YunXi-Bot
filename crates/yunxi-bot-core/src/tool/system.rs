@@ -195,7 +195,7 @@ impl Tool for RunCommandTool {
          本工具不经 shell 解析，管道、重定向、通配符、变量展开、&& 都不会生效；\
          确实需要它们时请显式起 shell（Windows：[\"cmd\",\"/C\",\"…\"]，\
          Unix：[\"sh\",\"-c\",\"…\"]），并明白那等于把注入面重新打开。\
-         执行命令可能改变系统状态，因此会先过审批门禁。\
+         执行命令须逐次人工批准，预批准和 --yes 不适用。不能借命令修改 Bot 自身的通用提示词、源码、配置或权限；人格和用户画像须使用专用身份工具。\
          可能跑很久的命令请设 timeout_ms，超时会连整个进程树一起终止。"
     }
 
@@ -225,6 +225,11 @@ impl Tool for RunCommandTool {
 
     fn capability(&self) -> Capability {
         Capability::Execute
+    }
+
+    // 任意程序能间接写文件；不能把通用文件工具的保护声称为命令沙箱。
+    fn fresh_approval(&self) -> bool {
+        true
     }
 
     /// 粒度是**程序名**（`command[0]`），不是整条命令。
