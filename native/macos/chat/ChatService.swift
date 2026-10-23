@@ -203,14 +203,6 @@ final class ChatService: ObservableObject {
             connected = true
             busy = false
             session = object["session"] as? String ?? ""
-            let turns = object["turns"] as? Int ?? 0
-            if object["resumed"] as? Bool == true {
-                if messages.isEmpty, turns > 0 {
-                    messages.append(ChatMessage(role: .system, text: "接着上次聊（\(turns) 轮）。", at: nil))
-                }
-            } else if messages.isEmpty {
-                messages.append(ChatMessage(role: .system, text: "云熙在这里。", at: nil))
-            }
             status = "在线"
             requestSessions()
         case "sessions":
@@ -228,10 +220,9 @@ final class ChatService: ObservableObject {
             let turns = object["turns"] as? Int ?? 0
             if messages.isEmpty {
                 let missing = object["history_missing"] as? Bool ?? false
-                let text = missing
-                    ? "已打开会话（\(turns) 轮）。旧会话没有可回显的显示记录，但上下文已恢复。"
-                    : "已打开会话（\(turns) 轮）。"
-                messages.append(ChatMessage(role: .system, text: text, at: nil))
+                if missing {
+                    messages.append(ChatMessage(role: .system, text: "旧会话没有可回显的显示记录（\(turns) 轮），上下文已恢复。", at: nil))
+                }
             }
         case "approval":
             applyApproval(object)
@@ -262,7 +253,6 @@ final class ChatService: ObservableObject {
             messages.removeAll()
             streamingID = nil
             pendingApproval = nil
-            messages.append(ChatMessage(role: .system, text: "已开新会话。", at: nil))
             busy = false
             requestSessions()
         default:

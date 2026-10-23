@@ -1,37 +1,107 @@
 import AppKit
 import Combine
 
-// MARK: - 设计 token（参考 Codex 前端：spacing 4、composer 44/22、elevation）
+// MARK: - 主题（照 Codex 深色外壳取样：rail #1b1b1c / sidebar #131315 / main #0f0f11 / card #2a2a2c）
+
+enum Theme {
+    static let accent = NSColor.adaptive(
+        light: NSColor(calibratedRed: 0.69, green: 0.34, blue: 0.43, alpha: 1),
+        dark: NSColor(calibratedRed: 0.80, green: 0.45, blue: 0.53, alpha: 1)
+    )
+    static let window = NSColor.adaptive(
+        light: NSColor(calibratedWhite: 1.0, alpha: 1),
+        dark: NSColor(calibratedRed: 0.059, green: 0.059, blue: 0.067, alpha: 1)
+    )
+    static let rail = NSColor.adaptive(
+        light: NSColor(calibratedWhite: 0.965, alpha: 1),
+        dark: NSColor(calibratedRed: 0.106, green: 0.106, blue: 0.110, alpha: 1)
+    )
+    static let sidebar = NSColor.adaptive(
+        light: NSColor(calibratedWhite: 0.980, alpha: 1),
+        dark: NSColor(calibratedRed: 0.075, green: 0.075, blue: 0.082, alpha: 1)
+    )
+    static let elevated = NSColor.adaptive(
+        light: NSColor(calibratedWhite: 1.0, alpha: 1),
+        dark: NSColor(calibratedRed: 0.165, green: 0.165, blue: 0.173, alpha: 1)
+    )
+    static let chip = NSColor.adaptive(
+        light: NSColor(calibratedWhite: 0.945, alpha: 1),
+        dark: NSColor(calibratedRed: 0.118, green: 0.118, blue: 0.125, alpha: 1)
+    )
+    static let selection = NSColor.adaptive(
+        light: NSColor(calibratedWhite: 0.918, alpha: 1),
+        dark: NSColor(calibratedRed: 0.169, green: 0.169, blue: 0.176, alpha: 1)
+    )
+    static let hover = NSColor.adaptive(
+        light: NSColor(calibratedWhite: 0.945, alpha: 1),
+        dark: NSColor(calibratedRed: 0.137, green: 0.137, blue: 0.145, alpha: 1)
+    )
+    static let border = NSColor.adaptive(
+        light: NSColor(calibratedWhite: 0.900, alpha: 1),
+        dark: NSColor(calibratedRed: 0.173, green: 0.173, blue: 0.180, alpha: 1)
+    )
+    static let userBubble = NSColor.adaptive(
+        light: NSColor(calibratedRed: 0.72, green: 0.36, blue: 0.45, alpha: 1),
+        dark: NSColor(calibratedRed: 0.63, green: 0.30, blue: 0.38, alpha: 1)
+    )
+
+    static func applyEnvironmentAppearance() {
+        let saved = UserDefaults.standard.string(forKey: "YunXiAppearance") ?? "dark"
+        let env = ProcessInfo.processInfo.environment["YUNXI_APPEARANCE"]
+        apply(name: env ?? saved)
+    }
+
+    static func apply(name: String) {
+        switch name {
+        case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+        case "light": NSApp.appearance = NSAppearance(named: .aqua)
+        default: NSApp.appearance = nil
+        }
+    }
+}
 
 extension NSColor {
-    static let yunxiAccent = NSColor(calibratedRed: 0.66, green: 0.33, blue: 0.42, alpha: 1.0)
+    static var yunxiAccent: NSColor { Theme.accent }
 
     static func adaptive(light: NSColor, dark: NSColor) -> NSColor {
         NSColor(name: nil) { appearance in
             appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
         }
     }
+}
 
-    static let bubbleUser = NSColor.adaptive(
-        light: NSColor(calibratedRed: 0.72, green: 0.36, blue: 0.45, alpha: 1.0),
-        dark: NSColor(calibratedRed: 0.54, green: 0.25, blue: 0.33, alpha: 1.0)
-    )
-    static let bubbleAssistant = NSColor.adaptive(
-        light: NSColor(calibratedWhite: 0.955, alpha: 1.0),
-        dark: NSColor(calibratedWhite: 0.185, alpha: 1.0)
-    )
-    static let bubbleBorder = NSColor.adaptive(
-        light: NSColor(calibratedWhite: 0.87, alpha: 1.0),
-        dark: NSColor(calibratedWhite: 0.29, alpha: 1.0)
-    )
-    static let composerSurface = NSColor.adaptive(
-        light: NSColor(calibratedWhite: 0.995, alpha: 1.0),
-        dark: NSColor(calibratedWhite: 0.165, alpha: 1.0)
-    )
-    static let cardSurface = NSColor.adaptive(
-        light: NSColor(calibratedWhite: 0.985, alpha: 1.0),
-        dark: NSColor(calibratedWhite: 0.21, alpha: 1.0)
-    )
+/// 动态色块：外观切换时自动重刷 layer 颜色。
+final class ColorView: NSView {
+    var fill: NSColor? { didSet { refresh() } }
+    var borderColor: NSColor? { didSet { refresh() } }
+    var borderWidth: CGFloat = 0 { didSet { refresh() } }
+    var cornerRadius: CGFloat = 0 { didSet { refresh() } }
+
+    init(fill: NSColor? = nil, radius: CGFloat = 0, border: NSColor? = nil, borderWidth: CGFloat = 0) {
+        self.fill = fill
+        self.cornerRadius = radius
+        self.borderColor = border
+        self.borderWidth = borderWidth
+        super.init(frame: .zero)
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+        refresh()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refresh()
+    }
+
+    private func refresh() {
+        guard let layer else { return }
+        layer.cornerRadius = cornerRadius
+        layer.backgroundColor = fill?.cgColor
+        layer.borderWidth = borderWidth
+        layer.borderColor = borderColor?.cgColor
+    }
 }
 
 final class FlippedView: NSView {
@@ -45,7 +115,7 @@ final class AvatarView: NSView {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = diameter / 2
-        layer?.backgroundColor = NSColor.yunxiAccent.cgColor
+        layer?.backgroundColor = Theme.accent.cgColor
         let label = NSTextField(labelWithString: "熙")
         label.font = .systemFont(ofSize: fontSize, weight: .semibold)
         label.textColor = .white
@@ -64,60 +134,32 @@ final class AvatarView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 }
 
-// MARK: - 消息气泡
+private func symbol(_ name: String, size: CGFloat, weight: NSFont.Weight = .regular, tint: NSColor? = nil) -> NSImage? {
+    let config = NSImage.SymbolConfiguration(pointSize: size, weight: weight)
+    let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+    image?.isTemplate = true
+    return image
+}
 
-final class BubbleView: NSView {
-    let label = NSTextField(wrappingLabelWithString: "")
-    private var plainText = ""
-
-    init(isUser: Bool) {
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer?.cornerRadius = 16
-        layer?.backgroundColor = (isUser ? NSColor.bubbleUser : NSColor.bubbleAssistant).cgColor
-        layer?.borderWidth = isUser ? 0 : 1
-        layer?.borderColor = NSColor.bubbleBorder.cgColor
-
-        label.isSelectable = true
-        label.maximumNumberOfLines = 0
-        label.preferredMaxLayoutWidth = 340
-        label.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(label)
-        NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            label.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
-            label.widthAnchor.constraint(lessThanOrEqualToConstant: 340),
-        ])
-        translatesAutoresizingMaskIntoConstraints = false
-
-        let menu = NSMenu()
-        let copyItem = NSMenuItem(title: "复制", action: #selector(copyText), keyEquivalent: "")
-        copyItem.target = self
-        menu.addItem(copyItem)
-        label.menu = menu
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    @objc private func copyText() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(plainText, forType: .string)
-    }
-
-    func update(text: String, isUser: Bool) {
-        plainText = text
-        label.attributedStringValue = MarkdownRenderer.render(text, isUser: isUser)
-    }
+private func iconButton(_ name: String, size: CGFloat = 16) -> NSButton {
+    let button = NSButton()
+    button.image = symbol(name, size: size)
+    button.imageScaling = .scaleProportionallyUpOrDown
+    button.isBordered = false
+    button.bezelStyle = .regularSquare
+    button.contentTintColor = .secondaryLabelColor
+    button.translatesAutoresizingMaskIntoConstraints = false
+    button.widthAnchor.constraint(equalToConstant: 26).isActive = true
+    button.heightAnchor.constraint(equalToConstant: 26).isActive = true
+    return button
 }
 
 // MARK: - 消息行
 
 final class MessageRowView: NSView {
-    let bubble: BubbleView?
-    let textLabel: NSTextField?
     private let role: ChatMessage.Role
+    private let bubble: ColorView?
+    private let label: NSTextField?
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -132,82 +174,83 @@ final class MessageRowView: NSView {
 
     init(message: ChatMessage, showDate: Bool) {
         role = message.role
+
         if message.role == .system {
             bubble = nil
-            textLabel = NSTextField(wrappingLabelWithString: message.text)
+            label = NSTextField(wrappingLabelWithString: message.text)
         } else {
-            bubble = BubbleView(isUser: message.role == .user)
-            textLabel = nil
-            bubble?.update(text: message.text, isUser: message.role == .user)
+            bubble = ColorView(fill: message.role == .user ? Theme.userBubble : nil, radius: 16)
+            label = NSTextField(wrappingLabelWithString: "")
         }
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
-        if let textLabel {
-            textLabel.font = .systemFont(ofSize: 11)
-            textLabel.textColor = .secondaryLabelColor
-            textLabel.alignment = .center
-            textLabel.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(textLabel)
+        if role == .system {
+            guard let label else { return }
+            label.font = .systemFont(ofSize: 10.5)
+            label.textColor = .tertiaryLabelColor
+            label.alignment = .center
+            label.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(label)
             NSLayoutConstraint.activate([
-                textLabel.topAnchor.constraint(equalTo: topAnchor, constant: 6),
-                textLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
-                textLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 40),
-                textLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -40),
-                textLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+                label.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+                label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+                label.centerXAnchor.constraint(equalTo: centerXAnchor),
+                label.widthAnchor.constraint(lessThanOrEqualToConstant: 560),
             ])
             return
         }
 
-        guard let bubble else { return }
-        let timeText: String
-        if let at = message.at {
-            timeText = showDate ? Self.dayFormatter.string(from: at) : Self.timeFormatter.string(from: at)
-        } else {
-            timeText = ""
-        }
-        let time = NSTextField(labelWithString: timeText)
-        time.font = .systemFont(ofSize: 9.5)
-        time.textColor = .tertiaryLabelColor
-        time.isHidden = timeText.isEmpty
-        time.translatesAutoresizingMaskIntoConstraints = false
-
-        let column = NSStackView(views: [bubble, time])
-        column.orientation = .vertical
-        column.alignment = role == .user ? .trailing : .leading
-        column.spacing = 3
-        column.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(column)
+        guard let bubble, let label else { return }
+        label.isSelectable = true
+        label.maximumNumberOfLines = 0
+        label.translatesAutoresizingMaskIntoConstraints = false
 
         if role == .assistant {
-            let avatar = AvatarView(diameter: 26, fontSize: 11)
+            let avatar = AvatarView(diameter: 22, fontSize: 9.5)
             addSubview(avatar)
+            addSubview(label)
+            label.preferredMaxLayoutWidth = 640
             NSLayoutConstraint.activate([
-                avatar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+                avatar.leadingAnchor.constraint(equalTo: leadingAnchor),
                 avatar.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-                column.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 8),
-                column.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-                column.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
-                column.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -60),
+
+                label.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 10),
+                label.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+                label.widthAnchor.constraint(lessThanOrEqualToConstant: 640),
+                label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
             ])
-        } else {
-            NSLayoutConstraint.activate([
-                column.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-                column.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-                column.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
-                column.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 70),
-            ])
+            updateText(message.text)
+            return
         }
+
+        bubble.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 13),
+            label.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -13),
+            label.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 9),
+            label.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -9),
+        ])
+        label.preferredMaxLayoutWidth = 520
+        addSubview(bubble)
+        NSLayoutConstraint.activate([
+            bubble.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            bubble.trailingAnchor.constraint(equalTo: trailingAnchor),
+            bubble.widthAnchor.constraint(lessThanOrEqualToConstant: 560),
+            bubble.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 80),
+            bubble.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
+        ])
+        updateText(message.text)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    private func updateText(_ text: String) {
+        label?.attributedStringValue = MarkdownRenderer.render(text, isUser: role == .user)
+    }
+
     func update(_ message: ChatMessage) {
-        if let bubble {
-            bubble.update(text: message.text, isUser: message.role == .user)
-        } else if let textLabel {
-            if textLabel.stringValue != message.text { textLabel.stringValue = message.text }
-        }
+        updateText(message.text)
     }
 }
 
@@ -215,30 +258,35 @@ final class MessageRowView: NSView {
 
 final class TypingRowView: NSView {
     private let dot = NSView()
+    private let label = NSTextField(labelWithString: "正在想…")
 
     init() {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
+        let avatar = AvatarView(diameter: 22, fontSize: 9.5)
+        addSubview(avatar)
+
         dot.wantsLayer = true
-        dot.layer?.cornerRadius = 3
-        dot.layer?.backgroundColor = NSColor.yunxiAccent.cgColor
+        dot.layer?.cornerRadius = 2.5
+        dot.layer?.backgroundColor = Theme.accent.cgColor
         dot.translatesAutoresizingMaskIntoConstraints = false
         addSubview(dot)
 
-        let label = NSTextField(labelWithString: "云熙正在想…")
         label.font = .systemFont(ofSize: 11)
         label.textColor = .secondaryLabelColor
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
 
         NSLayoutConstraint.activate([
-            dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 48),
+            avatar.leadingAnchor.constraint(equalTo: leadingAnchor),
+            avatar.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            dot.leadingAnchor.constraint(equalTo: avatar.trailingAnchor, constant: 12),
             dot.centerYAnchor.constraint(equalTo: label.centerYAnchor),
-            dot.widthAnchor.constraint(equalToConstant: 6),
-            dot.heightAnchor.constraint(equalToConstant: 6),
+            dot.widthAnchor.constraint(equalToConstant: 5),
+            dot.heightAnchor.constraint(equalToConstant: 5),
             label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 6),
-            label.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
         ])
 
         let pulse = CABasicAnimation(keyPath: "opacity")
@@ -253,74 +301,208 @@ final class TypingRowView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 }
 
-// MARK: - 侧边栏会话行
+// MARK: - 会话行
 
-final class SessionCellView: NSTableCellView {
-    let previewLabel = NSTextField(labelWithString: "")
-    let metaLabel = NSTextField(labelWithString: "")
+final class SessionRowView: NSView {
+    private let background = ColorView(fill: .clear, radius: 9)
+    private let preview = NSTextField(labelWithString: "")
+    private let meta = NSTextField(labelWithString: "")
+    private let session: ChatSession
+    private let onClick: () -> Void
+    private var hovered = false
+    private var selected = false
+    private var tracking: NSTrackingArea?
 
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        previewLabel.font = .systemFont(ofSize: 12)
-        previewLabel.lineBreakMode = .byTruncatingTail
-        previewLabel.translatesAutoresizingMaskIntoConstraints = false
-        metaLabel.font = .systemFont(ofSize: 9.5)
-        metaLabel.textColor = .tertiaryLabelColor
-        metaLabel.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(previewLabel)
-        addSubview(metaLabel)
+    init(session: ChatSession, selected: Bool, onClick: @escaping () -> Void) {
+        self.session = session
+        self.onClick = onClick
+        self.selected = selected
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        addSubview(background)
+
+        if session.hasHistory {
+            preview.stringValue = session.preview.isEmpty ? "（无预览）" : session.preview
+            preview.textColor = .labelColor
+        } else {
+            preview.stringValue = "旧会话 · " + Self.dateString(session.updatedAt)
+            preview.textColor = .secondaryLabelColor
+        }
+        preview.font = .systemFont(ofSize: 12.5)
+        preview.lineBreakMode = .byTruncatingTail
+        preview.translatesAutoresizingMaskIntoConstraints = false
+
+        meta.stringValue = "\(session.turns) 轮 · " + Self.timeString(session.updatedAt)
+        meta.font = .systemFont(ofSize: 9.5)
+        meta.textColor = .tertiaryLabelColor
+        meta.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(preview)
+        addSubview(meta)
         NSLayoutConstraint.activate([
-            previewLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            previewLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            previewLabel.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            metaLabel.leadingAnchor.constraint(equalTo: previewLabel.leadingAnchor),
-            metaLabel.trailingAnchor.constraint(equalTo: previewLabel.trailingAnchor),
-            metaLabel.topAnchor.constraint(equalTo: previewLabel.bottomAnchor, constant: 3),
+            background.leadingAnchor.constraint(equalTo: leadingAnchor),
+            background.trailingAnchor.constraint(equalTo: trailingAnchor),
+            background.topAnchor.constraint(equalTo: topAnchor),
+            background.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            preview.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            preview.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            preview.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+
+            meta.leadingAnchor.constraint(equalTo: preview.leadingAnchor),
+            meta.topAnchor.constraint(equalTo: preview.bottomAnchor, constant: 2),
+            meta.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
+            heightAnchor.constraint(equalToConstant: 44),
         ])
+        refreshBackground()
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow], owner: self)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovered = true
+        refreshBackground()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovered = false
+        refreshBackground()
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    private func refreshBackground() {
+        background.fill = selected ? Theme.selection : (hovered ? Theme.hover : .clear)
+    }
+
+    private static func dateString(_ ms: Double) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "M月d日"
+        return f.string(from: Date(timeIntervalSince1970: ms / 1000))
+    }
+
+    private static func timeString(_ ms: Double) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: ms / 1000))
+    }
+}
+
+// MARK: - 小部件
+
+final class ChipView: NSView {
+    private let background = ColorView(fill: Theme.chip, radius: 8)
+    private let label = NSTextField(labelWithString: "")
+    private let icon = NSImageView()
+
+    init(text: String, symbolName: String? = nil) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        addSubview(background)
+
+        icon.image = symbolName.flatMap { symbol($0, size: 10) }
+        icon.contentTintColor = .secondaryLabelColor
+        icon.isHidden = symbolName == nil
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(icon)
+
+        label.stringValue = text
+        label.font = .systemFont(ofSize: 10.5)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 24),
+            background.leadingAnchor.constraint(equalTo: leadingAnchor),
+            background.trailingAnchor.constraint(equalTo: trailingAnchor),
+            background.topAnchor.constraint(equalTo: topAnchor),
+            background.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 12),
+            icon.heightAnchor.constraint(equalToConstant: 12),
+
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: symbolName == nil ? 0 : 5),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        if symbolName == nil {
+            icon.widthAnchor.constraint(equalToConstant: 0).isActive = true
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setText(_ text: String) {
+        label.stringValue = text
+    }
 }
 
 // MARK: - 应用
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDelegate,
-    NSTableViewDataSource, NSTableViewDelegate
-{
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDelegate, NSSearchFieldDelegate {
     private var window: NSWindow!
     private let service = ChatService()
 
-    private var scrollView: NSScrollView!
+    private var root: ColorView!
+    private var rail: ColorView!
+    private var sidebar: ColorView!
+    private var main: ColorView!
+
+    private var contentScroll: NSScrollView!
     private var document: FlippedView!
+    private var contentColumn: NSView!
     private var stack: NSStackView!
     private var emptyState: NSStackView!
-    private var statusLabel = NSTextField(labelWithString: "连接中…")
-    private var modelLabel = NSTextField(labelWithString: "")
 
-    private var sidebarTable: NSTableView!
-    private var suppressSelection = false
-    private var newChatButton: NSButton!
-    private var effortPopup: NSPopUpButton!
-    private var capabilityWindow: CapabilityWindowController?
+    private var sessionsScroll: NSScrollView!
+    private var sessionsStack: NSStackView!
+    private var searchField: NSSearchField!
+    private var searchVisible = false
+    private var newChatTopToHeader: NSLayoutConstraint!
+    private var newChatTopToSearch: NSLayoutConstraint!
+    private var searchHeight: NSLayoutConstraint!
 
-    private var composerScroll: NSScrollView!
+    private var composer: ColorView!
     private var composerTextView: NSTextView!
-    private var composerPlaceholder = NSTextField(labelWithString: "说点什么…")
+    private var composerPlaceholder = NSTextField(labelWithString: "随心输入")
     private var composerHeight: NSLayoutConstraint!
-    private var sendButton = NSButton()
+    private var textHeight: NSLayoutConstraint!
+    private var sendButton: NSButton!
+    private var effortPopup: NSPopUpButton!
 
-    private var approvalCard: NSView!
+    private var approvalCard: ColorView!
     private var approvalTitle = NSTextField(labelWithString: "需要你确认")
     private var approvalDetail = NSTextField(labelWithString: "")
     private var approvalPreview = NSTextField(wrappingLabelWithString: "")
+
+    private var railStatusDot = NSView()
 
     private var rows: [MessageRowView] = []
     private var renderedIDs: [UUID] = []
     private var lastRenderedDate: Date?
     private var typingRow: TypingRowView?
     private var cancellables = Set<AnyCancellable>()
+    private var capabilityWindow: CapabilityWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Theme.applyEnvironmentAppearance()
         NSApp.applicationIconImage = Self.makeIcon()
         buildMenu()
         buildWindow()
@@ -329,7 +511,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         window.makeFirstResponder(composerTextView)
-        // 便捷入口：YUNXI_OPEN_CAPABILITIES=1 时启动即打开能力面板（测试/演示用）。
         if ProcessInfo.processInfo.environment["YUNXI_OPEN_CAPABILITIES"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
                 self?.showCapabilities()
@@ -353,209 +534,342 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         appMenu.addItem(withTitle: "新会话", action: #selector(newChat), keyEquivalent: "n")
         appMenu.addItem(withTitle: "能力面板", action: #selector(showCapabilities), keyEquivalent: "i")
         appMenu.addItem(.separator())
+        let appearanceItem = NSMenuItem(title: "外观", action: nil, keyEquivalent: "")
+        let appearanceMenu = NSMenu()
+        for (title, key) in [("跟随系统", "system"), ("浅色", "light"), ("深色", "dark")] {
+            let item = NSMenuItem(title: title, action: #selector(setAppearance(_:)), keyEquivalent: "")
+            item.representedObject = key
+            appearanceMenu.addItem(item)
+        }
+        appearanceItem.submenu = appearanceMenu
+        appMenu.addItem(appearanceItem)
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 云熙", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         NSApp.mainMenu = mainMenu
+    }
+
+    @objc private func setAppearance(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        Theme.apply(name: name)
+        UserDefaults.standard.set(name, forKey: "YunXiAppearance")
+        window.backgroundColor = Theme.window
     }
 
     // MARK: 窗口
 
     private func buildWindow() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 780),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            contentRect: NSRect(x: 0, y: 0, width: 1180, height: 800),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "云熙"
-        window.minSize = NSSize(width: 680, height: 620)
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.backgroundColor = Theme.window
+        window.minSize = NSSize(width: 1000, height: 640)
         window.center()
         window.delegate = self
         window.isReleasedWhenClosed = false
-        window.setFrameAutosaveName("YunXiChatWindow")
+        window.setFrameAutosaveName("YunXiCodexShellV2")
+        if window.frame.width < 1000 || window.frame.height < 640 {
+            window.setContentSize(NSSize(width: 1180, height: 800))
+            window.center()
+        }
+        window.appearance = NSApp.appearance
 
-        let background = NSVisualEffectView()
-        background.material = .underWindowBackground
-        background.blendingMode = .behindWindow
-        background.state = .active
-        window.contentView = background
+        root = ColorView(fill: Theme.window)
+        window.contentView = root
+        root.translatesAutoresizingMaskIntoConstraints = true
+        root.autoresizingMask = [.width, .height]
 
-        // —— 侧边栏 ——
-        let sidebar = NSView()
-        sidebar.translatesAutoresizingMaskIntoConstraints = false
-        background.addSubview(sidebar)
+        rail = ColorView(fill: Theme.rail)
+        sidebar = ColorView(fill: Theme.sidebar)
+        main = ColorView(fill: Theme.window)
+        root.addSubview(rail)
+        root.addSubview(sidebar)
+        root.addSubview(main)
 
-        let sidebarTitle = NSTextField(labelWithString: "对话")
-        sidebarTitle.font = .systemFont(ofSize: 11, weight: .semibold)
-        sidebarTitle.textColor = .secondaryLabelColor
-        sidebarTitle.translatesAutoresizingMaskIntoConstraints = false
-        sidebar.addSubview(sidebarTitle)
+        let divider = ColorView(fill: Theme.border)
+        root.addSubview(divider)
 
-        sidebarTable = NSTableView()
-        sidebarTable.headerView = nil
-        sidebarTable.rowHeight = 52
-        sidebarTable.backgroundColor = .clear
-        sidebarTable.selectionHighlightStyle = .regular
-        sidebarTable.allowsEmptySelection = true
-        sidebarTable.dataSource = self
-        sidebarTable.delegate = self
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("session"))
-        column.width = 190
-        sidebarTable.addTableColumn(column)
+        NSLayoutConstraint.activate([
+            rail.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            rail.topAnchor.constraint(equalTo: root.topAnchor),
+            rail.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            rail.widthAnchor.constraint(equalToConstant: 56),
 
-        let sidebarScroll = NSScrollView()
-        sidebarScroll.documentView = sidebarTable
-        sidebarScroll.hasVerticalScroller = true
-        sidebarScroll.autohidesScrollers = true
-        sidebarScroll.drawsBackground = false
-        sidebarScroll.borderType = .noBorder
-        sidebarScroll.translatesAutoresizingMaskIntoConstraints = false
-        sidebar.addSubview(sidebarScroll)
+            sidebar.leadingAnchor.constraint(equalTo: rail.trailingAnchor),
+            sidebar.topAnchor.constraint(equalTo: root.topAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            sidebar.widthAnchor.constraint(equalToConstant: 280),
 
-        let sidebarDivider = NSBox()
-        sidebarDivider.boxType = .separator
-        sidebarDivider.translatesAutoresizingMaskIntoConstraints = false
-        background.addSubview(sidebarDivider)
+            divider.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            divider.topAnchor.constraint(equalTo: root.topAnchor),
+            divider.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1),
 
-        // —— 主列 ——
-        let mainColumn = NSView()
-        mainColumn.translatesAutoresizingMaskIntoConstraints = false
-        background.addSubview(mainColumn)
+            main.leadingAnchor.constraint(equalTo: divider.trailingAnchor),
+            main.topAnchor.constraint(equalTo: root.topAnchor),
+            main.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            main.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+        ])
 
-        let avatar = AvatarView(diameter: 28, fontSize: 12)
-        let name = NSTextField(labelWithString: "云熙")
-        name.font = .systemFont(ofSize: 15, weight: .semibold)
-        statusLabel.font = .systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        modelLabel.font = .systemFont(ofSize: 9.5)
-        modelLabel.textColor = .tertiaryLabelColor
+        buildRail()
+        buildSidebar()
+        buildMain()
+    }
 
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    private func buildRail() {
+        let avatar = AvatarView(diameter: 28, fontSize: 11)
+        rail.addSubview(avatar)
+        NSLayoutConstraint.activate([
+            avatar.centerXAnchor.constraint(equalTo: rail.centerXAnchor),
+            avatar.topAnchor.constraint(equalTo: rail.topAnchor, constant: 52),
+        ])
 
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        rail.addSubview(stack)
+
+        let buttons: [(String, Selector, String, Bool)] = [
+            ("bubble.left.and.bubble.right.fill", #selector(focusComposer), "对话", true),
+            ("square.grid.2x2", #selector(showCapabilities), "能力", false),
+            ("gearshape", #selector(showAbout), "关于", false),
+        ]
+        for item in buttons {
+            let button = NSButton()
+            button.image = symbol(item.0, size: 16)
+            button.imageScaling = .scaleProportionallyUpOrDown
+            button.isBordered = false
+            button.bezelStyle = .regularSquare
+            button.contentTintColor = item.3 ? .labelColor : .secondaryLabelColor
+            button.target = self
+            button.action = item.1
+            button.toolTip = item.2
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 9
+            if item.3 { button.layer?.backgroundColor = Theme.selection.cgColor }
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(equalToConstant: 36),
+                button.heightAnchor.constraint(equalToConstant: 36),
+            ])
+            stack.addArrangedSubview(button)
+        }
+
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: avatar.bottomAnchor, constant: 20),
+            stack.centerXAnchor.constraint(equalTo: rail.centerXAnchor),
+        ])
+
+        railStatusDot.wantsLayer = true
+        railStatusDot.layer?.cornerRadius = 3
+        railStatusDot.layer?.backgroundColor = NSColor.systemOrange.cgColor
+        rail.addSubview(railStatusDot)
+        NSLayoutConstraint.activate([
+            railStatusDot.centerXAnchor.constraint(equalTo: rail.centerXAnchor),
+            railStatusDot.bottomAnchor.constraint(equalTo: rail.bottomAnchor, constant: -18),
+            railStatusDot.widthAnchor.constraint(equalToConstant: 6),
+            railStatusDot.heightAnchor.constraint(equalToConstant: 6),
+        ])
+    }
+
+    private func buildSidebar() {
         effortPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        effortPopup.addItems(withTitles: ["自动思考", "始终思考", "不思考"])
+        effortPopup.addItems(withTitles: ["自动", "思考开", "思考关"])
+        effortPopup.isBordered = false
         effortPopup.controlSize = .small
-        effortPopup.font = .systemFont(ofSize: 10)
+        effortPopup.font = .systemFont(ofSize: 12)
         effortPopup.target = self
         effortPopup.action = #selector(effortChanged)
         effortPopup.translatesAutoresizingMaskIntoConstraints = false
+        effortPopup.wantsLayer = true
+        effortPopup.layer?.cornerRadius = 7
+        effortPopup.layer?.backgroundColor = Theme.chip.cgColor
+        sidebar.addSubview(effortPopup)
 
-        newChatButton = NSButton(title: "新会话", target: self, action: #selector(newChat))
-        newChatButton.bezelStyle = .inline
-        newChatButton.font = .systemFont(ofSize: 11)
-        newChatButton.controlSize = .small
+        let compose = NSButton()
+        compose.image = symbol("square.and.pencil", size: 14)
+        compose.contentTintColor = .secondaryLabelColor
+        compose.isBordered = false
+        compose.target = self
+        compose.action = #selector(newChat)
+        compose.toolTip = "新会话"
+        compose.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(compose)
 
-        let capabilityButton = NSButton(title: "能力", target: self, action: #selector(showCapabilities))
-        capabilityButton.bezelStyle = .inline
-        capabilityButton.font = .systemFont(ofSize: 11)
-        capabilityButton.controlSize = .small
+        let headerRow = NSStackView(views: [effortPopup, NSView(), compose])
+        headerRow.orientation = .horizontal
+        headerRow.alignment = .centerY
+        headerRow.spacing = 6
+        headerRow.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(headerRow)
 
-        let header = NSStackView(views: [avatar, name, statusLabel, spacer, modelLabel, effortPopup, capabilityButton, newChatButton])
-        header.orientation = .horizontal
-        header.spacing = 8
-        header.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 10, right: 16)
-        header.translatesAutoresizingMaskIntoConstraints = false
-        header.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        searchField = NSSearchField()
+        searchField.placeholderString = "搜索"
+        searchField.font = .systemFont(ofSize: 12)
+        searchField.controlSize = .small
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        searchField.delegate = self
+        searchField.focusRingType = .none
+        searchField.isBordered = false
+        searchField.drawsBackground = true
+        searchField.backgroundColor = Theme.chip
+        searchField.wantsLayer = true
+        searchField.layer?.cornerRadius = 7
+        sidebar.addSubview(searchField)
 
-        let divider = NSBox()
-        divider.boxType = .separator
-        divider.translatesAutoresizingMaskIntoConstraints = false
+        let recent = NSTextField(labelWithString: "最近")
+        recent.font = .systemFont(ofSize: 10.5)
+        recent.textColor = .tertiaryLabelColor
+        recent.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(recent)
 
-        scrollView = NSScrollView()
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        sessionsScroll = NSScrollView()
+        sessionsScroll.hasVerticalScroller = true
+        sessionsScroll.autohidesScrollers = true
+        sessionsScroll.drawsBackground = false
+        sessionsScroll.borderType = .noBorder
+        sessionsScroll.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(sessionsScroll)
+
+        let sessionsDoc = FlippedView()
+        sessionsDoc.translatesAutoresizingMaskIntoConstraints = false
+        sessionsScroll.documentView = sessionsDoc
+        sessionsStack = NSStackView()
+        sessionsStack.orientation = .vertical
+        sessionsStack.alignment = .leading
+        sessionsStack.spacing = 2
+        sessionsStack.edgeInsets = NSEdgeInsetsZero
+        sessionsStack.translatesAutoresizingMaskIntoConstraints = false
+        sessionsDoc.addSubview(sessionsStack)
+        NSLayoutConstraint.activate([
+            sessionsDoc.widthAnchor.constraint(equalTo: sessionsScroll.contentView.widthAnchor),
+            sessionsStack.topAnchor.constraint(equalTo: sessionsDoc.topAnchor, constant: 2),
+            sessionsStack.leadingAnchor.constraint(equalTo: sessionsDoc.leadingAnchor),
+            sessionsStack.trailingAnchor.constraint(equalTo: sessionsDoc.trailingAnchor),
+            sessionsStack.bottomAnchor.constraint(equalTo: sessionsDoc.bottomAnchor),
+        ])
+
+        NSLayoutConstraint.activate([
+            headerRow.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 52),
+            headerRow.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 14),
+            headerRow.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -14),
+
+            effortPopup.widthAnchor.constraint(equalToConstant: 76),
+            effortPopup.heightAnchor.constraint(equalToConstant: 26),
+            compose.widthAnchor.constraint(equalToConstant: 24),
+            compose.heightAnchor.constraint(equalToConstant: 24),
+
+            searchField.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 10),
+            searchField.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 12),
+            searchField.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -12),
+            searchField.heightAnchor.constraint(equalToConstant: 26),
+
+            recent.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 14),
+            recent.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 16),
+
+            sessionsScroll.topAnchor.constraint(equalTo: recent.bottomAnchor, constant: 6),
+            sessionsScroll.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 8),
+            sessionsScroll.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
+            sessionsScroll.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -10),
+        ])
+    }
+
+    private func buildMain() {
+        contentScroll = NSScrollView()
+        contentScroll.hasVerticalScroller = true
+        contentScroll.autohidesScrollers = true
+        contentScroll.drawsBackground = false
+        contentScroll.borderType = .noBorder
+        contentScroll.translatesAutoresizingMaskIntoConstraints = false
+        main.addSubview(contentScroll)
 
         document = FlippedView()
         document.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.documentView = document
+        contentScroll.documentView = document
+
+        contentColumn = NSView()
+        contentColumn.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(contentColumn)
 
         stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 0
-        stack.edgeInsets = NSEdgeInsets(top: 12, left: 0, bottom: 12, right: 0)
+        stack.spacing = 12
+        stack.edgeInsets = NSEdgeInsetsZero
         stack.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(stack)
+        contentColumn.addSubview(stack)
 
-        // 空态
-        let bigAvatar = AvatarView(diameter: 64, fontSize: 26)
-        let emptyTitle = NSTextField(labelWithString: "云熙")
-        emptyTitle.font = .systemFont(ofSize: 20, weight: .semibold)
-        let emptyHint = NSTextField(labelWithString: "说点什么吧，我在。")
-        emptyHint.font = .systemFont(ofSize: 12)
-        emptyHint.textColor = .secondaryLabelColor
-        emptyState = NSStackView(views: [bigAvatar, emptyTitle, emptyHint])
+        let preferredWidth = contentColumn.widthAnchor.constraint(equalTo: document.widthAnchor, constant: -56)
+        preferredWidth.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            document.widthAnchor.constraint(equalTo: contentScroll.contentView.widthAnchor),
+
+            contentColumn.topAnchor.constraint(equalTo: document.topAnchor, constant: 24),
+            contentColumn.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -12),
+            contentColumn.centerXAnchor.constraint(equalTo: document.centerXAnchor),
+            contentColumn.widthAnchor.constraint(lessThanOrEqualToConstant: 820),
+            contentColumn.leadingAnchor.constraint(greaterThanOrEqualTo: document.leadingAnchor, constant: 24),
+            contentColumn.trailingAnchor.constraint(lessThanOrEqualTo: document.trailingAnchor, constant: -24),
+            preferredWidth,
+
+            stack.topAnchor.constraint(equalTo: contentColumn.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: contentColumn.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: contentColumn.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: contentColumn.bottomAnchor),
+        ])
+
+        buildEmptyState()
+        buildComposer()
+        buildApprovalCard()
+    }
+
+    private func buildEmptyState() {
+        let cloud = NSImageView()
+        cloud.image = symbol("cloud", size: 42, weight: .thin)
+        cloud.contentTintColor = .tertiaryLabelColor
+        cloud.translatesAutoresizingMaskIntoConstraints = false
+
+        let heading = NSTextField(labelWithString: "今天想聊点什么？")
+        heading.font = .systemFont(ofSize: 24, weight: .semibold)
+        let sub = NSTextField(labelWithString: "说事、闲聊、安排今天，都可以。")
+        sub.font = .systemFont(ofSize: 12.5)
+        sub.textColor = .secondaryLabelColor
+
+        emptyState = NSStackView(views: [cloud, heading, sub])
         emptyState.orientation = .vertical
         emptyState.alignment = .centerX
-        emptyState.spacing = 8
+        emptyState.spacing = 10
         emptyState.translatesAutoresizingMaskIntoConstraints = false
-        mainColumn.addSubview(emptyState)
+        main.addSubview(emptyState)
+        NSLayoutConstraint.activate([
+            cloud.widthAnchor.constraint(equalToConstant: 48),
+            cloud.heightAnchor.constraint(equalToConstant: 48),
+            emptyState.centerXAnchor.constraint(equalTo: main.centerXAnchor),
+            emptyState.centerYAnchor.constraint(equalTo: main.centerYAnchor, constant: -30),
+        ])
+    }
 
-        // 审批卡片（悬浮在输入区上方）
-        approvalCard = NSView()
-        approvalCard.wantsLayer = true
-        approvalCard.layer?.cornerRadius = 14
-        approvalCard.layer?.backgroundColor = NSColor.cardSurface.cgColor
-        approvalCard.layer?.borderWidth = 1
-        approvalCard.layer?.borderColor = NSColor.bubbleBorder.cgColor
-        approvalCard.layer?.shadowColor = NSColor.black.cgColor
-        approvalCard.layer?.shadowOpacity = 0.08
-        approvalCard.layer?.shadowRadius = 10
-        approvalCard.layer?.shadowOffset = CGSize(width: 0, height: 3)
-        approvalCard.isHidden = true
-        approvalCard.translatesAutoresizingMaskIntoConstraints = false
-        mainColumn.addSubview(approvalCard)
+    private func buildComposer() {
+        composer = ColorView(fill: Theme.elevated, radius: 16, border: Theme.border, borderWidth: 0.8)
+        composer.layer?.shadowColor = NSColor.black.cgColor
+        composer.layer?.shadowOpacity = 0.16
+        composer.layer?.shadowRadius = 20
+        composer.layer?.shadowOffset = CGSize(width: 0, height: 6)
+        main.addSubview(composer)
 
-        approvalTitle.font = .systemFont(ofSize: 12, weight: .semibold)
-        approvalDetail.font = .systemFont(ofSize: 10.5)
-        approvalDetail.textColor = .secondaryLabelColor
-        approvalDetail.lineBreakMode = .byTruncatingTail
-        approvalPreview.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
-        approvalPreview.textColor = .secondaryLabelColor
-        approvalPreview.maximumNumberOfLines = 6
-        approvalPreview.lineBreakMode = .byTruncatingTail
-
-        let approvalAllow = NSButton(title: "允许", target: self, action: #selector(approveAction))
-        approvalAllow.bezelStyle = .rounded
-        approvalAllow.controlSize = .small
-        let approvalDeny = NSButton(title: "拒绝", target: self, action: #selector(denyAction))
-        approvalDeny.bezelStyle = .rounded
-        approvalDeny.controlSize = .small
-
-        let approvalButtons = NSStackView(views: [approvalDeny, approvalAllow])
-        approvalButtons.orientation = .horizontal
-        approvalButtons.spacing = 6
-        approvalButtons.alignment = .trailing
-        approvalButtons.translatesAutoresizingMaskIntoConstraints = false
-
-        let approvalContent = NSStackView(views: [approvalTitle, approvalDetail, approvalPreview, approvalButtons])
-        approvalContent.orientation = .vertical
-        approvalContent.alignment = .leading
-        approvalContent.spacing = 5
-        approvalContent.translatesAutoresizingMaskIntoConstraints = false
-        approvalCard.addSubview(approvalContent)
-
-        // 输入区
-        let inputContainer = NSView()
-        inputContainer.wantsLayer = true
-        inputContainer.layer?.cornerRadius = 22
-        inputContainer.layer?.backgroundColor = NSColor.composerSurface.cgColor
-        inputContainer.layer?.borderWidth = 1
-        inputContainer.layer?.borderColor = NSColor.bubbleBorder.cgColor
-        inputContainer.layer?.shadowColor = NSColor.black.cgColor
-        inputContainer.layer?.shadowOpacity = 0.06
-        inputContainer.layer?.shadowRadius = 8
-        inputContainer.layer?.shadowOffset = CGSize(width: 0, height: 2)
-        inputContainer.translatesAutoresizingMaskIntoConstraints = false
-
-        composerScroll = NSScrollView()
-        composerScroll.hasVerticalScroller = false
-        composerScroll.drawsBackground = false
-        composerScroll.borderType = .noBorder
-        composerScroll.translatesAutoresizingMaskIntoConstraints = false
+        let textScroll = NSScrollView()
+        textScroll.hasVerticalScroller = false
+        textScroll.drawsBackground = false
+        textScroll.borderType = .noBorder
+        textScroll.translatesAutoresizingMaskIntoConstraints = false
+        composer.addSubview(textScroll)
 
         composerTextView = NSTextView()
         composerTextView.isRichText = false
@@ -564,123 +878,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         composerTextView.drawsBackground = false
         composerTextView.font = .systemFont(ofSize: 14)
         composerTextView.textColor = .labelColor
-        composerTextView.insertionPointColor = .yunxiAccent
-        composerTextView.textContainerInset = NSSize(width: 0, height: 6)
+        composerTextView.insertionPointColor = Theme.accent
+        composerTextView.textContainerInset = NSSize(width: 0, height: 3)
         composerTextView.isVerticallyResizable = true
         composerTextView.isHorizontallyResizable = false
         composerTextView.autoresizingMask = [.width]
         composerTextView.textContainer?.widthTracksTextView = true
         composerTextView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         composerTextView.delegate = self
-        composerScroll.documentView = composerTextView
+        textScroll.documentView = composerTextView
 
+        composerPlaceholder = NSTextField(labelWithString: "说点什么…")
         composerPlaceholder.font = .systemFont(ofSize: 14)
-        composerPlaceholder.textColor = .placeholderTextColor
+        composerPlaceholder.textColor = .tertiaryLabelColor
         composerPlaceholder.translatesAutoresizingMaskIntoConstraints = false
+        composer.addSubview(composerPlaceholder)
 
-        sendButton = NSButton(
-            image: NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: "发送") ?? NSImage(),
-            target: self,
-            action: #selector(sendMessage)
-        )
+        sendButton = NSButton()
+        sendButton.image = symbol("arrow.up", size: 12, weight: .semibold)
+        sendButton.contentTintColor = .white
         sendButton.isBordered = false
-        sendButton.contentTintColor = .yunxiAccent
-        sendButton.imageScaling = .scaleProportionallyUpOrDown
+        sendButton.wantsLayer = true
+        sendButton.layer?.cornerRadius = 14
+        sendButton.layer?.backgroundColor = Theme.accent.cgColor
+        sendButton.target = self
+        sendButton.action = #selector(sendMessage)
+        sendButton.toolTip = "发送（Enter）"
         sendButton.translatesAutoresizingMaskIntoConstraints = false
-
-        inputContainer.addSubview(composerScroll)
-        inputContainer.addSubview(composerPlaceholder)
-        inputContainer.addSubview(sendButton)
+        composer.addSubview(sendButton)
 
         let hint = NSTextField(labelWithString: "仅本机 · Enter 发送、Shift+Enter 换行")
         hint.font = .systemFont(ofSize: 9.5)
         hint.textColor = .tertiaryLabelColor
         hint.translatesAutoresizingMaskIntoConstraints = false
+        main.addSubview(hint)
 
-        mainColumn.addSubview(header)
-        mainColumn.addSubview(divider)
-        mainColumn.addSubview(scrollView)
-        mainColumn.addSubview(inputContainer)
-        mainColumn.addSubview(hint)
-
-        composerHeight = inputContainer.heightAnchor.constraint(equalToConstant: 44)
+        composerHeight = composer.heightAnchor.constraint(equalToConstant: 56)
         composerHeight.isActive = true
+        textHeight = textScroll.heightAnchor.constraint(equalToConstant: 28)
+        textHeight.isActive = true
 
         NSLayoutConstraint.activate([
-            sidebar.leadingAnchor.constraint(equalTo: background.leadingAnchor),
-            sidebar.topAnchor.constraint(equalTo: background.topAnchor),
-            sidebar.bottomAnchor.constraint(equalTo: background.bottomAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: 200),
+            contentScroll.topAnchor.constraint(equalTo: main.topAnchor),
+            contentScroll.leadingAnchor.constraint(equalTo: main.leadingAnchor),
+            contentScroll.trailingAnchor.constraint(equalTo: main.trailingAnchor),
+            contentScroll.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -12),
 
-            sidebarTitle.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 16),
-            sidebarTitle.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 14),
+            composer.leadingAnchor.constraint(greaterThanOrEqualTo: main.leadingAnchor, constant: 32),
+            composer.trailingAnchor.constraint(lessThanOrEqualTo: main.trailingAnchor, constant: -32),
+            composer.centerXAnchor.constraint(equalTo: main.centerXAnchor),
+            composer.widthAnchor.constraint(lessThanOrEqualToConstant: 720),
+            composer.widthAnchor.constraint(greaterThanOrEqualToConstant: 520),
+            composer.bottomAnchor.constraint(equalTo: hint.topAnchor, constant: -8),
 
-            sidebarScroll.topAnchor.constraint(equalTo: sidebarTitle.bottomAnchor, constant: 8),
-            sidebarScroll.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 6),
-            sidebarScroll.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -6),
-            sidebarScroll.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -8),
+            hint.centerXAnchor.constraint(equalTo: main.centerXAnchor),
+            hint.bottomAnchor.constraint(equalTo: main.bottomAnchor, constant: -10),
 
-            sidebarDivider.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            sidebarDivider.topAnchor.constraint(equalTo: background.topAnchor),
-            sidebarDivider.bottomAnchor.constraint(equalTo: background.bottomAnchor),
-            sidebarDivider.widthAnchor.constraint(equalToConstant: 1),
+            textScroll.leadingAnchor.constraint(equalTo: composer.leadingAnchor, constant: 16),
+            textScroll.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -8),
+            textScroll.topAnchor.constraint(equalTo: composer.topAnchor, constant: 12),
+            textScroll.bottomAnchor.constraint(equalTo: composer.bottomAnchor, constant: -12),
 
-            mainColumn.leadingAnchor.constraint(equalTo: sidebarDivider.trailingAnchor),
-            mainColumn.trailingAnchor.constraint(equalTo: background.trailingAnchor),
-            mainColumn.topAnchor.constraint(equalTo: background.topAnchor),
-            mainColumn.bottomAnchor.constraint(equalTo: background.bottomAnchor),
+            composerPlaceholder.leadingAnchor.constraint(equalTo: composer.leadingAnchor, constant: 17),
+            composerPlaceholder.topAnchor.constraint(equalTo: textScroll.topAnchor, constant: 5),
 
-            header.topAnchor.constraint(equalTo: mainColumn.topAnchor),
-            header.leadingAnchor.constraint(equalTo: mainColumn.leadingAnchor),
-            header.trailingAnchor.constraint(equalTo: mainColumn.trailingAnchor),
-
-            divider.topAnchor.constraint(equalTo: header.bottomAnchor),
-            divider.leadingAnchor.constraint(equalTo: mainColumn.leadingAnchor),
-            divider.trailingAnchor.constraint(equalTo: mainColumn.trailingAnchor),
-
-            scrollView.topAnchor.constraint(equalTo: divider.bottomAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: mainColumn.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: mainColumn.trailingAnchor),
-
-            stack.topAnchor.constraint(equalTo: document.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor),
-            document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
-            document.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor),
-
-            emptyState.centerXAnchor.constraint(equalTo: scrollView.centerXAnchor),
-            emptyState.centerYAnchor.constraint(equalTo: scrollView.centerYAnchor),
-
-            inputContainer.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 8),
-            inputContainer.leadingAnchor.constraint(equalTo: mainColumn.leadingAnchor, constant: 16),
-            inputContainer.trailingAnchor.constraint(equalTo: mainColumn.trailingAnchor, constant: -16),
-
-            composerScroll.leadingAnchor.constraint(equalTo: inputContainer.leadingAnchor, constant: 14),
-            composerScroll.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -8),
-            composerScroll.topAnchor.constraint(equalTo: inputContainer.topAnchor, constant: 7),
-            composerScroll.bottomAnchor.constraint(equalTo: inputContainer.bottomAnchor, constant: -7),
-
-            composerPlaceholder.leadingAnchor.constraint(equalTo: inputContainer.leadingAnchor, constant: 15),
-            composerPlaceholder.centerYAnchor.constraint(equalTo: inputContainer.centerYAnchor),
-
-            sendButton.trailingAnchor.constraint(equalTo: inputContainer.trailingAnchor, constant: -10),
-            sendButton.bottomAnchor.constraint(equalTo: inputContainer.bottomAnchor, constant: -8),
+            sendButton.trailingAnchor.constraint(equalTo: composer.trailingAnchor, constant: -12),
+            sendButton.centerYAnchor.constraint(equalTo: composer.centerYAnchor),
             sendButton.widthAnchor.constraint(equalToConstant: 28),
             sendButton.heightAnchor.constraint(equalToConstant: 28),
+        ])
+    }
 
-            hint.topAnchor.constraint(equalTo: inputContainer.bottomAnchor, constant: 6),
-            hint.leadingAnchor.constraint(equalTo: mainColumn.leadingAnchor, constant: 18),
-            hint.bottomAnchor.constraint(equalTo: mainColumn.bottomAnchor, constant: -8),
+    private func buildApprovalCard() {
+        approvalCard = ColorView(fill: Theme.elevated, radius: 16, border: Theme.border, borderWidth: 1)
+        approvalCard.layer?.shadowColor = NSColor.black.cgColor
+        approvalCard.layer?.shadowOpacity = 0.14
+        approvalCard.layer?.shadowRadius = 16
+        approvalCard.layer?.shadowOffset = CGSize(width: 0, height: 5)
+        approvalCard.isHidden = true
+        main.addSubview(approvalCard)
 
-            approvalCard.leadingAnchor.constraint(equalTo: mainColumn.leadingAnchor, constant: 16),
-            approvalCard.trailingAnchor.constraint(equalTo: mainColumn.trailingAnchor, constant: -16),
-            approvalCard.bottomAnchor.constraint(equalTo: inputContainer.topAnchor, constant: -8),
+        approvalTitle.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        approvalDetail.font = .systemFont(ofSize: 10.5)
+        approvalDetail.textColor = .secondaryLabelColor
+        approvalDetail.lineBreakMode = .byTruncatingTail
+        approvalPreview.font = .monospacedSystemFont(ofSize: 10.5, weight: .regular)
+        approvalPreview.textColor = .secondaryLabelColor
+        approvalPreview.maximumNumberOfLines = 5
+        approvalPreview.lineBreakMode = .byTruncatingTail
+        approvalPreview.preferredMaxLayoutWidth = 640
 
-            approvalContent.topAnchor.constraint(equalTo: approvalCard.topAnchor, constant: 10),
-            approvalContent.leadingAnchor.constraint(equalTo: approvalCard.leadingAnchor, constant: 12),
-            approvalContent.trailingAnchor.constraint(equalTo: approvalCard.trailingAnchor, constant: -12),
-            approvalContent.bottomAnchor.constraint(equalTo: approvalCard.bottomAnchor, constant: -10),
+        let allow = NSButton(title: "允许", target: self, action: #selector(approveAction))
+        allow.bezelStyle = .rounded
+        allow.controlSize = .small
+        let deny = NSButton(title: "拒绝", target: self, action: #selector(denyAction))
+        deny.bezelStyle = .rounded
+        deny.controlSize = .small
+        let buttons = NSStackView(views: [deny, allow])
+        buttons.orientation = .horizontal
+        buttons.spacing = 6
+        buttons.alignment = .trailing
+        buttons.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSStackView(views: [approvalTitle, approvalDetail, approvalPreview, buttons])
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 5
+        content.translatesAutoresizingMaskIntoConstraints = false
+        approvalCard.addSubview(content)
+
+        NSLayoutConstraint.activate([
+            approvalCard.leadingAnchor.constraint(equalTo: composer.leadingAnchor),
+            approvalCard.trailingAnchor.constraint(equalTo: composer.trailingAnchor),
+            approvalCard.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -8),
+
+            content.leadingAnchor.constraint(equalTo: approvalCard.leadingAnchor, constant: 12),
+            content.trailingAnchor.constraint(equalTo: approvalCard.trailingAnchor, constant: -12),
+            content.topAnchor.constraint(equalTo: approvalCard.topAnchor, constant: 10),
+            content.bottomAnchor.constraint(equalTo: approvalCard.bottomAnchor, constant: -10),
         ])
     }
 
@@ -697,15 +1012,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             .store(in: &cancellables)
         service.$status
             .receive(on: RunLoop.main)
-            .sink { [weak self] value in self?.statusLabel.stringValue = value }
-            .store(in: &cancellables)
-        service.$modelInfo
-            .receive(on: RunLoop.main)
-            .sink { [weak self] value in self?.modelLabel.stringValue = value }
+            .sink { [weak self] value in
+                self?.railStatusDot.layer?.backgroundColor = (value == "在线" ? NSColor.systemGreen : NSColor.systemOrange).cgColor
+            }
             .store(in: &cancellables)
         service.$sessions
             .receive(on: RunLoop.main)
             .sink { [weak self] sessions in self?.reloadSessions(sessions) }
+            .store(in: &cancellables)
+        service.$session
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.reloadSessions(self?.service.sessions ?? []) }
             .store(in: &cancellables)
         service.$pendingApproval
             .receive(on: RunLoop.main)
@@ -723,16 +1040,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             .sink { [weak self] connected in
                 self?.composerTextView.isEditable = connected
                 self?.sendButton.isEnabled = connected
-                self?.sidebarTable.isEnabled = connected
-                self?.effortPopup.isEnabled = connected
-                self?.newChatButton.isEnabled = connected
-            }
-            .store(in: &cancellables)
-        service.$busy
-            .receive(on: RunLoop.main)
-            .sink { [weak self] busy in
-                self?.sidebarTable.isEnabled = self?.service.connected == true && !busy
-                self?.newChatButton.isEnabled = self?.service.connected == true && !busy
             }
             .store(in: &cancellables)
     }
@@ -757,7 +1064,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             }
         }
 
-        emptyState.isHidden = !messages.isEmpty
+        emptyState.isHidden = messages.contains { $0.role != .system }
         updateTyping(visible: service.busy)
         scrollToBottom()
     }
@@ -786,17 +1093,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             showDate = false
         }
         let row = MessageRowView(message: message, showDate: showDate)
+        row.alphaValue = 0
         stack.addArrangedSubview(row)
         row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         rows.append(row)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            row.animator().alphaValue = 1
+        }
     }
 
     private func updateTyping(visible: Bool) {
         if visible, typingRow == nil {
             let row = TypingRowView()
+            row.alphaValue = 0
             stack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
             typingRow = row
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                row.animator().alphaValue = 1
+            }
         } else if !visible, let typingRow {
             typingRow.removeFromSuperview()
             self.typingRow = nil
@@ -808,62 +1125,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
             guard let self else { return }
             self.document.layoutSubtreeIfNeeded()
             let height = self.stack.fittingSize.height
-            let visible = self.scrollView.contentView.bounds.height
-            let maxY = max(0, height - visible + 24)
-            self.scrollView.contentView.scroll(to: NSPoint(x: 0, y: maxY))
-            self.scrollView.reflectScrolledClipView(self.scrollView.contentView)
+            let visible = self.contentScroll.contentView.bounds.height
+            let maxY = max(0, height - visible + 40)
+            self.contentScroll.contentView.scroll(to: NSPoint(x: 0, y: maxY))
+            self.contentScroll.reflectScrolledClipView(self.contentScroll.contentView)
         }
     }
 
-    // MARK: 侧边栏
+    // MARK: 会话侧栏
 
     private func reloadSessions(_ sessions: [ChatSession]) {
-        suppressSelection = true
-        sidebarTable.reloadData()
-        if let index = sessions.firstIndex(where: { $0.id == service.session }) {
-            sidebarTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-        } else {
-            sidebarTable.deselectAll(nil)
+        for view in sessionsStack.arrangedSubviews {
+            sessionsStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
         }
-        // 选中通知可能异步到达：等一拍再放开，避免启动时自动"打开"错误会话。
-        DispatchQueue.main.async { [weak self] in self?.suppressSelection = false }
-    }
+        let query = searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let filtered = query.isEmpty
+            ? sessions
+            : sessions.filter { $0.preview.localizedCaseInsensitiveContains(query) || $0.id.localizedCaseInsensitiveContains(query) }
 
-    func numberOfRows(in tableView: NSTableView) -> Int {
-        service.sessions.count
-    }
-
-    private static let sessionDateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "M月d日 HH:mm"
-        return f
-    }()
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard row < service.sessions.count else { return nil }
-        let item = service.sessions[row]
-        let identifier = NSUserInterfaceItemIdentifier("session-cell")
-        let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? SessionCellView) ?? SessionCellView()
-        cell.identifier = identifier
-        if item.hasHistory {
-            cell.previewLabel.stringValue = item.preview.isEmpty ? "（无预览）" : item.preview
-            cell.metaLabel.stringValue = "\(item.turns) 轮"
-        } else {
-            let date = Date(timeIntervalSince1970: item.updatedAt / 1000)
-            cell.previewLabel.stringValue = "旧会话 · " + Self.sessionDateFormatter.string(from: date)
-            cell.metaLabel.stringValue = "\(item.turns) 轮 · 无显示记录"
+        if filtered.isEmpty {
+            let hint = NSTextField(wrappingLabelWithString: query.isEmpty ? "还没有会话。\n点右上角新建开始。" : "没有匹配的会话。")
+            hint.font = .systemFont(ofSize: 11)
+            hint.textColor = .tertiaryLabelColor
+            hint.alignment = .center
+            sessionsStack.addArrangedSubview(hint)
+            hint.widthAnchor.constraint(equalTo: sessionsStack.widthAnchor).isActive = true
+            return
         }
-        return cell
+
+        var lastGroup = ""
+        let calendar = Calendar.current
+        for session in filtered {
+            let group = groupTitle(for: session.updatedAt, calendar: calendar)
+            if group != lastGroup {
+                let label = NSTextField(labelWithString: group)
+                label.font = .systemFont(ofSize: 10.5, weight: .medium)
+                label.textColor = .tertiaryLabelColor
+                sessionsStack.addArrangedSubview(label)
+                label.widthAnchor.constraint(equalTo: sessionsStack.widthAnchor).isActive = true
+                lastGroup = group
+            }
+            let row = SessionRowView(session: session, selected: session.id == service.session) { [weak self] in
+                guard let self, !self.service.busy else { return }
+                self.service.openSession(session.id)
+            }
+            sessionsStack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: sessionsStack.widthAnchor).isActive = true
+        }
     }
 
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        guard !suppressSelection else { return }
-        let row = sidebarTable.selectedRow
-        guard row >= 0, row < service.sessions.count else { return }
-        service.openSession(service.sessions[row].id)
+    private func groupTitle(for ms: Double, calendar: Calendar) -> String {
+        let date = Date(timeIntervalSince1970: ms / 1000)
+        if calendar.isDateInToday(date) { return "今天" }
+        if calendar.isDateInYesterday(date) { return "昨天" }
+        return "更早"
     }
 
-    // MARK: 审批卡片
+    @objc private func toggleSearch() {
+        searchVisible.toggle()
+        searchField.isHidden = !searchVisible
+        searchHeight.constant = searchVisible ? 26 : 0
+        newChatTopToHeader.isActive = !searchVisible
+        newChatTopToSearch.isActive = searchVisible
+        if searchVisible {
+            window.makeFirstResponder(searchField)
+            searchField.stringValue = ""
+        } else {
+            reloadSessions(service.sessions)
+            window.makeFirstResponder(composerTextView)
+        }
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        if obj.object as? NSSearchField === searchField {
+            reloadSessions(service.sessions)
+        }
+    }
+
+    // MARK: 审批
 
     private func updateApproval(_ approval: PendingApproval?) {
         guard let approval else {
@@ -891,23 +1231,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         service.respondApproval(approval.id, allow: false)
     }
 
-    @objc private func effortChanged() {
-        let values = ["auto", "on", "off"]
-        let index = effortPopup.indexOfSelectedItem
-        if index >= 0 && index < values.count {
-            service.setEffort(values[index])
-        }
-    }
-
     // MARK: 输入
 
     func textDidChange(_ notification: Notification) {
         let text = composerTextView.string
         composerPlaceholder.isHidden = !text.isEmpty
         let used = composerTextView.layoutManager?.usedRect(for: composerTextView.textContainer!) ?? .zero
-        let height = min(112, max(44, used.height + 20))
-        if abs(composerHeight.constant - height) > 0.5 {
-            composerHeight.constant = height
+        let height = min(120, max(28, used.height + 8))
+        let composerTarget = height + 24
+        if abs(textHeight.constant - height) > 0.5 {
+            textHeight.constant = height
+            composerHeight.constant = composerTarget
             window.contentView?.layoutSubtreeIfNeeded()
         }
         sendButton.isEnabled = service.connected && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -929,16 +1263,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     @objc private func sendMessage() {
         let text = composerTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, service.connected, !service.busy else { return }
+        resetComposer()
+        service.send(text)
+    }
+
+    private func resetComposer() {
         composerTextView.string = ""
         composerPlaceholder.isHidden = false
-        composerHeight.constant = 44
+        textHeight.constant = 28
+        composerHeight.constant = 56
         sendButton.isEnabled = false
-        service.send(text)
         window.makeFirstResponder(composerTextView)
+    }
+
+    @objc private func useSuggestion(_ sender: NSButton) {
+        guard service.connected, !service.busy else { return }
+        service.send(sender.title)
+    }
+
+    @objc private func effortChanged() {
+        let values = ["auto", "on", "off"]
+        let index = effortPopup.indexOfSelectedItem
+        if index >= 0 && index < values.count {
+            service.setEffort(values[index])
+        }
     }
 
     @objc private func newChat() {
         service.newChat()
+        window.makeFirstResponder(composerTextView)
+    }
+
+    @objc private func focusComposer() {
+        window.makeFirstResponder(composerTextView)
+    }
+
+    @objc private func focusSessions() {
+        sessionsScroll.contentView.scroll(to: .zero)
+        sessionsScroll.reflectScrolledClipView(sessionsScroll.contentView)
+    }
+
+    @objc private func showAbout() {
+        NSApp.orderFrontStandardAboutPanel(nil)
     }
 
     @objc private func showCapabilities() {
@@ -947,6 +1313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         }
         capabilityWindow?.showWindow(nil)
         capabilityWindow?.window?.makeKeyAndOrderFront(nil)
+        service.requestCapabilities()
     }
 
     // MARK: 图标

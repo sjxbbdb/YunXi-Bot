@@ -14,7 +14,7 @@ YunXi Bot 是 YunXi 家族衍生的个人 Agent。它以本地机器为长期运
 
 项目的目标是让一个助理长期在场：相处有连续性，行动有边界，主动有分寸。
 
-> **当前状态（2026-10-20）**：重点开发和验收平台为 **Apple Silicon / macOS 14+**，入口是 CLI、macOS 原生聊天窗口与后台守护。聊天和任务由 DeepSeek 生成，本地只需 Laya 决策与按需启动的语义编码器。Windows 通用内核与启动入口保留，新增 Mac 生态工具仅在 Mac 可用；本轮未重做 Windows 真机验收。7×24 常驻是项目目标，长期运行和休眠唤醒尚未完成验收。
+> **当前状态（2026-10-20）**：重点开发和验收平台为 **Apple Silicon / macOS 14+**（原生聊天窗口为 **macOS 26+**，采用 Liquid Glass 界面，回适配 macOS 14 后续再做），入口是 CLI、macOS 原生聊天窗口与后台守护。聊天和任务由 DeepSeek 生成，本地只需 Laya 决策与按需启动的语义编码器。Windows 通用内核与启动入口保留，新增 Mac 生态工具仅在 Mac 可用；本轮未重做 Windows 真机验收。7×24 常驻是项目目标，长期运行和休眠唤醒尚未完成验收。
 
 ## 当前能做什么
 
@@ -477,7 +477,7 @@ cargo run -- cost --calls 10
 
 ### macOS（当前主要验收平台）
 
-需要 Apple Silicon、macOS 14+、Xcode Command Line Tools、Git、Rust 1.88+ 和 Python 3.12。先准备这些工具，再执行：
+需要 Apple Silicon、macOS 14+、Xcode Command Line Tools、Git、Rust 1.88+ 和 Python 3.12。原生聊天窗口（SwiftUI + Liquid Glass）需要 **macOS 26+**，其余组件 14+ 即可。先准备这些工具，再执行：
 
 ```bash
 git clone https://github.com/sjxbbdb/YunXi-Bot.git
@@ -515,13 +515,17 @@ export YUNXI_BOT_HOME="$PWD/data"
 
 ### macOS 原生聊天窗口（可选）
 
+> 聊天窗口为 **SwiftUI + Liquid Glass** 界面，需要 **macOS 26+**（`.glassEffect` 材质）。旧 AppKit 版（`scripts/build-macos-chat.sh`）仍保留、支持 macOS 14+，可作回退；回适配 macOS 14 后续再做。
+
 窗口顶部“能力”按钮（或 Cmd+I）打开能力面板：按工具、记忆、任务、台账、系统五类展示后端实时快照——63 个内置工具及能力/审批级别、记忆候选、定时作业、模型调用成本、值守与本地服务状态。面板只读，不绕过审批。
+
+界面按 Codex 桌面端外壳重做：左侧图标栏 + 会话栏、主区空态、悬浮输入卡；深色优先，可在「云熙 > 外观」切换跟随系统/浅色/深色。助手回复为纯文本 Markdown，用户消息是玫瑰色气泡。
 
 除终端入口外，可用原生窗口和云熙对话（人格、画像、记忆、会话、只读工具与 `chat` 完全同一条链路）：
 
 ```bash
 # 首次构建（先确保 target/release/yunxi-bot 已构建）
-bash scripts/build-macos-chat.sh
+bash scripts/build-macos-chat-swiftui.sh
 
 # 打开窗口（或双击仓库里的 启动聊天窗口.command / target/macos/云熙聊天.app）
 open "target/macos/云熙聊天.app"
