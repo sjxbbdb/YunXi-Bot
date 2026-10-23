@@ -119,7 +119,7 @@ impl yunxi_bot_core::think::context::Summarizer for ModelSummarizer {
 }
 
 /// 超预算就压。**摘要用模型；失败退回兜底。**
-fn compact_now(
+pub(crate) fn compact_now(
     handler: &mut ChatHandler,
     budget: &yunxi_bot_core::think::context::ContextBudget,
     spec: &yunxi_bot_core::think::ModelSpec,
@@ -537,7 +537,7 @@ pub fn run(
 }
 
 /// 落盘。
-fn persist(
+pub(crate) fn persist(
     handler: &ChatHandler,
     store: &SessionStore,
     id: &str,

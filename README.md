@@ -14,7 +14,7 @@ YunXi Bot 是 YunXi 家族衍生的个人 Agent。它以本地机器为长期运
 
 项目的目标是让一个助理长期在场：相处有连续性，行动有边界，主动有分寸。
 
-> **当前状态（2026-10-20）**：重点开发和验收平台为 **Apple Silicon / macOS 14+**，入口是 CLI 与后台守护。聊天和任务由 DeepSeek 生成，本地只需 Laya 决策与按需启动的语义编码器。Windows 通用内核与启动入口保留，新增 Mac 生态工具仅在 Mac 可用；本轮未重做 Windows 真机验收。7×24 常驻是项目目标，长期运行和休眠唤醒尚未完成验收。
+> **当前状态（2026-10-20）**：重点开发和验收平台为 **Apple Silicon / macOS 14+**，入口是 CLI、macOS 原生聊天窗口与后台守护。聊天和任务由 DeepSeek 生成，本地只需 Laya 决策与按需启动的语义编码器。Windows 通用内核与启动入口保留，新增 Mac 生态工具仅在 Mac 可用；本轮未重做 Windows 真机验收。7×24 常驻是项目目标，长期运行和休眠唤醒尚未完成验收。
 
 ## 当前能做什么
 
@@ -512,6 +512,20 @@ export YUNXI_BOT_HOME="$PWD/data"
 ./启动.command knowledge add /完整路径/资料.md
 ./启动.command knowledge search "需要查询的内容"
 ```
+
+### macOS 原生聊天窗口（可选）
+
+除终端入口外，可用原生窗口和云熙对话（人格、画像、记忆、会话、只读工具与 `chat` 完全同一条链路）：
+
+```bash
+# 首次构建（先确保 target/release/yunxi-bot 已构建）
+bash scripts/build-macos-chat.sh
+
+# 打开窗口（或双击仓库里的 启动聊天窗口.command / target/macos/云熙聊天.app）
+open "target/macos/云熙聊天.app"
+```
+
+窗口会自动以 `YUNXI_BOT_HOME=<仓库>/data` 拉起本地 `chat-server`，并接上最近一个会话。**首次启动 macOS 会询问访问「桌面」文件夹**（项目在桌面），需要点“允许”，否则窗口会停在“等待系统权限”。每轮对话会写入 `ConversationObserved`，因此主动陪伴与记忆能获得真实素材。需要人工批准的动作（写入、命令、电脑操控等）在窗口里会被明确拒绝——图形审批界面尚未接入，这类操作请回到终端 `chat`。
 
 **邮件后台是单独配置的可选能力**：先通过 `mac_mail_accounts` 查询真实账户 ID，在数据目录建立 `mac-mail.json`，仅列希望巡检的邮箱，例如：
 

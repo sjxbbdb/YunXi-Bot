@@ -81,14 +81,14 @@ fn search_provider(home: &Path) -> Box<dyn SearchProvider> {
     let key_path = home.join("secrets").join("bocha.key");
     match BochaKey::load(&key_path) {
         Ok(k) => {
-            println!("搜索      : 博查（带 key，直连不需要代理）");
+            eprintln!("搜索      : 博查（带 key，直连不需要代理）");
             Box::new(BochaSearch::new(k))
         }
         Err(e) => {
-            println!("搜索      : DuckDuckGo Lite（抓 HTML，**会失效**）");
-            println!("           没读到博查密钥：{e}");
-            println!("           想稳就去 https://open.bochaai.com/ 申请，存到");
-            println!("           {}", key_path.display());
+            eprintln!("搜索      : DuckDuckGo Lite（抓 HTML，**会失效**）");
+            eprintln!("           没读到博查密钥：{e}");
+            eprintln!("           想稳就去 https://open.bochaai.com/ 申请，存到");
+            eprintln!("           {}", key_path.display());
             Box::new(DuckDuckGoLite::new())
         }
     }

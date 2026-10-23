@@ -13,6 +13,7 @@ mod approval;
 mod autostart_macos;
 mod chat;
 mod chat_handler;
+mod chat_server;
 mod companion_runtime;
 mod detach;
 #[cfg(all(test, target_os = "macos"))]
@@ -153,6 +154,7 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
       --mail-source mac|imap  mac读取数据目录mac-mail.json中的收件箱
       --port <n>            显式选择IMAP sidecar端口（默认17871）
   yunxi-bot chat [选项]       交互式会话（通用 agent 的入口）
+  yunxi-bot chat-server      原生聊天窗口使用的本地 stdio 服务（逐行 JSON）
       --resume [名字]       接着指定会话，也可用 --resume --id <名字>；不指定则接最近那个
       chat list             看有哪些会话
       --thinking auto|on|off 思考模式
@@ -255,6 +257,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "notify" => cmd_notify(rest),
         "mail" => cmd_mail(rest),
         "chat" => cmd_chat(rest),
+        "chat-server" => chat_server::run(rest),
         "check" => cmd_check(rest),
         "mcp" => cmd_mcp(rest),
         "feedback" => cmd_feedback(rest),
