@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/target/macos/云熙聊天.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/native/macos/chat/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/native/macos/chat/icon/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 xcrun swiftc -O -target "$(uname -m)-apple-macosx14.0" \
   "$ROOT/native/macos/chat/main.swift" \
   "$ROOT/native/macos/chat/MacChatWindow.swift" \

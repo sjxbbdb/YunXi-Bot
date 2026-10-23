@@ -768,7 +768,12 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.applicationIconImage = Self.makeIcon()
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = icon
+        } else {
+            NSApp.applicationIconImage = Self.makeIcon()
+        }
         buildMenu()
         buildWindow()
         bind()
