@@ -7,6 +7,7 @@ struct ChatMessage: Identifiable, Equatable {
     let id = UUID()
     let role: Role
     var text: String
+    let at: Date?
 }
 
 /// 与 `yunxi-bot chat-server` 的 stdio 连接。
@@ -110,7 +111,7 @@ final class ChatService: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, connected else { return }
         guard !busy else { return }
-        messages.append(ChatMessage(role: .user, text: trimmed))
+        messages.append(ChatMessage(role: .user, text: trimmed, at: Date()))
         busy = true
         write(["type": "chat", "text": trimmed])
     }
@@ -156,11 +157,15 @@ final class ChatService: ObservableObject {
             session = object["session"] as? String ?? ""
             let turns = object["turns"] as? Int ?? 0
             if object["resumed"] as? Bool == true, turns > 0 {
-                messages.append(ChatMessage(role: .system, text: "接着上次聊（\(turns) 轮）。"))
-            } else {
-                messages.append(ChatMessage(role: .system, text: "云熙在这里。"))
+                if messages.isEmpty {
+                    messages.append(ChatMessage(role: .system, text: "接着上次聊（\(turns) 轮）。", at: nil))
+                }
+            } else if messages.isEmpty {
+                messages.append(ChatMessage(role: .system, text: "云熙在这里。", at: nil))
             }
             status = "在线"
+        case "history":
+            applyHistory(object["messages"] as? [[String: Any]] ?? [])
         case "delta":
             if let text = object["text"] as? String {
                 appendDelta(text)
@@ -174,13 +179,23 @@ final class ChatService: ObservableObject {
         case "error":
             busy = false
             streamingID = nil
-            messages.append(ChatMessage(role: .system, text: "⚠️ " + (object["message"] as? String ?? "未知错误")))
+            messages.append(ChatMessage(role: .system, text: "⚠️ " + (object["message"] as? String ?? "未知错误"), at: nil))
         case "session":
             session = object["session"] as? String ?? ""
-            messages.append(ChatMessage(role: .system, text: "已开新会话。"))
+            messages.removeAll()
+            streamingID = nil
+            messages.append(ChatMessage(role: .system, text: "已开新会话。", at: nil))
             busy = false
         default:
             break
+        }
+    }
+
+    private func applyHistory(_ rows: [[String: Any]]) {
+        for row in rows {
+            guard let role = row["role"] as? String, let text = row["text"] as? String else { continue }
+            let kind: ChatMessage.Role = role == "user" ? .user : .assistant
+            messages.append(ChatMessage(role: kind, text: text, at: nil))
         }
     }
 
@@ -188,7 +203,7 @@ final class ChatService: ObservableObject {
         if let id = streamingID, let index = messages.firstIndex(where: { $0.id == id }) {
             messages[index].text += text
         } else {
-            let message = ChatMessage(role: .assistant, text: text)
+            let message = ChatMessage(role: .assistant, text: text, at: Date())
             streamingID = message.id
             messages.append(message)
         }
@@ -198,7 +213,7 @@ final class ChatService: ObservableObject {
         if let id = streamingID, let index = messages.firstIndex(where: { $0.id == id }) {
             messages[index].text = text
         } else {
-            messages.append(ChatMessage(role: .assistant, text: text))
+            messages.append(ChatMessage(role: .assistant, text: text, at: Date()))
         }
         streamingID = nil
         busy = false
@@ -207,7 +222,7 @@ final class ChatService: ObservableObject {
     private func fail(_ message: String) {
         status = "离线"
         connected = false
-        messages.append(ChatMessage(role: .system, text: "⚠️ " + message))
+        messages.append(ChatMessage(role: .system, text: "⚠️ " + message, at: nil))
     }
 
     // MARK: - 找项目根目录

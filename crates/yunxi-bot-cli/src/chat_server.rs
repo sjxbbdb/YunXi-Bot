@@ -27,6 +27,7 @@
 //! stdout 只留给协议；日志一律走 stderr，否则窗口会把日志当成消息。
 
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -107,6 +108,10 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let history = read_display_history(&home, &session_id, 200);
+    if !history.is_empty() {
+        emit(&mut out, json!({"type":"history","messages":history}));
+    }
     emit(
         &mut out,
         json!({"type":"ready","session":session_id,"turns":turns,"resumed":resumed}),
@@ -199,6 +204,8 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                         {
                             eprintln!("[chat-server] 存盘失败: {e}");
                         }
+                        append_display(&home, &session_id, "user", text);
+                        append_display(&home, &session_id, "assistant", &reply);
                         drain_records(&mut ledger, &mut records);
                         emit(
                             &mut out,
@@ -221,6 +228,43 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         }
     }
     Ok(0)
+}
+
+/// 窗口显示用历史（只含你/云熙的对话文本，不含工具消息与系统前缀）。
+///
+/// 存在 `data/chat-ui/<session>.jsonl`：会话布局仍是唯一上下文来源，
+/// 这份只是给界面回显用，损坏/缺失都不影响对话。
+fn display_log_path(home: &Path, session: &str) -> PathBuf {
+    home.join("chat-ui").join(format!("{session}.jsonl"))
+}
+
+fn append_display(home: &Path, session: &str, role: &str, text: &str) {
+    let path = display_log_path(home, session);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let line = json!({"role": role, "text": text});
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn read_display_history(home: &Path, session: &str, limit: usize) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(display_log_path(home, session)) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    if rows.len() > limit {
+        rows = rows.split_off(rows.len() - limit);
+    }
+    rows
 }
 
 fn emit(out: &mut impl Write, value: Value) {
@@ -268,5 +312,27 @@ mod tests {
         assert_eq!(text.lines().count(), 1, "每行一条 JSON，窗口才能按行解析");
         let parsed: Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(parsed["type"], "pong");
+    }
+}
+
+#[cfg(test)]
+mod display_history_tests {
+    use super::*;
+
+    #[test]
+    fn display_history_round_trips_and_is_bounded() {
+        let home = std::env::temp_dir().join(format!("yunxi-ui-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        append_display(&home, "chat-test", "user", "第一句");
+        append_display(&home, "chat-test", "assistant", "第二句");
+        let rows = read_display_history(&home, "chat-test", 200);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["role"], "user");
+        assert_eq!(rows[1]["text"], "第二句");
+        let last = read_display_history(&home, "chat-test", 1);
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0]["text"], "第二句");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
