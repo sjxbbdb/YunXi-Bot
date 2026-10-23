@@ -10,8 +10,13 @@
 //! 服务 → 窗口：
 //! ```text
 //! {"type":"ready","session":"chat-...","turns":3,"resumed":true}
-//! {"type":"delta","text":"…"}          // 流式正文，可能多条
+//! {"type":"sessions","items":[{"id":"...","preview":"...","turns":2,"updated_at":...}]}
+//! {"type":"history","messages":[{"role":"user","text":"..."}]}
+//! {"type":"opened","session":"...","turns":2}
+//! {"type":"delta","text":"…"}
 //! {"type":"route","model":"deepseek-flash","thinking":false}
+//! {"type":"approval","id":1,"tool":"write_file",...}
+//! {"type":"approval_expired","id":1}
 //! {"type":"reply","text":"…","session":"…","turns":4}
 //! {"type":"error","message":"…"}
 //! {"type":"pong"}
@@ -20,22 +25,31 @@
 //! 窗口 → 服务：
 //! ```text
 //! {"type":"chat","text":"在吗？"}
+//! {"type":"approval","id":1,"allow":true}
 //! {"type":"new"}
+//! {"type":"list_sessions"}
+//! {"type":"open","session":"chat-..."}
+//! {"type":"effort","value":"auto|on|off"}
 //! {"type":"ping"}
 //! ```
 //!
 //! stdout 只留给协议；日志一律走 stderr，否则窗口会把日志当成消息。
+//!
+//! 读线程负责 stdin：审批决定直接交给 [`ApprovalBridge`]（chat_turn 阻塞时
+//! 也要能送达），其它请求进 channel 给主循环。这样审批不会被主循环卡死。
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use yunxi_bot_core::costlog::CallRecord;
-use yunxi_bot_core::think::ModelSpec;
-use yunxi_bot_core::think::ReasoningEffort;
 use yunxi_bot_core::think::context::ContextBudget;
 use yunxi_bot_core::think::session::SessionStore;
+use yunxi_bot_core::think::{ModelSpec, ReasoningEffort};
+use yunxi_bot_core::tool::runner::{Approval, ApprovalRequest, Approver};
 use yunxi_bot_core::{EventKind, Ledger};
 
 use crate::chat_handler::ChatHandler;
@@ -44,7 +58,7 @@ use crate::chat_handler::ChatHandler;
 pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let home = crate::default_home();
     let store = SessionStore::new(&home);
-    let effort = match crate::flag(args, "--thinking").unwrap_or("auto") {
+    let mut effort = match crate::flag(args, "--thinking").unwrap_or("auto") {
         "off" => ReasoningEffort::Never,
         "on" => ReasoningEffort::Always,
         _ => ReasoningEffort::Auto,
@@ -53,6 +67,12 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     if crate::flag(args, "--endpoint").is_none() {
         crate::ensure_decider_running();
     }
+
+    // —— 窗口内审批：读线程把 UI 的决定送回来 ——
+    let approvals = ApprovalBridge::new();
+    let approver = WebApprover {
+        bridge: approvals.clone(),
+    };
 
     // —— 和 `chat` 同一套装配：工具、审批、台账、决策模型 ——
     let mut handler = ChatHandler::new(
@@ -67,15 +87,12 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         handler = handler.with_tools(tools);
     }
     handler = handler
+        .with_approver(Arc::new(Mutex::new(approver)))
         .with_policy(crate::tooling::policy_from_args(args))
         .with_sink(crate::tool_sink_or_warn())
         .with_decider(Arc::new(yunxi_bot_core::decide::LayaDecider::new(
             crate::flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
         )));
-
-    // 窗口没有"人在终端里答审批"的通道：不挂审批者 = 默认 RefusingApprover。
-    // 需要人工批准的动作会被明确拒绝，而不是被悄悄放行。
-    // （只读工具按策略照常可用。）
 
     let mut budget = ContextBudget::for_model(ModelSpec::DEEPSEEK_FLASH.model);
     if let Some(w) = crate::flag(args, "--context-window") {
@@ -97,83 +114,117 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     if args.iter().any(|a| a == "--resume")
         && let Some(file) = store.latest()?
     {
-        let (layout, mismatch) =
+        let (layout, mismatched) =
             yunxi_bot_core::think::session::resume_onto(&file, &handler.expected_chat_prefix());
-        let _ = mismatch;
+        let _ = mismatched;
         handler.restore_chat_layout(layout, crate::chat_handler::CHAT_SESSION_KEY);
         session_id = file.id;
         turns = file.turns;
         resumed = true;
     }
 
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let history = read_display_history(&home, &session_id, 200);
-    if !history.is_empty() {
-        emit(&mut out, json!({"type":"history","messages":history}));
-    }
-    emit(
-        &mut out,
-        json!({"type":"ready","session":session_id,"turns":turns,"resumed":resumed}),
-    );
-
-    // 流式正文走 stdout 的协议行；没有 on_delta 的话窗口只能等整段。
+    // 流式正文直接写协议行（与审批、最终回复同在主线程，写出顺序稳定）。
     handler.set_on_delta(Arc::new(|text: &str| {
-        let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        let _ = writeln!(lock, "{}", json!({"type":"delta","text":text}));
-        let _ = lock.flush();
+        write_event(json!({"type":"delta","text":text}));
     }));
 
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[chat-server] 读输入失败: {e}");
-                break;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let req: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                emit(
-                    &mut out,
-                    json!({"type":"error","message":format!("请求不是合法 JSON: {e}")}),
-                );
+    let history = read_display_history(&home, &session_id, 200);
+    if !history.is_empty() {
+        write_event(json!({"type":"history","messages":history}));
+    }
+    write_event(json!({"type":"ready","session":session_id,"turns":turns,"resumed":resumed}));
+    write_event(sessions_event(&home, &store));
+
+    // 读线程：协议请求进 channel；审批决定先进 bridge（chat_turn 阻塞时也要能送达）。
+    let (tx, rx) = mpsc::channel::<Value>();
+    let bridge_for_reader = approvals.clone();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
                 continue;
             }
-        };
-        match req["type"].as_str().unwrap_or("chat") {
-            "ping" => emit(&mut out, json!({"type":"pong"})),
-            "new" => {
-                handler.reset_chat_session();
-                across_new_session(&mut ledger, &session_id);
-                session_id = new_session_id();
-                turns = 0;
-                emit(&mut out, json!({"type":"session","session":session_id}));
-            }
-            "chat" => {
-                let text = req["text"].as_str().unwrap_or("").trim();
-                if text.is_empty() {
-                    emit(&mut out, json!({"type":"error","message":"空消息"}));
+            let req: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = tx.send(
+                        json!({"type":"__bad_json","message":format!("请求不是合法 JSON: {e}")}),
+                    );
                     continue;
                 }
-                let routing = match handler.route_for(text, effort) {
+            };
+            if req["type"] == "approval"
+                && let (Some(id), Some(allow)) = (req["id"].as_u64(), req["allow"].as_bool())
+            {
+                bridge_for_reader.resolve(id, allow);
+                continue;
+            }
+            if tx.send(req).is_err() {
+                break;
+            }
+        }
+    });
+
+    for req in rx {
+        match req["type"].as_str().unwrap_or("chat") {
+            "ping" => write_event(json!({"type":"pong"})),
+            "__bad_json" => write_event(json!({"type":"error","message":req["message"]})),
+            "list_sessions" => write_event(sessions_event(&home, &store)),
+            "effort" => {
+                effort = match req["value"].as_str().unwrap_or("auto") {
+                    "on" => ReasoningEffort::Always,
+                    "off" => ReasoningEffort::Never,
+                    _ => ReasoningEffort::Auto,
+                };
+                write_event(json!({"type":"effort","value":effort_label(effort)}));
+            }
+            "new" => {
+                handler.reset_chat_session();
+                session_id = new_session_id();
+                turns = 0;
+                write_event(json!({"type":"session","session":session_id}));
+                write_event(sessions_event(&home, &store));
+            }
+            "open" => {
+                let Some(id) = req["session"].as_str().filter(|s| !s.is_empty()) else {
+                    write_event(json!({"type":"error","message":"缺少 session"}));
+                    continue;
+                };
+                match store.load(id) {
+                    Ok(file) => {
+                        let (layout, _mismatch) = yunxi_bot_core::think::session::resume_onto(
+                            &file,
+                            &handler.expected_chat_prefix(),
+                        );
+                        handler.restore_chat_layout(layout, crate::chat_handler::CHAT_SESSION_KEY);
+                        session_id = file.id;
+                        turns = file.turns;
+                        let history = read_display_history(&home, &session_id, 200);
+                        if !history.is_empty() {
+                            write_event(json!({"type":"history","messages":history}));
+                        }
+                        write_event(json!({"type":"opened","session":session_id,"turns":turns}));
+                    }
+                    Err(e) => {
+                        write_event(json!({"type":"error","message":format!("打开会话失败: {e}")}))
+                    }
+                }
+            }
+            "chat" => {
+                let text = req["text"].as_str().unwrap_or("").trim().to_string();
+                if text.is_empty() {
+                    write_event(json!({"type":"error","message":"空消息"}));
+                    continue;
+                }
+                let routing = match handler.route_for(&text, effort) {
                     Ok(r) => r,
                     Err(e) => {
-                        emit(
-                            &mut out,
-                            json!({"type":"error","message":format!("路由失败: {e}")}),
-                        );
+                        write_event(json!({"type":"error","message":format!("路由失败: {e}")}));
                         continue;
                     }
                 };
-                emit(
-                    &mut out,
+                write_event(
                     json!({"type":"route","model":routing.spec.model,"thinking":routing.thinking}),
                 );
 
@@ -196,7 +247,7 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 }
 
                 let mut records = Vec::new();
-                match handler.chat_turn(&routing, text, &mut records) {
+                match handler.chat_turn(&routing, &text, &mut records) {
                     Ok(reply) => {
                         turns += 1;
                         if let Err(e) =
@@ -204,36 +255,160 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                         {
                             eprintln!("[chat-server] 存盘失败: {e}");
                         }
-                        append_display(&home, &session_id, "user", text);
+                        append_display(&home, &session_id, "user", &text);
                         append_display(&home, &session_id, "assistant", &reply);
                         drain_records(&mut ledger, &mut records);
-                        emit(
-                            &mut out,
+                        write_event(
                             json!({"type":"reply","text":reply,"session":session_id,"turns":turns}),
                         );
+                        write_event(sessions_event(&home, &store));
                     }
                     Err(e) => {
                         drain_records(&mut ledger, &mut records);
-                        emit(
-                            &mut out,
-                            json!({"type":"error","message":format!("这一轮失败了: {e}")}),
-                        );
+                        write_event(json!({"type":"error","message":format!("这一轮失败了: {e}")}));
                     }
                 }
             }
-            other => emit(
-                &mut out,
-                json!({"type":"error","message":format!("未知请求类型: {other}")}),
-            ),
+            other => {
+                write_event(json!({"type":"error","message":format!("未知请求类型: {other}")}))
+            }
         }
     }
     Ok(0)
 }
 
-/// 窗口显示用历史（只含你/云熙的对话文本，不含工具消息与系统前缀）。
-///
-/// 存在 `data/chat-ui/<session>.jsonl`：会话布局仍是唯一上下文来源，
-/// 这份只是给界面回显用，损坏/缺失都不影响对话。
+// MARK: - 审批桥
+
+struct ApprovalState {
+    decisions: std::collections::HashMap<u64, bool>,
+}
+
+/// UI 与 chat_turn 之间的审批会合点。等待带超时：窗口关掉/无响应时一律拒绝。
+struct ApprovalBridge {
+    next: AtomicU64,
+    state: Mutex<ApprovalState>,
+    ready: Condvar,
+}
+
+impl ApprovalBridge {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            next: AtomicU64::new(1),
+            state: Mutex::new(ApprovalState {
+                decisions: std::collections::HashMap::new(),
+            }),
+            ready: Condvar::new(),
+        })
+    }
+
+    fn resolve(&self, id: u64, allow: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.decisions.insert(id, allow);
+            self.ready.notify_all();
+        }
+    }
+
+    fn wait(&self, id: u64, timeout: Duration) -> Option<bool> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.state.lock().ok()?;
+        loop {
+            if let Some(answer) = state.decisions.remove(&id) {
+                return Some(answer);
+            }
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            let (guard, _) = self.ready.wait_timeout(state, left).ok()?;
+            state = guard;
+        }
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+struct WebApprover {
+    bridge: Arc<ApprovalBridge>,
+}
+
+impl Approver for WebApprover {
+    fn approve(&mut self, req: &ApprovalRequest) -> Approval {
+        let id = self.bridge.next_id();
+        // 私有工具的参数不往界面送（与终端审批同一条隐私规则）。
+        let arguments = if req.private {
+            "[私有参数不显示]".to_string()
+        } else {
+            truncate(&req.arguments, 1600)
+        };
+        write_event(json!({
+            "type":"approval",
+            "id":id,
+            "tool":req.tool,
+            "capability":req.capability.label(),
+            "specifier":req.specifier,
+            "reason":req.reason,
+            "preview":req.preview,
+            "arguments":arguments,
+            "require_human":req.require_human,
+        }));
+        match self.bridge.wait(id, Duration::from_secs(300)) {
+            Some(true) => Approval::Once,
+            Some(false) => Approval::Deny,
+            None => {
+                write_event(json!({"type":"approval_expired","id":id}));
+                Approval::Deny
+            }
+        }
+    }
+}
+
+// MARK: - 协议输出与数据
+
+fn write_event(value: Value) {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = writeln!(lock, "{value}");
+    let _ = lock.flush();
+}
+
+fn effort_label(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Always => "on",
+        ReasoningEffort::Never => "off",
+        ReasoningEffort::Auto => "auto",
+    }
+}
+
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    text.chars().take(limit).collect::<String>() + "…"
+}
+
+fn sessions_event(home: &Path, store: &SessionStore) -> Value {
+    let items = store
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|file| {
+            let preview = read_display_history(home, &file.id, 200)
+                .into_iter()
+                .find(|row| row["role"] == "user")
+                .and_then(|row| row["text"].as_str().map(str::to_string))
+                .unwrap_or_else(|| file.id.clone());
+            json!({
+                "id": file.id,
+                "preview": truncate(preview.trim(), 60),
+                "turns": file.turns,
+                "updated_at": file.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"type":"sessions","items":items})
+}
+
+// MARK: - 显示历史（只服务界面回显，不进模型上下文）
+
 fn display_log_path(home: &Path, session: &str) -> PathBuf {
     home.join("chat-ui").join(format!("{session}.jsonl"))
 }
@@ -267,23 +442,8 @@ fn read_display_history(home: &Path, session: &str, limit: usize) -> Vec<Value> 
     rows
 }
 
-fn emit(out: &mut impl Write, value: Value) {
-    if writeln!(out, "{value}").is_err() || out.flush().is_err() {
-        eprintln!("[chat-server] 协议写出失败");
-    }
-}
-
 fn new_session_id() -> String {
     format!("chat-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"))
-}
-
-/// 新会话时在台账留一条，便于事后对齐（会话文件本身另存，不进台账）。
-fn across_new_session(ledger: &mut Ledger, old_session: &str) {
-    let _ = ledger.append(
-        EventKind::InfoTriaged,
-        None,
-        json!({"source":"chat_server","phase":"new_session","previous":old_session}),
-    );
 }
 
 fn drain_records(ledger: &mut Ledger, records: &mut Vec<CallRecord>) {
@@ -300,24 +460,8 @@ mod tests {
     fn session_ids_are_acceptable_to_the_session_store() {
         let id = new_session_id();
         assert!(id.starts_with("chat-"));
-        yunxi_bot_core::think::session::SessionStore::check_id(&id)
-            .expect("chat-server 新建的会话 id 必须能落盘");
+        SessionStore::check_id(&id).expect("chat-server 新建的会话 id 必须能落盘");
     }
-
-    #[test]
-    fn protocol_writer_emits_exactly_one_json_line() {
-        let mut buffer = Vec::new();
-        emit(&mut buffer, json!({"type":"pong"}));
-        let text = String::from_utf8(buffer).unwrap();
-        assert_eq!(text.lines().count(), 1, "每行一条 JSON，窗口才能按行解析");
-        let parsed: Value = serde_json::from_str(text.trim()).unwrap();
-        assert_eq!(parsed["type"], "pong");
-    }
-}
-
-#[cfg(test)]
-mod display_history_tests {
-    use super::*;
 
     #[test]
     fn display_history_round_trips_and_is_bounded() {
@@ -334,5 +478,13 @@ mod display_history_tests {
         assert_eq!(last.len(), 1);
         assert_eq!(last[0]["text"], "第二句");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn truncation_is_char_safe() {
+        assert_eq!(truncate("云熙", 10), "云熙");
+        let cut = truncate("云熙云熙云熙", 2);
+        assert!(cut.starts_with("云熙"));
+        assert!(cut.ends_with('…'));
     }
 }

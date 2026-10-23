@@ -10,17 +10,37 @@ struct ChatMessage: Identifiable, Equatable {
     let at: Date?
 }
 
+/// 侧边栏里的一个会话。
+struct ChatSession: Identifiable, Equatable {
+    let id: String
+    let preview: String
+    let turns: Int
+    let updatedAt: Double
+}
+
+/// 等待用户决定的工具审批。
+struct PendingApproval: Identifiable, Equatable {
+    let id: Int
+    let tool: String
+    let capability: String
+    let specifier: String?
+    let reason: String
+    let preview: String?
+    let arguments: String
+    let requireHuman: Bool
+}
+
 /// 与 `yunxi-bot chat-server` 的 stdio 连接。
-///
-/// 后端是同一个 ChatHandler：人格、记忆、会话、台账都在那边；
-/// 窗口只负责显示和收发，不自己拼提示词。
 final class ChatService: ObservableObject {
     @Published var messages: [ChatMessage] = []
+    @Published var sessions: [ChatSession] = []
+    @Published var pendingApproval: PendingApproval?
     @Published var status: String = "连接中…"
     @Published var connected = false
     @Published var busy = false
     @Published var session: String = ""
     @Published var modelInfo: String = ""
+    @Published var effort: String = "auto"
 
     private var process: Process?
     private var stdinHandle: FileHandle?
@@ -66,9 +86,8 @@ final class ChatService: ObservableObject {
         }
         errPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
+            if !data.isEmpty {
                 FileHandle.standardError.write(data)
-                _ = text
             }
         }
         p.terminationHandler = { [weak self] _ in
@@ -86,8 +105,6 @@ final class ChatService: ObservableObject {
             stdoutHandle = outPipe.fileHandleForReading
             stderrHandle = errPipe.fileHandleForReading
             status = "正在唤醒云熙…"
-            // 仓库在桌面：首次启动 macOS 会问"访问桌面文件夹"。没允许时
-            // 后端读不到 data/，ready 永远不来——把这个状态说清楚。
             DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
                 guard let self, !self.connected else { return }
                 self.status = "等待系统权限：请允许访问「桌面」文件夹"
@@ -109,16 +126,40 @@ final class ChatService: ObservableObject {
 
     func send(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, connected else { return }
-        guard !busy else { return }
+        guard !trimmed.isEmpty, connected, !busy else { return }
         messages.append(ChatMessage(role: .user, text: trimmed, at: Date()))
         busy = true
         write(["type": "chat", "text": trimmed])
     }
 
     func newChat() {
-        guard connected else { return }
+        guard connected, !busy else { return }
         write(["type": "new"])
+    }
+
+    func openSession(_ id: String) {
+        guard connected, !busy, id != session else { return }
+        messages.removeAll()
+        pendingApproval = nil
+        streamingID = nil
+        busy = true
+        write(["type": "open", "session": id])
+    }
+
+    func requestSessions() {
+        guard connected else { return }
+        write(["type": "list_sessions"])
+    }
+
+    func setEffort(_ value: String) {
+        guard connected else { return }
+        effort = value
+        write(["type": "effort", "value": value])
+    }
+
+    func respondApproval(_ id: Int, allow: Bool) {
+        pendingApproval = nil
+        write(["type": "approval", "id": id, "allow": allow])
     }
 
     private func write(_ object: [String: Any]) {
@@ -156,16 +197,35 @@ final class ChatService: ObservableObject {
             busy = false
             session = object["session"] as? String ?? ""
             let turns = object["turns"] as? Int ?? 0
-            if object["resumed"] as? Bool == true, turns > 0 {
-                if messages.isEmpty {
+            if object["resumed"] as? Bool == true {
+                if messages.isEmpty, turns > 0 {
                     messages.append(ChatMessage(role: .system, text: "接着上次聊（\(turns) 轮）。", at: nil))
                 }
             } else if messages.isEmpty {
                 messages.append(ChatMessage(role: .system, text: "云熙在这里。", at: nil))
             }
             status = "在线"
+            requestSessions()
+        case "sessions":
+            applySessions(object["items"] as? [[String: Any]] ?? [])
         case "history":
             applyHistory(object["messages"] as? [[String: Any]] ?? [])
+        case "opened":
+            busy = false
+            session = object["session"] as? String ?? session
+            let turns = object["turns"] as? Int ?? 0
+            if messages.isEmpty {
+                messages.append(ChatMessage(role: .system, text: "已打开会话（\(turns) 轮）。", at: nil))
+            }
+        case "approval":
+            applyApproval(object)
+        case "approval_expired":
+            if let id = object["id"] as? Int, pendingApproval?.id == id {
+                pendingApproval = nil
+                messages.append(ChatMessage(role: .system, text: "审批等待超时，已按拒绝处理。", at: nil))
+            }
+        case "effort":
+            effort = object["value"] as? String ?? effort
         case "delta":
             if let text = object["text"] as? String {
                 appendDelta(text)
@@ -179,15 +239,30 @@ final class ChatService: ObservableObject {
         case "error":
             busy = false
             streamingID = nil
+            pendingApproval = nil
             messages.append(ChatMessage(role: .system, text: "⚠️ " + (object["message"] as? String ?? "未知错误"), at: nil))
         case "session":
             session = object["session"] as? String ?? ""
             messages.removeAll()
             streamingID = nil
+            pendingApproval = nil
             messages.append(ChatMessage(role: .system, text: "已开新会话。", at: nil))
             busy = false
+            requestSessions()
         default:
             break
+        }
+    }
+
+    private func applySessions(_ items: [[String: Any]]) {
+        sessions = items.compactMap { item in
+            guard let id = item["id"] as? String else { return nil }
+            return ChatSession(
+                id: id,
+                preview: item["preview"] as? String ?? id,
+                turns: item["turns"] as? Int ?? 0,
+                updatedAt: item["updated_at"] as? Double ?? 0
+            )
         }
     }
 
@@ -197,6 +272,20 @@ final class ChatService: ObservableObject {
             let kind: ChatMessage.Role = role == "user" ? .user : .assistant
             messages.append(ChatMessage(role: kind, text: text, at: nil))
         }
+    }
+
+    private func applyApproval(_ object: [String: Any]) {
+        guard let id = object["id"] as? Int else { return }
+        pendingApproval = PendingApproval(
+            id: id,
+            tool: object["tool"] as? String ?? "?",
+            capability: object["capability"] as? String ?? "",
+            specifier: object["specifier"] as? String,
+            reason: object["reason"] as? String ?? "",
+            preview: object["preview"] as? String,
+            arguments: object["arguments"] as? String ?? "",
+            requireHuman: object["require_human"] as? Bool ?? true
+        )
     }
 
     private func appendDelta(_ text: String) {
