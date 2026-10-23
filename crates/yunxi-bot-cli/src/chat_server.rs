@@ -201,10 +201,13 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                         session_id = file.id;
                         turns = file.turns;
                         let history = read_display_history(&home, &session_id, 200);
-                        if !history.is_empty() {
+                        let history_missing = history.is_empty();
+                        if !history_missing {
                             write_event(json!({"type":"history","messages":history}));
                         }
-                        write_event(json!({"type":"opened","session":session_id,"turns":turns}));
+                        write_event(
+                            json!({"type":"opened","session":session_id,"turns":turns,"history_missing":history_missing}),
+                        );
                     }
                     Err(e) => {
                         write_event(json!({"type":"error","message":format!("打开会话失败: {e}")}))
@@ -391,16 +394,17 @@ fn sessions_event(home: &Path, store: &SessionStore) -> Value {
         .unwrap_or_default()
         .into_iter()
         .map(|file| {
-            let preview = read_display_history(home, &file.id, 200)
-                .into_iter()
+            let history = read_display_history(home, &file.id, 200);
+            let preview = history
+                .iter()
                 .find(|row| row["role"] == "user")
-                .and_then(|row| row["text"].as_str().map(str::to_string))
-                .unwrap_or_else(|| file.id.clone());
+                .and_then(|row| row["text"].as_str().map(str::to_string));
             json!({
                 "id": file.id,
-                "preview": truncate(preview.trim(), 60),
+                "preview": preview.map(|p| truncate(p.trim(), 60)).unwrap_or_default(),
                 "turns": file.turns,
                 "updated_at": file.updated_at,
+                "has_history": !history.is_empty(),
             })
         })
         .collect::<Vec<_>>();

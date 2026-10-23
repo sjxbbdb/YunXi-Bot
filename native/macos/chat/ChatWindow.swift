@@ -809,13 +809,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         sidebarTable.reloadData()
         if let index = sessions.firstIndex(where: { $0.id == service.session }) {
             sidebarTable.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        } else {
+            sidebarTable.deselectAll(nil)
         }
-        suppressSelection = false
+        // 选中通知可能异步到达：等一拍再放开，避免启动时自动"打开"错误会话。
+        DispatchQueue.main.async { [weak self] in self?.suppressSelection = false }
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
         service.sessions.count
     }
+
+    private static let sessionDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "M月d日 HH:mm"
+        return f
+    }()
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard row < service.sessions.count else { return nil }
@@ -823,8 +832,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         let identifier = NSUserInterfaceItemIdentifier("session-cell")
         let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? SessionCellView) ?? SessionCellView()
         cell.identifier = identifier
-        cell.previewLabel.stringValue = item.preview.isEmpty ? item.id : item.preview
-        cell.metaLabel.stringValue = "\(item.turns) 轮"
+        if item.hasHistory {
+            cell.previewLabel.stringValue = item.preview.isEmpty ? "（无预览）" : item.preview
+            cell.metaLabel.stringValue = "\(item.turns) 轮"
+        } else {
+            let date = Date(timeIntervalSince1970: item.updatedAt / 1000)
+            cell.previewLabel.stringValue = "旧会话 · " + Self.sessionDateFormatter.string(from: date)
+            cell.metaLabel.stringValue = "\(item.turns) 轮 · 无显示记录"
+        }
         return cell
     }
 

@@ -16,6 +16,7 @@ struct ChatSession: Identifiable, Equatable {
     let preview: String
     let turns: Int
     let updatedAt: Double
+    let hasHistory: Bool
 }
 
 /// 等待用户决定的工具审批。
@@ -215,7 +216,11 @@ final class ChatService: ObservableObject {
             session = object["session"] as? String ?? session
             let turns = object["turns"] as? Int ?? 0
             if messages.isEmpty {
-                messages.append(ChatMessage(role: .system, text: "已打开会话（\(turns) 轮）。", at: nil))
+                let missing = object["history_missing"] as? Bool ?? false
+                let text = missing
+                    ? "已打开会话（\(turns) 轮）。旧会话没有可回显的显示记录，但上下文已恢复。"
+                    : "已打开会话（\(turns) 轮）。"
+                messages.append(ChatMessage(role: .system, text: text, at: nil))
             }
         case "approval":
             applyApproval(object)
@@ -259,9 +264,10 @@ final class ChatService: ObservableObject {
             guard let id = item["id"] as? String else { return nil }
             return ChatSession(
                 id: id,
-                preview: item["preview"] as? String ?? id,
+                preview: item["preview"] as? String ?? "",
                 turns: item["turns"] as? Int ?? 0,
-                updatedAt: item["updated_at"] as? Double ?? 0
+                updatedAt: item["updated_at"] as? Double ?? 0,
+                hasHistory: item["has_history"] as? Bool ?? false
             )
         }
     }
