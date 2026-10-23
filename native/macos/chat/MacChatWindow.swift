@@ -764,7 +764,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     private var chatVC: ChatViewController!
     private var searchField: NSSearchField!
     private var effortPopup: NSPopUpButton!
-    private var capabilityWindow: CapabilityWindowController?
+    private var settingsWindow: SettingsWindowController?
     private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -776,6 +776,12 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         chatVC.focusComposer()
+        // 验收入口：YUNXI_OPEN_SETTINGS=1 启动即打开设置；YUNXI_OPEN_CAPABILITIES=1 打开工具页。
+        if ProcessInfo.processInfo.environment["YUNXI_OPEN_SETTINGS"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.openSettings() }
+        } else if ProcessInfo.processInfo.environment["YUNXI_OPEN_CAPABILITIES"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.openCapabilities() }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -875,7 +881,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
             item.label = "能力"
             item.image = symbol("square.grid.2x2", size: 15)
             item.target = self
-            item.action = #selector(showCapabilities)
+            item.action = #selector(openCapabilities)
             return item
         case Item.search:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
@@ -922,7 +928,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         appItem.submenu = app
         app.addItem(withTitle: "关于 云熙", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         app.addItem(.separator())
-        let settings = NSMenuItem(title: "设置…", action: #selector(showCapabilities), keyEquivalent: ",")
+        let settings = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
         app.addItem(settings)
         app.addItem(.separator())
@@ -1008,13 +1014,18 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         chatVC.focusComposer()
     }
 
-    @objc private func showCapabilities() {
-        if capabilityWindow == nil {
-            capabilityWindow = CapabilityWindowController(service: service)
+    @objc private func openSettings() {
+        if settingsWindow == nil {
+            settingsWindow = SettingsWindowController(service: service)
         }
-        capabilityWindow?.showWindow(nil)
-        capabilityWindow?.window?.makeKeyAndOrderFront(nil)
-        service.requestCapabilities()
+        settingsWindow?.show(section: .overview)
+    }
+
+    @objc private func openCapabilities() {
+        if settingsWindow == nil {
+            settingsWindow = SettingsWindowController(service: service)
+        }
+        settingsWindow?.show(section: .tools)
     }
 
     @objc private func toggleSidebar() {
@@ -1036,8 +1047,8 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
     }
 
     @objc private func openHelp() {
-        let readme = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("README.md")
-        NSWorkspace.shared.open(readme)
+        guard let repo = ChatService.findRepoRoot() else { return }
+        NSWorkspace.shared.open(repo.appendingPathComponent("README.md"))
     }
 
     private static func makeIcon() -> NSImage {

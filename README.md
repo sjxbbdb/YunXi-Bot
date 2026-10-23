@@ -517,7 +517,7 @@ export YUNXI_BOT_HOME="$PWD/data"
 
 > 聊天窗口为 **SwiftUI + Liquid Glass** 界面，需要 **macOS 26+**（`.glassEffect` 材质）。旧 AppKit 版（`scripts/build-macos-chat.sh`）仍保留、支持 macOS 14+，可作回退；回适配 macOS 14 后续再做。
 
-窗口顶部“能力”按钮（或 Cmd+I）打开能力面板：按工具、记忆、任务、台账、系统五类展示后端实时快照——63 个内置工具及能力/审批级别、记忆候选、定时作业、模型调用成本、值守与本地服务状态。面板只读，不绕过审批。
+⌘, 打开标准“设置”窗口：左侧“概览 / 工具 / 记忆 / 任务 / 台账 / 系统”六类，右侧展示后端实时快照——63 个内置工具及能力/审批级别、记忆候选、定时作业、模型调用成本、值守与本地服务状态。只读，不绕过审批。
 
 界面按 macOS HIG 重做：标准 unified 工具栏 + 可折叠源列表侧栏 + 系统材质/语义色/SF 字体，自动跟随浅色与深色外观。用户消息使用系统强调色气泡，助手回复为纯文本 Markdown，输入区为原生圆角文本视图。设计评审使用了 `apple-design` 与 `macos-design-guidelines` skill（见 `docs/UI设计Skill-20261023.md`）。
 
