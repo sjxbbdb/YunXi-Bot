@@ -1,8 +1,13 @@
 //! 单实例锁。
 //!
 //! 常驻进程最怕的是"起了两个"，两个守护同时调度同一批任务会导致重复执行。
-//! 锁文件里记 pid，启动时**判断该 pid 是否真的还活着**——只看文件存在会把
-//! 上次崩溃留下的陈旧锁当成"已有实例在跑"，从此再也起不来。
+//!
+//! Unix 上用**内核文件锁（flock）**判定归属：锁随进程存活，进程正常退出、
+//! 崩溃、被杀死或整机关机时都由内核自动释放，不存在"陈旧锁"。锁文件里的 pid
+//! 只用于诊断和报错文案，**不再作为"是否已有实例"的依据**——PID 会被系统复用，
+//! 把复用后的无关进程当成持锁者会让守护进程永久起不来（2026-10-21、10-23 两次
+//! 实机事故：锁里的 pid 分别被 ScreenTime 和 iCloud 进程复用，开机问候与冒泡
+//! 因此整体消失）。Windows 上 `OpenProcess` 探测仍是主路径。
 //!
 //! 只依赖 std 与少量平台 FFI，不引入 winapi/libc 依赖树。
 
@@ -35,12 +40,7 @@ impl std::fmt::Display for LockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LockError::Io(m) => write!(f, "锁文件操作失败: {m}"),
-            LockError::AlreadyRunning { pid } => {
-                write!(
-                    f,
-                    "已有实例在运行（pid {pid}）。若确认它已死，删除锁文件后重试。"
-                )
-            }
+            LockError::AlreadyRunning { pid } => write!(f, "已有实例在运行（pid {pid}）"),
         }
     }
 }
@@ -138,18 +138,22 @@ pub fn is_process_alive(pid: u32) -> bool {
     true
 }
 
-/// 单实例锁。析构时释放。
+/// 单实例锁。持有期间保证同一数据目录只有一个实例。
+///
+/// Unix 上锁由 flock 持有，`Drop` 时自动释放；锁文件保留用于诊断。
 #[derive(Debug)]
 pub struct InstanceLock {
     path: PathBuf,
     pid: u32,
+    /// Unix 上持有 flock 的描述符；它的生命周期就是锁的生命周期。
+    #[cfg(unix)]
+    _file: std::fs::File,
 }
 
 impl InstanceLock {
     /// 获取锁。
     ///
     /// 返回 `Err(AlreadyRunning)` 表示已有存活实例——调用方**不应该**继续启动。
-    /// 陈旧锁（pid 已死或文件损坏）会被自动接管。
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self, LockError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent()
@@ -158,24 +162,62 @@ impl InstanceLock {
             fs::create_dir_all(parent).map_err(|e| LockError::Io(e.to_string()))?;
         }
 
-        if let Ok(text) = fs::read_to_string(&path)
-            && let Ok(info) = serde_json::from_str::<LockInfo>(&text)
-            && is_process_alive(info.pid)
-            && info.pid != std::process::id()
+        #[cfg(unix)]
         {
-            return Err(LockError::AlreadyRunning { pid: info.pid });
+            Self::acquire_unix(path)
         }
-        // 解析失败或进程已死：视为陈旧锁，直接接管
+        #[cfg(not(unix))]
+        {
+            Self::acquire_by_pid(path)
+        }
+    }
 
-        let pid = std::process::id();
-        let info = LockInfo {
+    /// Unix：内核文件锁。锁文件保留在磁盘上，内容只作诊断。
+    #[cfg(unix)]
+    fn acquire_unix(path: PathBuf) -> Result<Self, LockError> {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        const LOCK_EX: i32 = 0x02;
+        const LOCK_NB: i32 = 0x04;
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| LockError::Io(e.to_string()))?;
+        // SAFETY: 有效描述符；LOCK_EX | LOCK_NB 只尝试加锁，不写文件。
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            // EWOULDBLOCK / EAGAIN：锁已被另一个存活实例持有（macOS 35、Linux 11）。
+            if matches!(error.raw_os_error(), Some(35) | Some(11)) {
+                return Err(LockError::AlreadyRunning {
+                    pid: read_holder_pid(&path).unwrap_or(0),
+                });
+            }
+            // 文件系统不支持 flock：退回旧的 pid 探测，保守处理。
+            let pid = claim_by_pid(&path, 1)?;
+            return Ok(Self {
+                path,
+                pid,
+                _file: file,
+            });
+        }
+        let pid = write_lock_info(&path, 2)?;
+        Ok(Self {
+            path,
             pid,
-            at: crate::now_millis().map_err(|e| LockError::Io(e.to_string()))?,
-            schema: 1,
-        };
-        let body = serde_json::to_string(&info).map_err(|e| LockError::Io(e.to_string()))?;
-        fs::write(&path, body).map_err(|e| LockError::Io(e.to_string()))?;
+            _file: file,
+        })
+    }
 
+    /// 非 Unix：沿用 pid 探测（Windows 的存活探测无法被 flock 替代）。
+    #[cfg(not(unix))]
+    fn acquire_by_pid(path: PathBuf) -> Result<Self, LockError> {
+        let pid = claim_by_pid(&path, 1)?;
         Ok(Self { path, pid })
     }
 
@@ -188,15 +230,47 @@ impl InstanceLock {
     }
 }
 
+/// 读取锁文件里记录的 pid（仅用于诊断与错误文案）。
+fn read_holder_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<LockInfo>(&text).ok())
+        .map(|info| info.pid)
+}
+
+/// 写入锁信息并返回当前 pid（调用方必须已经实际持有锁）。
+fn write_lock_info(path: &Path, schema: u32) -> Result<u32, LockError> {
+    let pid = std::process::id();
+    let info = LockInfo {
+        pid,
+        at: crate::now_millis().map_err(|e| LockError::Io(e.to_string()))?,
+        schema,
+    };
+    let body = serde_json::to_string(&info).map_err(|e| LockError::Io(e.to_string()))?;
+    fs::write(path, body).map_err(|e| LockError::Io(e.to_string()))?;
+    Ok(pid)
+}
+
+/// 旧路径（非 Unix 或文件系统不支持 flock）：先做 pid 探测，再写锁文件。
+fn claim_by_pid(path: &Path, schema: u32) -> Result<u32, LockError> {
+    if let Ok(text) = fs::read_to_string(path)
+        && let Ok(info) = serde_json::from_str::<LockInfo>(&text)
+        && is_process_alive(info.pid)
+        && info.pid != std::process::id()
+    {
+        return Err(LockError::AlreadyRunning { pid: info.pid });
+    }
+    write_lock_info(path, schema)
+}
+
+/// Windows 等没有 flock 的平台仍在析构时清理锁文件。
+#[cfg(not(unix))]
 impl Drop for InstanceLock {
     fn drop(&mut self) {
         // 只删自己的锁：万一被别的实例接管过，不要误删它的
-        if let Ok(text) = fs::read_to_string(&self.path)
-            && let Ok(info) = serde_json::from_str::<LockInfo>(&text)
+        if let Some(pid) = read_holder_pid(&self.path)
+            && pid != self.pid
         {
-            if info.pid == self.pid {
-                let _ = fs::remove_file(&self.path);
-            }
             return;
         }
         let _ = fs::remove_file(&self.path);
@@ -291,10 +365,46 @@ mod tests {
     }
 
     /// 一个几乎必然存在的系统进程 pid，用于测试"锁被活进程占着"。
+    #[cfg(not(unix))]
     fn system_pid() -> u32 {
         if cfg!(windows) { 4 } else { 1 }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn refuses_when_another_instance_holds_the_lock() {
+        let p = tmp("held");
+        let first = InstanceLock::acquire(&p).expect("首次应能拿到锁");
+        match InstanceLock::acquire(&p) {
+            Err(LockError::AlreadyRunning { pid }) => assert_eq!(pid, std::process::id()),
+            other => panic!("锁被存活实例占着时必须拒绝启动，实际: {other:?}"),
+        }
+        drop(first);
+        assert!(
+            InstanceLock::acquire(&p).is_ok(),
+            "持有者退出后锁必须自动释放"
+        );
+    }
+
+    /// 回归 2026-10-21 / 10-23 实机事故：锁里记的 pid 被系统进程复用。
+    /// 旧实现只看"pid 是否活着"，于是把无关进程当成持锁者，守护进程永久起不来。
+    #[cfg(unix)]
+    #[test]
+    fn takes_over_a_lock_whose_pid_was_reused_by_an_unrelated_process() {
+        let p = tmp("reused-pid");
+        let reused = LockInfo {
+            pid: 1, // 一定存在的系统进程，但并没有持有 flock
+            at: 0,
+            schema: 1,
+        };
+        fs::write(&p, serde_json::to_string(&reused).unwrap()).unwrap();
+        assert!(
+            InstanceLock::acquire(&p).is_ok(),
+            "pid 被无关进程复用时必须接管，不能拒绝启动"
+        );
+    }
+
+    #[cfg(not(unix))]
     #[test]
     fn refuses_when_lock_held_by_a_live_process() {
         let p = tmp("held");
@@ -344,7 +454,9 @@ mod tests {
             let _lock = InstanceLock::acquire(&p).unwrap();
             assert!(p.exists());
         }
-        assert!(!p.exists(), "析构后锁文件应被清理");
+        #[cfg(not(unix))]
+        assert!(!p.exists(), "非 Unix 平台析构后锁文件应被清理");
+        assert!(InstanceLock::acquire(&p).is_ok(), "析构后必须能重新获得锁");
     }
 
     #[test]
