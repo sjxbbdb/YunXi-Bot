@@ -8,7 +8,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/native/macos/chat/Info.plist" "$APP/Contents/Info.plist"
 xcrun swiftc -O -target "$(uname -m)-apple-macosx14.0" \
   "$ROOT/native/macos/chat/main.swift" \
-  "$ROOT/native/macos/chat/ChatWindow.swift" \
+  "$ROOT/native/macos/chat/MacChatWindow.swift" \
   "$ROOT/native/macos/chat/ChatService.swift" \
   "$ROOT/native/macos/chat/MarkdownRenderer.swift" \
   "$ROOT/native/macos/chat/CapabilityModels.swift" \
