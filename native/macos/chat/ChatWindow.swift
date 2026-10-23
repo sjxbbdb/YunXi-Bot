@@ -30,7 +30,7 @@ enum Theme {
     )
     static let selection = NSColor.adaptive(
         light: NSColor(calibratedWhite: 0.918, alpha: 1),
-        dark: NSColor(calibratedRed: 0.169, green: 0.169, blue: 0.176, alpha: 1)
+        dark: NSColor(calibratedRed: 0.122, green: 0.122, blue: 0.129, alpha: 1)
     )
     static let hover = NSColor.adaptive(
         light: NSColor(calibratedWhite: 0.945, alpha: 1),
@@ -98,6 +98,7 @@ final class ColorView: NSView {
     private func refresh() {
         guard let layer else { return }
         layer.cornerRadius = cornerRadius
+        layer.cornerCurve = .continuous
         layer.backgroundColor = fill?.cgColor
         layer.borderWidth = borderWidth
         layer.borderColor = borderColor?.cgColor
@@ -115,6 +116,7 @@ final class AvatarView: NSView {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.cornerRadius = diameter / 2
+        layer?.cornerCurve = .continuous
         layer?.backgroundColor = Theme.accent.cgColor
         let label = NSTextField(labelWithString: "熙")
         label.font = .systemFont(ofSize: fontSize, weight: .semibold)
@@ -179,7 +181,7 @@ final class MessageRowView: NSView {
             bubble = nil
             label = NSTextField(wrappingLabelWithString: message.text)
         } else {
-            bubble = ColorView(fill: message.role == .user ? Theme.userBubble : nil, radius: 16)
+            bubble = ColorView(fill: message.role == .user ? Theme.userBubble : nil, radius: 18)
             label = NSTextField(wrappingLabelWithString: "")
         }
         super.init(frame: .zero)
