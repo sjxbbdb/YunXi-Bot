@@ -35,6 +35,7 @@ struct PendingApproval: Identifiable, Equatable {
 final class ChatService: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var sessions: [ChatSession] = []
+    @Published var capabilities: Capabilities?
     @Published var pendingApproval: PendingApproval?
     @Published var status: String = "连接中…"
     @Published var connected = false
@@ -152,6 +153,11 @@ final class ChatService: ObservableObject {
         write(["type": "list_sessions"])
     }
 
+    func requestCapabilities() {
+        guard connected else { return }
+        write(["type": "capabilities"])
+    }
+
     func setEffort(_ value: String) {
         guard connected else { return }
         effort = value
@@ -209,6 +215,11 @@ final class ChatService: ObservableObject {
             requestSessions()
         case "sessions":
             applySessions(object["items"] as? [[String: Any]] ?? [])
+        case "capabilities":
+            if let snapshot = object["snapshot"] as? [String: Any],
+               let decoded = Capabilities.decode(from: snapshot) {
+                capabilities = decoded
+            }
         case "history":
             applyHistory(object["messages"] as? [[String: Any]] ?? [])
         case "opened":

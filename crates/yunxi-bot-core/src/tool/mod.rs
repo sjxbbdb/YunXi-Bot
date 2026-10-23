@@ -116,6 +116,19 @@ pub enum Capability {
     Unknown,
 }
 
+/// 给界面展示的工具说明（不含参数 schema，避免把整页 JSON 塞进窗口）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolDescription {
+    pub name: String,
+    pub description: String,
+    /// 能力类别中文名（只读/写入/执行/网络/不可逆/未知）。
+    pub capability: String,
+    /// `auto` 表示只读默认放行，`ask` 表示默认询问。
+    pub approval: String,
+    pub private_io: bool,
+    pub fresh_approval: bool,
+}
+
 impl Capability {
     pub fn label(self) -> &'static str {
         match self {
@@ -526,6 +539,30 @@ impl ToolRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+
+    /// 给界面看的能力清单：名字、说明、类别、默认是否询问。
+    ///
+    /// 只是**描述**，不执行、不改变审批；能力面板用它把"能做什么"讲清楚。
+    pub fn describe(&self) -> Vec<ToolDescription> {
+        self.tools
+            .iter()
+            .map(|t| {
+                let capability = t.capability();
+                ToolDescription {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    capability: capability.label().to_string(),
+                    approval: match capability {
+                        Capability::ReadOnly => "auto",
+                        _ => "ask",
+                    }
+                    .to_string(),
+                    private_io: t.private_io(),
+                    fresh_approval: t.fresh_approval(),
+                }
+            })
+            .collect()
     }
 
     /// 全部工具的能力类别。给审批预览用。

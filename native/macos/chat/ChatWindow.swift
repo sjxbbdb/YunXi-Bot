@@ -301,6 +301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
     private var suppressSelection = false
     private var newChatButton: NSButton!
     private var effortPopup: NSPopUpButton!
+    private var capabilityWindow: CapabilityWindowController?
 
     private var composerScroll: NSScrollView!
     private var composerTextView: NSTextView!
@@ -328,6 +329,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         window.makeFirstResponder(composerTextView)
+        // 便捷入口：YUNXI_OPEN_CAPABILITIES=1 时启动即打开能力面板（测试/演示用）。
+        if ProcessInfo.processInfo.environment["YUNXI_OPEN_CAPABILITIES"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                self?.showCapabilities()
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -344,6 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         appMenu.addItem(withTitle: "关于 云熙", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "新会话", action: #selector(newChat), keyEquivalent: "n")
+        appMenu.addItem(withTitle: "能力面板", action: #selector(showCapabilities), keyEquivalent: "i")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 云熙", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         NSApp.mainMenu = mainMenu
@@ -437,7 +445,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
         newChatButton.font = .systemFont(ofSize: 11)
         newChatButton.controlSize = .small
 
-        let header = NSStackView(views: [avatar, name, statusLabel, spacer, modelLabel, effortPopup, newChatButton])
+        let capabilityButton = NSButton(title: "能力", target: self, action: #selector(showCapabilities))
+        capabilityButton.bezelStyle = .inline
+        capabilityButton.font = .systemFont(ofSize: 11)
+        capabilityButton.controlSize = .small
+
+        let header = NSStackView(views: [avatar, name, statusLabel, spacer, modelLabel, effortPopup, capabilityButton, newChatButton])
         header.orientation = .horizontal
         header.spacing = 8
         header.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 10, right: 16)
@@ -926,6 +939,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTe
 
     @objc private func newChat() {
         service.newChat()
+    }
+
+    @objc private func showCapabilities() {
+        if capabilityWindow == nil {
+            capabilityWindow = CapabilityWindowController(service: service)
+        }
+        capabilityWindow?.showWindow(nil)
+        capabilityWindow?.window?.makeKeyAndOrderFront(nil)
     }
 
     // MARK: 图标

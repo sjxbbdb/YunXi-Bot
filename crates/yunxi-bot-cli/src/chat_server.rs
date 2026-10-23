@@ -39,16 +39,19 @@
 //! 也要能送达），其它请求进 channel 给主循环。这样审批不会被主循环卡死。
 
 use std::io::{BufRead, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use yunxi_bot_core::costlog::CallRecord;
+use yunxi_bot_core::costlog::{CallRecord, project_costs};
+use yunxi_bot_core::memory::Memory;
 use yunxi_bot_core::think::context::ContextBudget;
 use yunxi_bot_core::think::session::SessionStore;
 use yunxi_bot_core::think::{ModelSpec, ReasoningEffort};
+use yunxi_bot_core::tool::ToolDescription;
 use yunxi_bot_core::tool::runner::{Approval, ApprovalRequest, Approver};
 use yunxi_bot_core::{EventKind, Ledger};
 
@@ -81,9 +84,19 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         crate::chat_handler::DEFAULT_PERSONA,
         crate::chat_handler::default_rules(),
     );
+    let mut tool_descriptions: Vec<ToolDescription> = Vec::new();
+    let mut mcp_count = 0usize;
+    let mut mcp_problems: Vec<String> = Vec::new();
     if let Ok(tools) = crate::tooling::default_registry(&home) {
         let mut tools = tools;
-        let _ = crate::tooling::with_mcp(&mut tools, &home);
+        match crate::tooling::with_mcp(&mut tools, &home) {
+            Ok((n, problems)) => {
+                mcp_count = n;
+                mcp_problems = problems;
+            }
+            Err(e) => mcp_problems.push(e.to_string()),
+        }
+        tool_descriptions = tools.describe();
         handler = handler.with_tools(tools);
     }
     handler = handler
@@ -214,6 +227,17 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                     }
                 }
             }
+            "capabilities" => write_event(capabilities_event(&CapabilityContext {
+                home: &home,
+                store: &store,
+                ledger: &ledger,
+                effort,
+                session: &session_id,
+                turns,
+                tools: &tool_descriptions,
+                mcp_count,
+                mcp_problems: &mcp_problems,
+            })),
             "chat" => {
                 let text = req["text"].as_str().unwrap_or("").trim().to_string();
                 if text.is_empty() {
@@ -411,6 +435,325 @@ fn sessions_event(home: &Path, store: &SessionStore) -> Value {
     json!({"type":"sessions","items":items})
 }
 
+// MARK: - 能力快照
+
+fn port_listening(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok()
+}
+
+fn event_kind_name(kind: yunxi_bot_core::EventKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{kind:?}"))
+}
+
+fn trigger_label(trigger: &yunxi_bot_core::job::Trigger) -> String {
+    match trigger {
+        yunxi_bot_core::job::Trigger::Manual => "手动".to_string(),
+        yunxi_bot_core::job::Trigger::Every { seconds } => format!("每 {seconds} 秒"),
+        yunxi_bot_core::job::Trigger::Cron { expr } => format!("cron {expr}"),
+        yunxi_bot_core::job::Trigger::Watch { path } => format!("监听 {path}"),
+    }
+}
+
+fn job_state_label(state: yunxi_bot_core::job::JobState) -> &'static str {
+    use yunxi_bot_core::job::JobState;
+    match state {
+        JobState::Pending => "待运行",
+        JobState::WaitingApproval => "待批准",
+        JobState::Running => "运行中",
+        JobState::Succeeded => "上次成功",
+        JobState::Failed => "上次失败",
+        JobState::Disabled => "已停用",
+    }
+}
+
+struct CapabilityContext<'a> {
+    home: &'a Path,
+    store: &'a SessionStore,
+    ledger: &'a Ledger,
+    effort: ReasoningEffort,
+    session: &'a str,
+    turns: u32,
+    tools: &'a [ToolDescription],
+    mcp_count: usize,
+    mcp_problems: &'a [String],
+}
+
+fn capabilities_event(ctx: &CapabilityContext<'_>) -> Value {
+    let CapabilityContext {
+        home,
+        store,
+        ledger,
+        effort,
+        session,
+        turns,
+        tools,
+        mcp_count,
+        mcp_problems,
+    } = *ctx;
+    let now = yunxi_bot_core::now_millis().unwrap_or(0);
+    let events = ledger.events();
+
+    // —— 会话与身份 ——
+    let sessions = store.list().unwrap_or_default();
+    let latest = sessions.first();
+    let persona_bytes = std::fs::metadata(home.join("persona.md"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let profile_bytes = std::fs::metadata(home.join("profile.md"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // —— 工具 ——
+    let mut by_capability: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for tool in tools {
+        *by_capability.entry(tool.capability.clone()).or_insert(0) += 1;
+    }
+    let tool_items: Vec<Value> = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": truncate(&tool.description, 220),
+                "capability": tool.capability,
+                "approval": tool.approval,
+                "private_io": tool.private_io,
+                "fresh_approval": tool.fresh_approval,
+            })
+        })
+        .collect();
+
+    // —— 记忆 ——
+    let memory = Memory::from_events(events);
+    let all = memory.all_sorted(now);
+    let mut memory_counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for entry in &all {
+        *memory_counts.entry(entry.kind.label()).or_insert(0) += 1;
+    }
+    let mut recent = all.clone();
+    recent.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+    let recent_memory: Vec<Value> = recent
+        .iter()
+        .take(8)
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "kind": entry.kind.label(),
+                "text": truncate(&entry.text, 160),
+                "weight": (entry.weight * 100.0).round() / 100.0,
+                "created_at": entry.created_at,
+            })
+        })
+        .collect();
+    let pending = yunxi_bot_core::continuity::pending(events, now).unwrap_or_default();
+    let pending_items: Vec<Value> = pending
+        .iter()
+        .take(5)
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "kind": c.kind.label(),
+                "text": truncate(&c.text, 160),
+                "quote": truncate(&c.quote, 120),
+                "source_seq": c.source_seq,
+            })
+        })
+        .collect();
+    let followups = yunxi_bot_core::continuity::followups(events)
+        .map(|f| f.len())
+        .unwrap_or(0);
+    let knowledge = yunxi_bot_core::retrieval::documents(home)
+        .map(|docs| docs.len())
+        .unwrap_or(0);
+
+    // —— 任务 ——
+    let jobs: Vec<Value> = ledger
+        .rebuild()
+        .into_values()
+        .map(|job| {
+            json!({
+                "id": job.id.as_str(),
+                "name": job.spec.name,
+                "command": truncate(&job.spec.command.join(" "), 140),
+                "trigger": trigger_label(&job.spec.trigger),
+                "state": job_state_label(job.state),
+                "irreversible": job.spec.irreversible,
+                "last_run_at": job.last_run_at,
+                "last_error": job.last_error.as_deref().map(|e| truncate(e, 120)),
+            })
+        })
+        .collect();
+    let do_tasks: Vec<Value> = yunxi_bot_core::ledger::task_from_events(events)
+        .into_values()
+        .map(|task| {
+            let (done, failed, skipped) = task.tally();
+            json!({
+                "id": task.id,
+                "goal": truncate(&task.goal, 160),
+                "state": task.state.label(),
+                "steps": task.steps.len(),
+                "done": done,
+                "failed": failed,
+                "skipped": skipped,
+            })
+        })
+        .collect();
+
+    // —— 台账与成本 ——
+    let mut kind_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for event in events {
+        *kind_counts.entry(event_kind_name(event.kind)).or_insert(0) += 1;
+    }
+    let mut top_kinds: Vec<(String, usize)> = kind_counts.into_iter().collect();
+    top_kinds.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let top_kinds: Vec<Value> = top_kinds
+        .into_iter()
+        .take(12)
+        .map(|(kind, count)| json!({"kind": kind, "count": count}))
+        .collect();
+    let recent_events: Vec<Value> = events
+        .iter()
+        .rev()
+        .take(10)
+        .map(|event| {
+            json!({
+                "seq": event.seq,
+                "kind": event_kind_name(event.kind),
+                "at": event.at,
+            })
+        })
+        .collect();
+    let cost = project_costs(events);
+
+    // —— 系统 ——
+    let daemon_lock = std::fs::read_to_string(home.join("daemon.lock"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let daemon_pid = daemon_lock
+        .as_ref()
+        .and_then(|v| v["pid"].as_u64())
+        .map(|pid| pid as u32);
+    let daemon_alive = daemon_pid.is_some_and(yunxi_bot_core::instance::is_process_alive);
+    let autostart_path = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join("Library/LaunchAgents/com.yunxi.bot.agent.plist"));
+    let autostart_registered = autostart_path.as_ref().is_some_and(|p| p.exists());
+    let models: Vec<String> = std::fs::read_dir(home.join("models"))
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut models = models;
+    models.sort();
+    let ledger_bytes = std::fs::metadata(home.join("ledger.jsonl"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let chat_ui_count = std::fs::read_dir(home.join("chat-ui"))
+        .map(|it| {
+            it.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+                .count()
+        })
+        .unwrap_or(0);
+    let mail_configured = home.join("mac-mail.json").exists();
+    let services = vec![
+        json!({"name": "Laya 决策服务", "port": 17870, "listening": port_listening(17870)}),
+        json!({"name": "EmbeddingGemma 2", "port": 17873, "listening": port_listening(17873)}),
+    ];
+
+    json!({
+        "type": "capabilities",
+        "snapshot": {
+            "generated_at": now,
+            "version": env!("CARGO_PKG_VERSION"),
+            "home": home.display().to_string(),
+            "platform": std::env::consts::OS,
+            "bot": {
+                "model": ModelSpec::DEEPSEEK_FLASH.model,
+                "effort": effort_label(effort),
+                "session": session,
+                "turns": turns,
+                "session_count": sessions.len(),
+                "latest_session": latest.map(|s| s.id.clone()),
+                "latest_turns": latest.map(|s| s.turns),
+            },
+            "identity": {
+                "persona_bytes": persona_bytes,
+                "profile_bytes": profile_bytes,
+            },
+            "tools": {
+                "total": tools.len(),
+                "by_capability": by_capability
+                    .into_iter()
+                    .map(|(label, count)| json!({"label": label, "count": count}))
+                    .collect::<Vec<_>>(),
+                "items": tool_items,
+                "mcp_count": mcp_count,
+                "mcp_problems": mcp_problems,
+            },
+            "memory": {
+                "total": memory.len(),
+                "by_kind": memory_counts
+                    .into_iter()
+                    .map(|(label, count)| json!({"label": label, "count": count}))
+                    .collect::<Vec<_>>(),
+                "recent": recent_memory,
+                "pending": pending_items,
+                "pending_total": pending.len(),
+                "followups": followups,
+                "knowledge_documents": knowledge,
+            },
+            "tasks": {
+                "jobs": jobs,
+                "do_tasks": do_tasks,
+            },
+            "ledger": {
+                "events": events.len(),
+                "recent": recent_events,
+                "top_kinds": top_kinds,
+                "bytes": ledger_bytes,
+            },
+            "cost": {
+                "calls": cost.calls,
+                "prompt_tokens": cost.prompt_tokens,
+                "completion_tokens": cost.completion_tokens,
+                "cache_hit_tokens": cost.cache_hit_tokens,
+                "cache_miss_tokens": cost.cache_miss_tokens,
+                "cache_hit_rate": cost.cache_hit_rate(),
+                "thinking_calls": cost.thinking_calls,
+                "total": cost.total,
+                "saved": cost.saved(),
+                "currency": "CNY",
+            },
+            "system": {
+                "daemon": {
+                    "pid": daemon_pid,
+                    "alive": daemon_alive,
+                    "lock_present": daemon_lock.is_some(),
+                },
+                "autostart": {
+                    "registered": autostart_registered,
+                    "path": autostart_path.map(|p| p.display().to_string()),
+                },
+                "services": services,
+                "models": models,
+                "chat_ui_sessions": chat_ui_count,
+                "mail_configured": mail_configured,
+                "ledger_path": home.join("ledger.jsonl").display().to_string(),
+            }
+        }
+    })
+}
+
 // MARK: - 显示历史（只服务界面回显，不进模型上下文）
 
 fn display_log_path(home: &Path, session: &str) -> PathBuf {
@@ -482,6 +825,37 @@ mod tests {
         assert_eq!(last.len(), 1);
         assert_eq!(last[0]["text"], "第二句");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn event_kind_names_match_the_serialized_form() {
+        assert_eq!(
+            event_kind_name(yunxi_bot_core::EventKind::InfoFetched),
+            "info_fetched"
+        );
+        assert_eq!(
+            event_kind_name(yunxi_bot_core::EventKind::ModelCalled),
+            "model_called"
+        );
+    }
+
+    #[test]
+    fn trigger_labels_are_human_readable() {
+        use yunxi_bot_core::job::Trigger;
+        assert_eq!(trigger_label(&Trigger::Manual), "手动");
+        assert_eq!(trigger_label(&Trigger::Every { seconds: 60 }), "每 60 秒");
+        assert_eq!(
+            trigger_label(&Trigger::Cron {
+                expr: "0 9 * * *".to_string()
+            }),
+            "cron 0 9 * * *"
+        );
+        assert_eq!(
+            trigger_label(&Trigger::Watch {
+                path: "/tmp/x".to_string()
+            }),
+            "监听 /tmp/x"
+        );
     }
 
     #[test]

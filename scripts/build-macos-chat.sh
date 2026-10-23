@@ -11,6 +11,8 @@ xcrun swiftc -O -target "$(uname -m)-apple-macosx14.0" \
   "$ROOT/native/macos/chat/ChatWindow.swift" \
   "$ROOT/native/macos/chat/ChatService.swift" \
   "$ROOT/native/macos/chat/MarkdownRenderer.swift" \
+  "$ROOT/native/macos/chat/CapabilityModels.swift" \
+  "$ROOT/native/macos/chat/CapabilityWindow.swift" \
   -o "$APP/Contents/MacOS/YunXiChat"
 /usr/bin/codesign --force --sign - --identifier local.yunxi.bot.chat "$APP"
 echo "聊天窗口已构建：$APP"
