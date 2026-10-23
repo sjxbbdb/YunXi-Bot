@@ -1,12 +1,11 @@
 import AppKit
 import Combine
 
-// MARK: - 配色
+// MARK: - 设计 token（参考 Codex 前端：spacing 4、composer 44/22、elevation）
 
 extension NSColor {
     static let yunxiAccent = NSColor(calibratedRed: 0.66, green: 0.33, blue: 0.42, alpha: 1.0)
 
-    /// 亮/暗两套色，跟随系统外观。
     static func adaptive(light: NSColor, dark: NSColor) -> NSColor {
         NSColor(name: nil) { appearance in
             appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
@@ -18,12 +17,16 @@ extension NSColor {
         dark: NSColor(calibratedRed: 0.54, green: 0.25, blue: 0.33, alpha: 1.0)
     )
     static let bubbleAssistant = NSColor.adaptive(
-        light: NSColor(calibratedWhite: 0.945, alpha: 1.0),
-        dark: NSColor(calibratedWhite: 0.19, alpha: 1.0)
+        light: NSColor(calibratedWhite: 0.955, alpha: 1.0),
+        dark: NSColor(calibratedWhite: 0.185, alpha: 1.0)
     )
     static let bubbleBorder = NSColor.adaptive(
-        light: NSColor(calibratedWhite: 0.86, alpha: 1.0),
-        dark: NSColor(calibratedWhite: 0.28, alpha: 1.0)
+        light: NSColor(calibratedWhite: 0.87, alpha: 1.0),
+        dark: NSColor(calibratedWhite: 0.29, alpha: 1.0)
+    )
+    static let composerSurface = NSColor.adaptive(
+        light: NSColor(calibratedWhite: 0.995, alpha: 1.0),
+        dark: NSColor(calibratedWhite: 0.165, alpha: 1.0)
     )
 }
 
@@ -57,21 +60,20 @@ final class AvatarView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 }
 
-// MARK: - 气泡与消息行
+// MARK: - 消息气泡
 
 final class BubbleView: NSView {
     let label = NSTextField(wrappingLabelWithString: "")
+    private var plainText = ""
 
     init(isUser: Bool) {
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.cornerRadius = 15
+        layer?.cornerRadius = 16
         layer?.backgroundColor = (isUser ? NSColor.bubbleUser : NSColor.bubbleAssistant).cgColor
-        layer?.borderWidth = isUser ? 0 : 0.5
+        layer?.borderWidth = isUser ? 0 : 1
         layer?.borderColor = NSColor.bubbleBorder.cgColor
 
-        label.font = .systemFont(ofSize: 14)
-        label.textColor = isUser ? .white : .labelColor
         label.isSelectable = true
         label.maximumNumberOfLines = 0
         label.preferredMaxLayoutWidth = 340
@@ -85,14 +87,28 @@ final class BubbleView: NSView {
             label.widthAnchor.constraint(lessThanOrEqualToConstant: 340),
         ])
         translatesAutoresizingMaskIntoConstraints = false
+
+        let menu = NSMenu()
+        let copyItem = NSMenuItem(title: "复制", action: #selector(copyText), keyEquivalent: "")
+        copyItem.target = self
+        menu.addItem(copyItem)
+        label.menu = menu
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func updateText(_ text: String) {
-        if label.stringValue != text { label.stringValue = text }
+    @objc private func copyText() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(plainText, forType: .string)
+    }
+
+    func update(text: String, isUser: Bool) {
+        plainText = text
+        label.attributedStringValue = MarkdownRenderer.render(text, isUser: isUser)
     }
 }
+
+// MARK: - 消息行
 
 final class MessageRowView: NSView {
     let bubble: BubbleView?
@@ -104,8 +120,13 @@ final class MessageRowView: NSView {
         f.dateFormat = "HH:mm"
         return f
     }()
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "M月d日 HH:mm"
+        return f
+    }()
 
-    init(message: ChatMessage) {
+    init(message: ChatMessage, showDate: Bool) {
         role = message.role
         if message.role == .system {
             bubble = nil
@@ -113,7 +134,7 @@ final class MessageRowView: NSView {
         } else {
             bubble = BubbleView(isUser: message.role == .user)
             textLabel = nil
-            bubble?.updateText(message.text)
+            bubble?.update(text: message.text, isUser: message.role == .user)
         }
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
@@ -135,10 +156,16 @@ final class MessageRowView: NSView {
         }
 
         guard let bubble else { return }
-        let time = NSTextField(labelWithString: message.at.map { Self.timeFormatter.string(from: $0) } ?? "")
+        let timeText: String
+        if let at = message.at {
+            timeText = showDate ? Self.dayFormatter.string(from: at) : Self.timeFormatter.string(from: at)
+        } else {
+            timeText = ""
+        }
+        let time = NSTextField(labelWithString: timeText)
         time.font = .systemFont(ofSize: 9.5)
         time.textColor = .tertiaryLabelColor
-        time.isHidden = message.at == nil
+        time.isHidden = timeText.isEmpty
         time.translatesAutoresizingMaskIntoConstraints = false
 
         let column = NSStackView(views: [bubble, time])
@@ -173,16 +200,58 @@ final class MessageRowView: NSView {
 
     func update(_ message: ChatMessage) {
         if let bubble {
-            bubble.updateText(message.text)
+            bubble.update(text: message.text, isUser: message.role == .user)
         } else if let textLabel {
             if textLabel.stringValue != message.text { textLabel.stringValue = message.text }
         }
     }
 }
 
+// MARK: - 打字指示（参考 animate-token-pulsing-dot）
+
+final class TypingRowView: NSView {
+    private let dot = NSView()
+
+    init() {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3
+        dot.layer?.backgroundColor = NSColor.yunxiAccent.cgColor
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(dot)
+
+        let label = NSTextField(labelWithString: "云熙正在想…")
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+
+        NSLayoutConstraint.activate([
+            dot.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 48),
+            dot.centerYAnchor.constraint(equalTo: label.centerYAnchor),
+            dot.widthAnchor.constraint(equalToConstant: 6),
+            dot.heightAnchor.constraint(equalToConstant: 6),
+            label.leadingAnchor.constraint(equalTo: dot.trailingAnchor, constant: 6),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+        ])
+
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 0.25
+        pulse.toValue = 1.0
+        pulse.duration = 0.9
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        dot.layer?.add(pulse, forKey: "pulse")
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+}
+
 // MARK: - 应用
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextViewDelegate {
     private var window: NSWindow!
     private let service = ChatService()
 
@@ -192,11 +261,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var emptyState: NSStackView!
     private var statusLabel = NSTextField(labelWithString: "连接中…")
     private var modelLabel = NSTextField(labelWithString: "")
-    private var input = NSTextField()
+
+    private var composerScroll: NSScrollView!
+    private var composerTextView: NSTextView!
+    private var composerPlaceholder = NSTextField(labelWithString: "说点什么…")
+    private var composerHeight: NSLayoutConstraint!
     private var sendButton = NSButton()
+
     private var rows: [MessageRowView] = []
     private var renderedIDs: [UUID] = []
-    private var typingRow: NSView?
+    private var lastRenderedDate: Date?
+    private var typingRow: TypingRowView?
     private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -207,6 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         service.start()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        window.makeFirstResponder(composerTextView)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -232,13 +308,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func buildWindow() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 740),
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "云熙"
-        window.minSize = NSSize(width: 440, height: 600)
+        window.minSize = NSSize(width: 460, height: 620)
         window.center()
         window.delegate = self
         window.isReleasedWhenClosed = false
@@ -312,26 +388,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         emptyState.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(emptyState)
 
-        // 输入区
+        // 输入区（参考 Codex composer：最小 44、圆角 22、elevation）
         let inputContainer = NSView()
         inputContainer.wantsLayer = true
-        inputContainer.layer?.cornerRadius = 16
-        inputContainer.layer?.backgroundColor = NSColor.adaptive(
-            light: NSColor(calibratedWhite: 0.985, alpha: 1.0),
-            dark: NSColor(calibratedWhite: 0.16, alpha: 1.0)
-        ).cgColor
-        inputContainer.layer?.borderWidth = 0.5
+        inputContainer.layer?.cornerRadius = 22
+        inputContainer.layer?.backgroundColor = NSColor.composerSurface.cgColor
+        inputContainer.layer?.borderWidth = 1
         inputContainer.layer?.borderColor = NSColor.bubbleBorder.cgColor
+        inputContainer.layer?.shadowColor = NSColor.black.cgColor
+        inputContainer.layer?.shadowOpacity = 0.06
+        inputContainer.layer?.shadowRadius = 8
+        inputContainer.layer?.shadowOffset = CGSize(width: 0, height: 2)
         inputContainer.translatesAutoresizingMaskIntoConstraints = false
 
-        input.placeholderString = "说点什么…"
-        input.font = .systemFont(ofSize: 14)
-        input.isBordered = false
-        input.drawsBackground = false
-        input.focusRingType = .none
-        input.target = self
-        input.action = #selector(sendMessage)
-        input.translatesAutoresizingMaskIntoConstraints = false
+        composerScroll = NSScrollView()
+        composerScroll.hasVerticalScroller = false
+        composerScroll.drawsBackground = false
+        composerScroll.borderType = .noBorder
+        composerScroll.translatesAutoresizingMaskIntoConstraints = false
+
+        composerTextView = NSTextView()
+        composerTextView.isRichText = false
+        composerTextView.isEditable = true
+        composerTextView.isSelectable = true
+        composerTextView.drawsBackground = false
+        composerTextView.font = .systemFont(ofSize: 14)
+        composerTextView.textColor = .labelColor
+        composerTextView.insertionPointColor = .yunxiAccent
+        composerTextView.textContainerInset = NSSize(width: 0, height: 6)
+        composerTextView.isVerticallyResizable = true
+        composerTextView.isHorizontallyResizable = false
+        composerTextView.autoresizingMask = [.width]
+        composerTextView.textContainer?.widthTracksTextView = true
+        composerTextView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        composerTextView.delegate = self
+        composerScroll.documentView = composerTextView
+
+        composerPlaceholder.font = .systemFont(ofSize: 14)
+        composerPlaceholder.textColor = .placeholderTextColor
+        composerPlaceholder.translatesAutoresizingMaskIntoConstraints = false
 
         sendButton = NSButton(image: NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: "发送") ?? NSImage(), target: self, action: #selector(sendMessage))
         sendButton.isBordered = false
@@ -339,7 +434,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sendButton.imageScaling = .scaleProportionallyUpOrDown
         sendButton.translatesAutoresizingMaskIntoConstraints = false
 
-        inputContainer.addSubview(input)
+        inputContainer.addSubview(composerScroll)
+        inputContainer.addSubview(composerPlaceholder)
         inputContainer.addSubview(sendButton)
 
         let hint = NSTextField(labelWithString: "仅本机 · 需要人工批准的动作会被拒绝，可在终端 chat 处理")
@@ -352,6 +448,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         background.addSubview(scrollView)
         background.addSubview(inputContainer)
         background.addSubview(hint)
+
+        composerHeight = inputContainer.heightAnchor.constraint(equalToConstant: 44)
+        composerHeight.isActive = true
 
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: background.topAnchor),
@@ -379,14 +478,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             inputContainer.topAnchor.constraint(equalTo: scrollView.bottomAnchor, constant: 8),
             inputContainer.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 16),
             inputContainer.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -16),
-            inputContainer.heightAnchor.constraint(equalToConstant: 44),
 
-            input.leadingAnchor.constraint(equalTo: inputContainer.leadingAnchor, constant: 14),
-            input.centerYAnchor.constraint(equalTo: inputContainer.centerYAnchor),
-            input.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -8),
+            composerScroll.leadingAnchor.constraint(equalTo: inputContainer.leadingAnchor, constant: 14),
+            composerScroll.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -8),
+            composerScroll.topAnchor.constraint(equalTo: inputContainer.topAnchor, constant: 7),
+            composerScroll.bottomAnchor.constraint(equalTo: inputContainer.bottomAnchor, constant: -7),
 
-            sendButton.trailingAnchor.constraint(equalTo: inputContainer.trailingAnchor, constant: -8),
-            sendButton.centerYAnchor.constraint(equalTo: inputContainer.centerYAnchor),
+            composerPlaceholder.leadingAnchor.constraint(equalTo: inputContainer.leadingAnchor, constant: 15),
+            composerPlaceholder.centerYAnchor.constraint(equalTo: inputContainer.centerYAnchor),
+
+            sendButton.trailingAnchor.constraint(equalTo: inputContainer.trailingAnchor, constant: -10),
+            sendButton.bottomAnchor.constraint(equalTo: inputContainer.bottomAnchor, constant: -8),
             sendButton.widthAnchor.constraint(equalToConstant: 28),
             sendButton.heightAnchor.constraint(equalToConstant: 28),
 
@@ -418,7 +520,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         service.$connected
             .receive(on: RunLoop.main)
             .sink { [weak self] connected in
-                self?.input.isEnabled = connected
+                self?.composerTextView.isEditable = connected
                 self?.sendButton.isEnabled = connected
             }
             .store(in: &cancellables)
@@ -435,7 +537,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             if ids.count > renderedIDs.count {
                 for index in renderedIDs.count..<messages.count {
-                    appendRow(MessageRowView(message: messages[index]))
+                    appendRow(for: messages[index])
                 }
                 renderedIDs = ids
             }
@@ -453,13 +555,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for row in rows { row.removeFromSuperview() }
         rows.removeAll()
         if let typingRow { typingRow.removeFromSuperview(); self.typingRow = nil }
+        lastRenderedDate = nil
         for message in service.messages {
-            appendRow(MessageRowView(message: message))
+            appendRow(for: message)
         }
         renderedIDs = service.messages.map(\.id)
     }
 
-    private func appendRow(_ row: MessageRowView) {
+    private func appendRow(for message: ChatMessage) {
+        let showDate: Bool
+        if let at = message.at {
+            if let last = lastRenderedDate {
+                showDate = !Calendar.current.isDate(last, inSameDayAs: at)
+            } else {
+                showDate = true
+            }
+            lastRenderedDate = at
+        } else {
+            showDate = false
+        }
+        let row = MessageRowView(message: message, showDate: showDate)
         stack.addArrangedSubview(row)
         row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         rows.append(row)
@@ -467,21 +582,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func updateTyping(visible: Bool) {
         if visible, typingRow == nil {
-            let label = NSTextField(labelWithString: "云熙正在想…")
-            label.font = .systemFont(ofSize: 11)
-            label.textColor = .secondaryLabelColor
-            let holder = NSView()
-            holder.translatesAutoresizingMaskIntoConstraints = false
-            label.translatesAutoresizingMaskIntoConstraints = false
-            holder.addSubview(label)
-            NSLayoutConstraint.activate([
-                label.leadingAnchor.constraint(equalTo: holder.leadingAnchor, constant: 48),
-                label.topAnchor.constraint(equalTo: holder.topAnchor, constant: 8),
-                label.bottomAnchor.constraint(equalTo: holder.bottomAnchor, constant: -4),
-            ])
-            stack.addArrangedSubview(holder)
-            holder.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-            typingRow = holder
+            let row = TypingRowView()
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            typingRow = row
         } else if !visible, let typingRow {
             typingRow.removeFromSuperview()
             self.typingRow = nil
@@ -500,14 +604,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    // MARK: 动作
+    // MARK: 输入
+
+    func textDidChange(_ notification: Notification) {
+        let text = composerTextView.string
+        composerPlaceholder.isHidden = !text.isEmpty
+        let used = composerTextView.layoutManager?.usedRect(for: composerTextView.textContainer!) ?? .zero
+        let height = min(112, max(44, used.height + 20))
+        if abs(composerHeight.constant - height) > 0.5 {
+            composerHeight.constant = height
+            window.contentView?.layoutSubtreeIfNeeded()
+        }
+        sendButton.isEnabled = service.connected && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        composerTextView.scrollRangeToVisible(composerTextView.selectedRange())
+    }
+
+    func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            if NSEvent.modifierFlags.contains(.shift) {
+                textView.insertNewlineIgnoringFieldEditor(nil)
+                return true
+            }
+            sendMessage()
+            return true
+        }
+        return false
+    }
 
     @objc private func sendMessage() {
-        let text = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        input.stringValue = ""
+        let text = composerTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, service.connected else { return }
+        composerTextView.string = ""
+        composerPlaceholder.isHidden = false
+        composerHeight.constant = 44
+        sendButton.isEnabled = false
         service.send(text)
-        window.makeFirstResponder(input)
+        window.makeFirstResponder(composerTextView)
     }
 
     @objc private func newChat() {
