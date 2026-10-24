@@ -6,4 +6,6 @@ if [[ ! -x "$ROOT/.venv-mlx/bin/python" ]]; then
     echo "请先运行 安装Mac环境.command --local-model。" >&2
     exit 2
 fi
-exec "$ROOT/.venv-mlx/bin/python" "$ROOT/sidecar/local_llm_server.py" --model Qwen3.5-9B-4bit --device mlx --warmup "$@"
+exec "$ROOT/.venv-mlx/bin/python" "$ROOT/sidecar/local_llm_server.py" \
+    --model Qwen3.5-9B-4bit --device mlx --warmup \
+    --idle-unload "${YUNXI_LOCAL_IDLE_UNLOAD:-600}" "$@"

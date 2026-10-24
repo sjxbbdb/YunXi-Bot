@@ -541,7 +541,7 @@ bash scripts/build-macos-chat-swiftui.sh
 open "target/macos/云熙聊天.app"
 ```
 
-窗口会自动以 `YUNXI_BOT_HOME=<仓库>/data` 拉起本地 `chat-server`；`chat-server` 会带 `--auto-local` 自动拉起本机陪伴模型并等待健康，窗口副标题显示“本机 · 模型名”。**首次启动 macOS 会询问访问「桌面」文件夹**（项目在桌面），需要点“允许”，否则窗口会停在“等待系统权限”。每轮对话会写入 `ConversationObserved`，因此主动陪伴与记忆能获得真实素材。需要人工批准的动作（写入、命令、电脑操控等）在窗口里会被明确拒绝——图形审批界面尚未接入，这类操作请回到终端 `chat`。
+窗口会自动以 `YUNXI_BOT_HOME=<仓库>/data` 拉起本地 `chat-server`；`chat-server` 带 `--auto-local`，但**第一次聊天才加载本机模型**，无输入 10 分钟后自动释放显存（进程保留）。窗口副标题显示“本机 · 模型名”。**首次启动 macOS 会询问访问「桌面」文件夹**（项目在桌面），需要点“允许”，否则窗口会停在“等待系统权限”。每轮对话会写入 `ConversationObserved`，因此主动陪伴与记忆能获得真实素材。需要人工批准的动作（写入、命令、电脑操控等）在窗口里会被明确拒绝——图形审批界面尚未接入，这类操作请回到终端 `chat`。
 
 **邮件后台是单独配置的可选能力**：先通过 `mac_mail_accounts` 查询真实账户 ID，在数据目录建立 `mac-mail.json`，仅列希望巡检的邮箱，例如：
 

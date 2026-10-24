@@ -76,6 +76,14 @@ impl Drop for LocalModelGuard {
     }
 }
 
+fn local_idle_unload_seconds() -> u64 {
+    std::env::var("YUNXI_LOCAL_IDLE_UNLOAD")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v == 0 || *v >= 60)
+        .unwrap_or(600)
+}
+
 fn local_model_ready() -> bool {
     std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], 17872)),
@@ -117,6 +125,8 @@ fn start_local_model(home: &std::path::Path) -> LocalModelGuard {
         .args([
             "--model", model, "--device", "mlx", "--port", "17872", "--warmup",
         ])
+        .arg("--idle-unload")
+        .arg(local_idle_unload_seconds().to_string())
         .current_dir(&root)
         .env("YUNXI_BOT_HOME", home)
         .stdin(std::process::Stdio::null())
@@ -164,13 +174,6 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     if crate::flag(args, "--endpoint").is_none() {
         crate::ensure_decider_running();
     }
-    // 只有 App 显式传 `--auto-local` 才自动拉起；CLI 仍可手动控制内存。
-    let _local_model_guard = if args.iter().any(|a| a == "--auto-local") {
-        start_local_model(&home)
-    } else {
-        LocalModelGuard(None)
-    };
-
     // —— 窗口内审批：读线程把 UI 的决定送回来 ——
     let approvals = ApprovalBridge::new();
     let approver = WebApprover {
@@ -254,6 +257,8 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     // —— 新建或接最近一个会话 ——
     let mut session_id = new_session_id();
     let mut work_session_id = format!("{session_id}-work");
+    // 懒加载：App 传 --auto-local 时，第一次聊天才拉起本机模型。
+    let mut local_model_guard: Option<LocalModelGuard> = None;
     let mut turns: u32 = 0;
     let mut work_turns: u32 = 0;
     let mut resumed = false;
@@ -403,18 +408,18 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                     }
                 };
                 let is_chat = matches!(classification.kind, InputKind::Chat);
-                if is_chat
-                    && std::net::TcpStream::connect_timeout(
-                        &std::net::SocketAddr::from(([127, 0, 0, 1], 17872)),
-                        std::time::Duration::from_millis(250),
-                    )
-                    .is_err()
-                {
-                    write_event(json!({
-                        "type":"error",
-                        "message":"本机模型未启动：请先运行「启动本地模型.command」。这一轮没有上云。"
-                    }));
-                    continue;
+                if is_chat {
+                    // 进入聊天才拉起本机模型；任务不会唤醒它。
+                    if !local_model_ready() && args.iter().any(|a| a == "--auto-local") {
+                        local_model_guard = Some(start_local_model(&home));
+                    }
+                    if !local_model_ready() {
+                        write_event(json!({
+                            "type":"error",
+                            "message":"本机模型未启动：请先运行「启动本地模型.command」。这一轮没有上云。"
+                        }));
+                        continue;
+                    }
                 }
                 let routing = if is_chat {
                     match companion.route_for_spec(
@@ -538,6 +543,8 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             }
         }
     }
+    // 让 guard 活到 chat-server 退出；正常退出时回收本机模型子进程。
+    drop(local_model_guard);
     Ok(0)
 }
 

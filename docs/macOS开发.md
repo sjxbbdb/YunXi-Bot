@@ -32,7 +32,7 @@ DeepSeek 凭证放在该数据目录的 `secrets/deepseek.key`（Mac 权限 0600
 curl http://127.0.0.1:17870/health
 ```
 
-聊天先由 Laya 分类：聊天走本机 MLX（默认 Qwen3.5-9B，可切 Gemma 4 26B），任务走 `deepseek-flash`；两条链路使用不同系统提示词与独立会话。App 启动 `chat-server` 时带 `--auto-local`，会自动拉起本机陪伴模型并等待健康，窗口副标题显示“本机 · 模型名”，无需先手动开终端。工作代理只读 `data/work/` 的工作人格、工作画像、工作记忆与工作知识库，不读陪伴的画像/记忆/私聊历史；`./启动.command work ...` 管理这些文件。
+聊天先由 Laya 分类：聊天走本机 MLX（默认 Qwen3.5-9B，可切 Gemma 4 26B），任务走 `deepseek-flash`；两条链路使用不同系统提示词与独立会话。App 启动 `chat-server` 时带 `--auto-local`，但**第一次聊天才加载本机模型**；无输入 10 分钟后自动释放显存（进程保留，`YUNXI_LOCAL_IDLE_UNLOAD` 可改）。窗口副标题显示“本机 · 模型名”，无需先手动开终端。工作代理只读 `data/work/` 的工作人格、工作画像、工作记忆与工作知识库，不读陪伴的画像/记忆/私聊历史；`./启动.command work ...` 管理这些文件。
 分类失败会停止本轮。默认闲聊不开思考，任务规划/分析按类型开启，显式开关优先。远端失败不会自动启动本地生成权重。
 Laya 通过 PyTorch MPS 运行；向量编码器使用 CPU。`do/resume --provider local` 已拒绝，避免轻量模式重新加载大模型。
 
