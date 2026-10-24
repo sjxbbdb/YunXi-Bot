@@ -101,15 +101,21 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let mut tool_descriptions: Vec<ToolDescription> = Vec::new();
     let mut mcp_count = 0usize;
     let mut mcp_problems: Vec<String> = Vec::new();
-    let mut work = ChatHandler::new(
+    // 工作上下文独立在 data/work：人格、画像、台账、向量库都与陪伴隔离。
+    let work_home = home.join("work");
+    std::fs::create_dir_all(&work_home)?;
+    let work_persona_path = work_home.join("persona.md");
+    if !work_persona_path.exists() {
+        std::fs::write(&work_persona_path, yunxi_bot_core::prompts::WORK_PERSONA)?;
+    }
+    let mut work = ChatHandler::new_with_context(
         home.clone(),
+        work_home.clone(),
         "云熙 · 工作助理",
         yunxi_bot_core::prompts::WORK_PERSONA,
         crate::chat_handler::default_rules(),
     )
-    .with_identity("云熙 · 工作助理", yunxi_bot_core::prompts::WORK_PERSONA)
     .with_chat_protocol(yunxi_bot_core::prompts::work_protocol())
-    .without_personal_context()
     .with_decider(decider.clone());
     if let Ok(tools) = crate::tooling::default_registry(&home) {
         let mut tools = tools;
@@ -126,7 +132,7 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let mut work = work
         .with_approver(Arc::new(Mutex::new(approver)))
         .with_policy(crate::tooling::policy_from_args(args))
-        .with_sink(crate::tool_sink_or_warn());
+        .with_sink(crate::tool_sink_or_warn_at(work_home.join("ledger.jsonl")));
     let mut companion = companion;
 
     let mut budget = ContextBudget::for_model(ModelSpec::DEEPSEEK_FLASH.model);
@@ -146,6 +152,8 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     local_budget.reserve_for_reply = 32768 / 8;
 
     let mut ledger = Ledger::open(crate::ledger_path())?;
+    // 工作代理的模型调用/压缩事件写工作台账，和陪伴台账分开。
+    let mut work_ledger = Ledger::open(work_home.join("ledger.jsonl"))?;
 
     // —— 新建或接最近一个会话 ——
     let mut session_id = new_session_id();
@@ -362,7 +370,12 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                     crate::chat::compact_now(&mut work, &budget, &routing.spec)
                 };
                 if let Some(c) = compact {
-                    let _ = ledger.append(
+                    let active_ledger = if is_chat {
+                        &mut ledger
+                    } else {
+                        &mut work_ledger
+                    };
+                    let _ = active_ledger.append(
                         EventKind::ContextCompacted,
                         None,
                         json!({
@@ -404,14 +417,22 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                         }
                         append_display(&home, &session_id, "user", &text);
                         append_display(&home, &session_id, "assistant", &reply);
-                        drain_records(&mut ledger, &mut records);
+                        if is_chat {
+                            drain_records(&mut ledger, &mut records);
+                        } else {
+                            drain_records(&mut work_ledger, &mut records);
+                        }
                         write_event(
                             json!({"type":"reply","text":reply,"session":session_id,"turns":turns}),
                         );
                         write_event(sessions_event(&home, &store));
                     }
                     Err(e) => {
-                        drain_records(&mut ledger, &mut records);
+                        if is_chat {
+                            drain_records(&mut ledger, &mut records);
+                        } else {
+                            drain_records(&mut work_ledger, &mut records);
+                        }
                         write_event(json!({"type":"error","message":format!("这一轮失败了: {e}")}));
                     }
                 }

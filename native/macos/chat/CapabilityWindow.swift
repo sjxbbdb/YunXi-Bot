@@ -385,6 +385,7 @@ final class SettingsWindowController: NSWindowController, NSOutlineViewDataSourc
         addGroup("运行环境", rows: [
             row("平台", c.platform),
             row("数据目录", c.home),
+            row("工作上下文", c.home + "/work"),
             row("邮件巡览", c.system.mailConfigured ? "已配置" : "未配置"),
             row("本地模型", c.system.models.isEmpty ? "（无）" : c.system.models.joined(separator: " · ")),
         ])
@@ -392,6 +393,8 @@ final class SettingsWindowController: NSWindowController, NSOutlineViewDataSourc
             button("打开数据目录", #selector(openDataFolder)),
             button("显示台账", #selector(revealLedger)),
             button("显示人格", #selector(revealPersona)),
+            button("打开工作上下文", #selector(openWorkFolder)),
+            button("显示工作人格", #selector(revealWorkPersona)),
         ])
         buttons.orientation = .horizontal
         buttons.spacing = 8
@@ -497,6 +500,27 @@ final class SettingsWindowController: NSWindowController, NSOutlineViewDataSourc
 
     @objc private func openDataFolder() {
         if let home = snapshot?.home { NSWorkspace.shared.open(URL(fileURLWithPath: home)) }
+    }
+
+    @objc private func openWorkFolder() {
+        if let home = snapshot?.home {
+            let work = home + "/work"
+            try? FileManager.default.createDirectory(atPath: work, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(URL(fileURLWithPath: work))
+        }
+    }
+
+    @objc private func revealWorkPersona() {
+        if let home = snapshot?.home {
+            let work = home + "/work"
+            let persona = work + "/persona.md"
+            try? FileManager.default.createDirectory(atPath: work, withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: persona) {
+                NSWorkspace.shared.selectFile(persona, inFileViewerRootedAtPath: work)
+            } else {
+                NSWorkspace.shared.open(URL(fileURLWithPath: work))
+            }
+        }
     }
 
     @objc private func revealLedger() {

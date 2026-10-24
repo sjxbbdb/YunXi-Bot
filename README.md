@@ -513,6 +513,15 @@ export YUNXI_BOT_HOME="$PWD/data"
 ./启动.command knowledge search "需要查询的内容"
 ```
 
+工作代理有独立的 `data/work/` 上下文（人格、画像、台账、向量库），不会读取陪伴的画像/记忆/私聊历史：
+
+```bash
+YUNXI_BOT_HOME="$PWD/data" ./启动.command work path
+YUNXI_BOT_HOME="$PWD/data" ./启动.command work persona --init
+YUNXI_BOT_HOME="$PWD/data" ./启动.command work profile --init
+YUNXI_BOT_HOME="$PWD/data" ./启动.command work knowledge add 工作资料.md
+```
+
 ### macOS 原生聊天窗口（可选）
 
 > 聊天窗口为 **SwiftUI + Liquid Glass** 界面，需要 **macOS 26+**（`.glassEffect` 材质）。旧 AppKit 版（`scripts/build-macos-chat.sh`）仍保留、支持 macOS 14+，可作回退；回适配 macOS 14 后续再做。

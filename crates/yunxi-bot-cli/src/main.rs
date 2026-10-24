@@ -47,7 +47,14 @@ use yunxi_bot_core::{TickOptions, now_millis, policy, tick};
 /// 理由：为了留痕而拒绝服务是本末倒置。但也不能静默——"这次没有工具记录"
 /// 是使用者需要知道的事，所以打到 stderr。
 fn tool_sink_or_warn() -> std::sync::Arc<dyn yunxi_bot_core::tool::ToolCallSink> {
-    match tool_sink::LedgerToolSink::open(ledger_path()) {
+    tool_sink_or_warn_at(ledger_path())
+}
+
+/// 指定台账的 sink；工作代理用它写 `data/work/ledger.jsonl`，不混入陪伴台账。
+fn tool_sink_or_warn_at(
+    path: std::path::PathBuf,
+) -> std::sync::Arc<dyn yunxi_bot_core::tool::ToolCallSink> {
+    match tool_sink::LedgerToolSink::open(path) {
         Ok(s) => std::sync::Arc::new(s),
         Err(e) => {
             eprintln!("警告：工具调用写不进台账（{e}）——改为打到标准错误");
@@ -111,6 +118,7 @@ YunXi Bot —— 陪伴型通用常驻 Agent 助理
   yunxi-bot memory --accept <id>|--reject <id>  处置记忆候选
   yunxi-bot memory --upgrade 停止全部写入后备份并逐版升级台账
   yunxi-bot knowledge add <文件>   导入 UTF-8 .md/.txt 副本
+  yunxi-bot work ...             工作代理的人格/画像/知识库（data/work）
   yunxi-bot knowledge list         列出已导入的知识文档
   yunxi-bot knowledge search <问题> 语义检索（自动启动本地编码器）
   yunxi-bot knowledge remove <id>  删除导入副本，保留原文件
@@ -242,6 +250,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         "remember" => cmd_remember(rest),
         "memory" => cmd_memory(rest),
         "knowledge" => cmd_knowledge(rest),
+        "work" => cmd_work(rest),
         "profile" => cmd_profile(rest),
         "persona" => cmd_persona(rest),
         "journal" => cmd_journal(rest),
@@ -2304,25 +2313,96 @@ fn cmd_profile(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
 ///
 /// 分层对不对也得靠这个命令核对（比如"这条明明是偏好，怎么归到事实了"）。
 fn cmd_knowledge(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    knowledge_for_home(&default_home(), args)
+}
+
+/// 工作代理的配置入口：人格、画像、知识库都落在 `data/work/`。
+fn cmd_work(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
+    use yunxi_bot_core::{persona, profile};
+    let home = default_home().join("work");
+    std::fs::create_dir_all(&home)?;
+    match args.first().map(String::as_str) {
+        Some("path") | None => {
+            println!("工作上下文：{}", home.display());
+            println!("  人格：{}", home.join(persona::PERSONA_FILE).display());
+            println!("  画像：{}", home.join(profile::PROFILE_FILE).display());
+            println!("  台账：{}", home.join("ledger.jsonl").display());
+            println!("  向量：{}", home.join("vectors").display());
+            println!("  知识：{}", home.join("knowledge").display());
+            println!(
+                "  命令：work persona [--init] | work profile [--init] | work knowledge <子命令>"
+            );
+        }
+        Some("persona") => {
+            let path = home.join(persona::PERSONA_FILE);
+            if args.iter().any(|a| a == "--init") {
+                if path.exists() {
+                    println!("工作人格已存在：{}（未覆盖）", path.display());
+                } else {
+                    std::fs::write(&path, yunxi_bot_core::prompts::WORK_PERSONA)?;
+                    println!("已写入工作人格：{}", path.display());
+                }
+            } else if path.exists() {
+                println!("{}", std::fs::read_to_string(&path)?);
+            } else {
+                println!("{}", yunxi_bot_core::prompts::WORK_PERSONA);
+                println!(
+                    "\n（这是内置默认；运行 `yunxi-bot work persona --init` 写入文件后可修改）"
+                );
+            }
+        }
+        Some("profile") => {
+            let path = home.join(profile::PROFILE_FILE);
+            if args.iter().any(|a| a == "--init") {
+                if path.exists() {
+                    println!("工作画像已存在：{}（未覆盖）", path.display());
+                } else {
+                    std::fs::write(
+                        &path,
+                        "# 工作背景\n- 我负责的业务/项目：\n- 常用系统与工具：\n- 输出偏好与禁区：\n",
+                    )?;
+                    println!("已写入工作画像：{}", path.display());
+                }
+            } else if path.exists() {
+                println!("{}", std::fs::read_to_string(&path)?);
+            } else {
+                println!("工作画像尚未创建：{}", path.display());
+                println!("运行 `yunxi-bot work profile --init` 建一份，或直接编辑该文件。");
+            }
+        }
+        Some("knowledge") => return knowledge_for_home(&home, &args[1..]),
+        _ => {
+            eprintln!(
+                "用法：work path | persona [--init] | profile [--init] | knowledge add/list/search/remove/reindex"
+            );
+            return Ok(2);
+        }
+    }
+    Ok(0)
+}
+
+fn knowledge_for_home(
+    home: &std::path::Path,
+    args: &[String],
+) -> Result<i32, Box<dyn std::error::Error>> {
     use yunxi_bot_core::retrieval;
-    let home = default_home();
     match args.first().map(String::as_str) {
         Some("add") if args.len() == 2 => {
-            let id = retrieval::import_document(&home, std::path::Path::new(&args[1]))?;
+            let id = retrieval::import_document(home, std::path::Path::new(&args[1]))?;
             println!("已导入 {id}；原文件更新后需再次 add，向量在下次检索时更新。");
         }
         Some("list") if args.len() == 1 => {
-            for (id, doc) in retrieval::documents(&home)? {
+            for (id, doc) in retrieval::documents(home)? {
                 println!("{id}\t{}\t{} 字", doc.source, doc.text.chars().count());
             }
         }
         Some("search") if args.len() >= 2 => {
-            let passages = retrieval::knowledge_passages(&home)?;
+            let passages = retrieval::knowledge_passages(home)?;
             if !passages.is_empty() {
                 ensure_embedding_running()?;
             }
             let hits = retrieval::search(
-                &home,
+                home,
                 "knowledge",
                 &passages,
                 &args[1..].join(" "),
@@ -2331,12 +2411,12 @@ fn cmd_knowledge(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&hits)?);
         }
         Some("remove") if args.len() == 2 => {
-            retrieval::remove_document(&home, &args[1])?;
+            retrieval::remove_document(home, &args[1])?;
             println!("已删除知识副本 {}，原文件未改动。", args[1]);
         }
         Some("reindex") if args.len() == 1 => {
-            retrieval::clear_cache(&home, "knowledge")?;
-            retrieval::clear_cache(&home, "memory")?;
+            retrieval::clear_cache(home, "knowledge")?;
+            retrieval::clear_cache(home, "memory")?;
             println!("已清除派生向量；下次检索按当前文档和台账重建。");
         }
         _ => {
