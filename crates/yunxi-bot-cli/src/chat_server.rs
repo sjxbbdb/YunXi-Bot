@@ -47,8 +47,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use yunxi_bot_core::costlog::{CallRecord, project_costs};
+use yunxi_bot_core::decide::Decider;
 use yunxi_bot_core::memory::Memory;
 use yunxi_bot_core::think::context::ContextBudget;
+use yunxi_bot_core::think::router::TaskKind;
 use yunxi_bot_core::think::session::SessionStore;
 use yunxi_bot_core::think::{ModelSpec, ReasoningEffort};
 use yunxi_bot_core::tool::ToolDescription;
@@ -56,6 +58,8 @@ use yunxi_bot_core::tool::runner::{Approval, ApprovalRequest, Approver};
 use yunxi_bot_core::{EventKind, Ledger};
 
 use crate::chat_handler::ChatHandler;
+use crate::model_adapter::ModelAdapter;
+use crate::task_classifier::{InputKind, TaskClassifier, strip_command};
 
 /// 启动本地聊天服务。
 pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
@@ -77,16 +81,36 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         bridge: approvals.clone(),
     };
 
-    // —— 和 `chat` 同一套装配：工具、审批、台账、决策模型 ——
-    let mut handler = ChatHandler::new(
+    // —— 分类器 + 双代理：陪伴（本地） / 工作（云端） ——
+    let decider: Arc<dyn Decider> = Arc::new(yunxi_bot_core::decide::LayaDecider::new(
+        crate::flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
+    ));
+    let classifier = TaskClassifier::new(decider.clone(), crate::ledger_path());
+    let companion_adapter = ModelAdapter::companion();
+    let work_adapter = ModelAdapter::work();
+
+    let companion = ChatHandler::new(
         home.clone(),
         "云熙",
         crate::chat_handler::DEFAULT_PERSONA,
         crate::chat_handler::default_rules(),
-    );
+    )
+    .with_chat_protocol(yunxi_bot_core::prompts::local_chat_protocol())
+    .with_decider(decider.clone());
+
     let mut tool_descriptions: Vec<ToolDescription> = Vec::new();
     let mut mcp_count = 0usize;
     let mut mcp_problems: Vec<String> = Vec::new();
+    let mut work = ChatHandler::new(
+        home.clone(),
+        "云熙 · 工作助理",
+        yunxi_bot_core::prompts::WORK_PERSONA,
+        crate::chat_handler::default_rules(),
+    )
+    .with_identity("云熙 · 工作助理", yunxi_bot_core::prompts::WORK_PERSONA)
+    .with_chat_protocol(yunxi_bot_core::prompts::work_protocol())
+    .without_personal_context()
+    .with_decider(decider.clone());
     if let Ok(tools) = crate::tooling::default_registry(&home) {
         let mut tools = tools;
         match crate::tooling::with_mcp(&mut tools, &home) {
@@ -97,15 +121,13 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             Err(e) => mcp_problems.push(e.to_string()),
         }
         tool_descriptions = tools.describe();
-        handler = handler.with_tools(tools);
+        work = work.with_tools(tools);
     }
-    handler = handler
+    let mut work = work
         .with_approver(Arc::new(Mutex::new(approver)))
         .with_policy(crate::tooling::policy_from_args(args))
-        .with_sink(crate::tool_sink_or_warn())
-        .with_decider(Arc::new(yunxi_bot_core::decide::LayaDecider::new(
-            crate::flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
-        )));
+        .with_sink(crate::tool_sink_or_warn());
+    let mut companion = companion;
 
     let mut budget = ContextBudget::for_model(ModelSpec::DEEPSEEK_FLASH.model);
     if let Some(w) = crate::flag(args, "--context-window") {
@@ -117,29 +139,42 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         budget.window_tokens = w;
         budget.reserve_for_reply = budget.reserve_for_reply.min(w / 8);
     }
+    // 本机 Qwen3.5-9B 的 MLX 侧车按 32k 上下文配置；人格前缀较大，
+    // 不能沿用云端的 64k 预算——否则会话不压缩，请求会直接被侧车拒绝。
+    let mut local_budget = ContextBudget::for_model(ModelSpec::LOCAL_CHAT.model);
+    local_budget.window_tokens = 32768;
+    local_budget.reserve_for_reply = 32768 / 8;
 
     let mut ledger = Ledger::open(crate::ledger_path())?;
 
     // —— 新建或接最近一个会话 ——
     let mut session_id = new_session_id();
+    let mut work_session_id = format!("{session_id}-work");
     let mut turns: u32 = 0;
+    let mut work_turns: u32 = 0;
     let mut resumed = false;
     if args.iter().any(|a| a == "--resume")
-        && let Some(file) = store.latest()?
+        && let Some(file) = store
+            .list()?
+            .into_iter()
+            .find(|file| !file.id.ends_with("-work"))
     {
         let (layout, mismatched) =
-            yunxi_bot_core::think::session::resume_onto(&file, &handler.expected_chat_prefix());
+            yunxi_bot_core::think::session::resume_onto(&file, &companion.expected_chat_prefix());
         let _ = mismatched;
-        handler.restore_chat_layout(layout, crate::chat_handler::CHAT_SESSION_KEY);
+        companion.restore_chat_layout(layout, crate::chat_handler::CHAT_SESSION_KEY);
         session_id = file.id;
+        work_session_id = format!("{session_id}-work");
         turns = file.turns;
         resumed = true;
     }
 
     // 流式正文直接写协议行（与审批、最终回复同在主线程，写出顺序稳定）。
-    handler.set_on_delta(Arc::new(|text: &str| {
+    let on_delta: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|text: &str| {
         write_event(json!({"type":"delta","text":text}));
-    }));
+    });
+    companion.set_on_delta(on_delta.clone());
+    work.set_on_delta(on_delta);
 
     let history = read_display_history(&home, &session_id, 200);
     if !history.is_empty() {
@@ -193,9 +228,12 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 write_event(json!({"type":"effort","value":effort_label(effort)}));
             }
             "new" => {
-                handler.reset_chat_session();
+                companion.reset_chat_session();
+                work.reset_chat_session();
                 session_id = new_session_id();
+                work_session_id = format!("{session_id}-work");
                 turns = 0;
+                work_turns = 0;
                 write_event(json!({"type":"session","session":session_id}));
                 write_event(sessions_event(&home, &store));
             }
@@ -208,11 +246,15 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                     Ok(file) => {
                         let (layout, _mismatch) = yunxi_bot_core::think::session::resume_onto(
                             &file,
-                            &handler.expected_chat_prefix(),
+                            &companion.expected_chat_prefix(),
                         );
-                        handler.restore_chat_layout(layout, crate::chat_handler::CHAT_SESSION_KEY);
+                        companion
+                            .restore_chat_layout(layout, crate::chat_handler::CHAT_SESSION_KEY);
+                        work.reset_chat_session();
                         session_id = file.id;
+                        work_session_id = format!("{session_id}-work");
                         turns = file.turns;
+                        work_turns = 0;
                         let history = read_display_history(&home, &session_id, 200);
                         let history_missing = history.is_empty();
                         if !history_missing {
@@ -239,28 +281,92 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 mcp_problems: &mcp_problems,
             })),
             "chat" => {
-                let text = req["text"].as_str().unwrap_or("").trim().to_string();
+                let raw = req["text"].as_str().unwrap_or("").trim().to_string();
+                if raw.is_empty() {
+                    write_event(json!({"type":"error","message":"空消息"}));
+                    continue;
+                }
+                let text = strip_command(&raw);
                 if text.is_empty() {
                     write_event(json!({"type":"error","message":"空消息"}));
                     continue;
                 }
-                let routing = match handler.route_for(&text, effort) {
-                    Ok(r) => r,
+                let classification = match classifier.classify(&raw) {
+                    Ok(c) => c,
                     Err(e) => {
-                        write_event(json!({"type":"error","message":format!("路由失败: {e}")}));
+                        write_event(json!({"type":"error","message":format!("分类失败: {e}")}));
                         continue;
                     }
                 };
-                write_event(
-                    json!({"type":"route","model":routing.spec.model,"thinking":routing.thinking}),
-                );
+                let is_chat = matches!(classification.kind, InputKind::Chat);
+                if is_chat
+                    && std::net::TcpStream::connect_timeout(
+                        &std::net::SocketAddr::from(([127, 0, 0, 1], 17872)),
+                        std::time::Duration::from_millis(250),
+                    )
+                    .is_err()
+                {
+                    write_event(json!({
+                        "type":"error",
+                        "message":"本机模型未启动：请先运行「启动本地模型.command」。这一轮没有上云。"
+                    }));
+                    continue;
+                }
+                let routing = if is_chat {
+                    match companion.route_for_spec(
+                        &text,
+                        effort,
+                        companion_adapter.spec.clone(),
+                        TaskKind::Conversation,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            write_event(
+                                json!({"type":"error","message":format!("本机路由失败: {e}")}),
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    match work.route_for_spec(
+                        &text,
+                        effort,
+                        work_adapter.spec.clone(),
+                        TaskKind::Generation,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            write_event(
+                                json!({"type":"error","message":format!("工作路由失败: {e}")}),
+                            );
+                            continue;
+                        }
+                    }
+                };
+                write_event(json!({
+                    "type":"route",
+                    "model":routing.spec.model,
+                    "thinking":routing.thinking,
+                    "mode":if is_chat { "chat" } else { "task" },
+                    "agent":if is_chat { companion_adapter.role } else { work_adapter.role },
+                    "adapter":if is_chat { companion_adapter.label } else { work_adapter.label },
+                    "local":if is_chat { companion_adapter.local } else { work_adapter.local },
+                    "tools":if is_chat { companion_adapter.tools } else { work_adapter.tools },
+                    "classified":classification.reason,
+                    "classified_model":classification.model,
+                }));
 
-                if let Some(c) = crate::chat::compact_now(&mut handler, &budget, &routing.spec) {
+                let compact = if is_chat {
+                    crate::chat::compact_now(&mut companion, &local_budget, &routing.spec)
+                } else {
+                    crate::chat::compact_now(&mut work, &budget, &routing.spec)
+                };
+                if let Some(c) = compact {
                     let _ = ledger.append(
                         EventKind::ContextCompacted,
                         None,
                         json!({
-                            "session": session_id,
+                            "session": if is_chat { &session_id } else { &work_session_id },
                             "dropped_messages": c.dropped_messages,
                             "dropped_chars": c.dropped_chars,
                             "dropped_tool_calls": c.dropped_tool_calls,
@@ -274,13 +380,27 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 }
 
                 let mut records = Vec::new();
-                match handler.chat_turn(&routing, &text, &mut records) {
+                let result = if is_chat {
+                    companion.chat_turn_with_images(&routing, &text, Vec::new(), &mut records)
+                } else {
+                    work.chat_turn_with_images(&routing, &text, Vec::new(), &mut records)
+                };
+                match result {
                     Ok(reply) => {
                         turns += 1;
-                        if let Err(e) =
-                            crate::chat::persist(&handler, &store, &session_id, turns, 0)
-                        {
-                            eprintln!("[chat-server] 存盘失败: {e}");
+                        if is_chat {
+                            if let Err(e) =
+                                crate::chat::persist(&companion, &store, &session_id, turns, 0)
+                            {
+                                eprintln!("[chat-server] 陪伴会话存盘失败: {e}");
+                            }
+                        } else {
+                            work_turns += 1;
+                            if let Err(e) =
+                                crate::chat::persist(&work, &store, &work_session_id, work_turns, 0)
+                            {
+                                eprintln!("[chat-server] 工作会话存盘失败: {e}");
+                            }
                         }
                         append_display(&home, &session_id, "user", &text);
                         append_display(&home, &session_id, "assistant", &reply);
@@ -417,6 +537,7 @@ fn sessions_event(home: &Path, store: &SessionStore) -> Value {
         .list()
         .unwrap_or_default()
         .into_iter()
+        .filter(|file| !file.id.ends_with("-work"))
         .map(|file| {
             let history = read_display_history(home, &file.id, 200);
             let preview = history

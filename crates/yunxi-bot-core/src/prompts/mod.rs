@@ -11,6 +11,9 @@ pub const EXPRESSION: &str = include_str!("expression.md");
 pub const PERSONA_VOICE: &str = include_str!("persona_voice.md");
 pub const REPLY_REVIEW: &str = include_str!("reply_review.md");
 pub const CHAT: &str = include_str!("chat.md");
+pub const WORK: &str = include_str!("work.md");
+pub const LOCAL_CHAT: &str = include_str!("local_chat.md");
+pub const WORK_PERSONA: &str = include_str!("work_persona.md");
 pub const STEP: &str = include_str!("step.md");
 pub const PLAN: &str = include_str!("plan.md");
 pub const OPTIONS: &str = include_str!("options.md");
@@ -26,6 +29,19 @@ pub fn internal(purpose: &str) -> String {
 
 pub fn expression(purpose: &str) -> String {
     format!("{BASE}\n\n{EXPRESSION}\n\n# 当前职责\n{purpose}\n\n{PERSONA_VOICE}")
+}
+
+/// 本机陪伴协议：没有工具，不允许输出工具/思考协议。
+pub fn local_chat_protocol() -> String {
+    format!("{}\n\n# 本阶段输出协议\n{}\n", BASE, LOCAL_CHAT)
+}
+
+/// 工作代理的对话协议。**和陪伴协议分开**：不包含人格表达与陪伴语气。
+pub fn work_protocol() -> String {
+    format!(
+        "{}\n\n{OPERATIONS}\n\n# 面向用户的表达\n工作模式：只报告任务相关的结论、证据、未完成项和下一步；不进行人格表演、调情或情绪陪伴。\n",
+        internal(WORK)
+    )
 }
 
 const CATALOG: &str = include_str!("tool_catalog.tsv");
@@ -59,6 +75,23 @@ pub fn tool_catalog(specs: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_chat_protocol_has_no_tool_or_task_instructions() {
+        let p = local_chat_protocol();
+        assert!(p.contains("没有工具"));
+        assert!(p.contains("不要输出工具调用"));
+        assert!(!p.contains("mail_send"));
+        assert!(!p.contains("WORK_PROTOCOL"));
+    }
+
+    #[test]
+    fn work_protocol_is_professional_and_separate() {
+        let p = work_protocol();
+        assert!(p.contains("工作代理"));
+        assert!(p.contains("不进行调情"));
+        assert!(!p.contains("PERSONA_VOICE"));
+    }
 
     #[test]
     fn every_companion_purpose_ends_with_scoped_persona_priority() {

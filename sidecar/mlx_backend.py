@@ -4,7 +4,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-CONTEXT_LIMIT = 16384
+CONTEXT_LIMIT = 32768
 _worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yunxi-mlx")
 
 
@@ -76,12 +76,15 @@ def parse_call(body, tools):
     return [(call["name"], json.dumps(call["arguments"], ensure_ascii=False, allow_nan=False))]
 
 
-def split_stream(pieces, tokenizer, prompt, tools):
+def split_stream(pieces, tokenizer, prompt, tools, thinking=True):
     """隔离思考和工具协议；跨 token 的标记必须完整识别后才发出。"""
     markers = {tokenizer.tool_call_start: ("tool_call", tokenizer.tool_call_end),
                tokenizer.think_start: ("reasoning", tokenizer.think_end)}
     state, end, buffer = "delta", None, ""
-    if prompt.rfind(tokenizer.think_start) > prompt.rfind(tokenizer.think_end):
+    # 只有“开启思考且提示词正好以 think_start 结尾”才延续思考态。
+    # 不能因为提示词正文里出现过 think_start 就把整轮当思考——人格/记忆里
+    # 一旦出现这个字面量，正文会被全部吞掉，客户端只看到“没有正文”。
+    if thinking and prompt.rstrip().endswith(tokenizer.think_start):
         state, end = markers[tokenizer.think_start]
     for piece in pieces:
         buffer += piece
@@ -155,16 +158,29 @@ def _generate_events(model, tokenizer, messages, tools, max_tokens, temperature,
                                 stream=mx.default_stream(mx.default_device()),
                                 prefill_step_size=512)
     last = None
-
     def pieces():
         nonlocal last
         for response in responses:
             last = response
             yield response.text
 
+    # 纯聊天：不思考、无工具时不做思考/工具协议解析。
+    # 这条路径只要正文，解析器反而会把提示词里的字面量误判成协议。
+    if not thinking and not tools:
+        for response in responses:
+            last = response
+            if response.text:
+                yield "delta", response.text
+        if last is None:
+            raise RuntimeError("Gemma 没有产生输出")
+        yield "usage", {"prompt_tokens": last.prompt_tokens,
+                        "completion_tokens": last.generation_tokens,
+                        "finish_reason": last.finish_reason or "stop"}
+        return
+
     calls = []
     try:
-        for kind, value in split_stream(pieces(), tokenizer, prompt, tools):
+        for kind, value in split_stream(pieces(), tokenizer, prompt, tools, thinking):
             if kind == "tool_call":
                 calls.extend(value)
             else:

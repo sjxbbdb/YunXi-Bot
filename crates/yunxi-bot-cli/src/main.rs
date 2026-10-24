@@ -16,9 +16,11 @@ mod chat_handler;
 mod chat_server;
 mod companion_runtime;
 mod detach;
+mod model_adapter;
 #[cfg(all(test, target_os = "macos"))]
 mod recorded_travel;
 mod startup_care;
+mod task_classifier;
 mod tool_sink;
 mod tooling;
 

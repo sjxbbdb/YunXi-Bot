@@ -120,6 +120,10 @@ pub struct ChatHandler {
     /// 人格 + 硬规则拼成的稳定块。**只在这里存一份。**
     persona: String,
     persona_defaults: (String, String, Vec<String>),
+    /// 工作代理的对话协议；None 表示沿用 CHAT 协议（陪伴代理）。
+    chat_protocol_override: Option<String>,
+    /// 是否注入使用者的画像/记忆/召回。工作代理必须为 false。
+    personal_context: bool,
     /// 对话会话的稳定前缀。**提前算好**——载入会话时要拿它和存档里的
     /// 指纹比，而"先建会话再比"会覆盖掉存档里的指纹。
     /// 常驻记忆段（构造时定下）。**单独存着**，因为它要拼进稳定前缀，
@@ -260,6 +264,8 @@ impl ChatHandler {
             project_rules,
             persona: build_persona(persona_name, persona_text, &rules),
             persona_defaults,
+            chat_protocol_override: None,
+            personal_context: true,
             tools: ToolRegistry::new(),
             approver: std::sync::Arc::new(std::sync::Mutex::new(RefusingApprover)),
             decider: None,
@@ -324,6 +330,52 @@ impl ChatHandler {
     pub fn with_policy(mut self, policy: ToolPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// 替换人格文本（工作代理用，不复用陪伴人格）。
+    pub fn with_identity(mut self, name: &str, text: &str) -> Self {
+        self.persona = build_persona(name, text, &self.persona_defaults.2);
+        self.persona_defaults.0 = name.to_string();
+        self.persona_defaults.1 = text.to_string();
+        self
+    }
+
+    /// 替换 Chat 意图的固定协议；工作代理用专业协议，陪伴代理不设置。
+    pub fn with_chat_protocol(mut self, protocol: impl Into<String>) -> Self {
+        self.chat_protocol_override = Some(protocol.into());
+        self
+    }
+
+    /// 工作代理不注入使用者的画像、长期记忆与动态召回。
+    pub fn without_personal_context(mut self) -> Self {
+        self.personal_context = false;
+        self.profile_block.clear();
+        self.memory_block.clear();
+        self
+    }
+
+    /// 用指定模型构造一条路由；双代理由分类器决定用哪个 spec。
+    pub fn route_for_spec(
+        &self,
+        input: &str,
+        effort: ReasoningEffort,
+        spec: ModelSpec,
+        kind: yunxi_bot_core::think::router::TaskKind,
+    ) -> Result<Routing, TaskError> {
+        use yunxi_bot_core::think::router::profile_task;
+        let mut routing = self
+            .router
+            .route(input, kind, &profile_task(input, 0), effort, None);
+        routing.spec = spec.clone();
+        routing.tier = spec.tier;
+        routing.kind = kind;
+        routing.thinking = effort.applies(kind, spec.tier);
+        routing.reason = format!(
+            "双代理路由：{:?} → {} / {}",
+            kind, spec.provider, spec.model
+        );
+        self.prepare_local_model(&mut routing);
+        Ok(routing)
     }
 
     /// 三套系统提示词 + 人格，也就是三个会话各自的**稳定前缀**。
@@ -412,8 +464,10 @@ impl ChatHandler {
             })?;
         let source_seq = continuity::observe_user(&mut ledger, input)
             .map_err(|e| TaskError::NeedsHuman { reason: e })?;
-        self.refresh_identity(&Memory::from_events(ledger.events()))
-            .map_err(|e| TaskError::NeedsHuman { reason: e })?;
+        if self.personal_context {
+            self.refresh_identity(&Memory::from_events(ledger.events()))
+                .map_err(|e| TaskError::NeedsHuman { reason: e })?;
+        }
         self.ensure_session(
             &SessionKey {
                 intent: Intent::Chat,
@@ -421,7 +475,11 @@ impl ChatHandler {
             },
             Intent::Chat,
         );
-        let memory = Memory::from_events(ledger.events());
+        let memory = if self.personal_context {
+            Memory::from_events(ledger.events())
+        } else {
+            Memory::default()
+        };
         let next_expiry = memory
             .all_sorted(now_ms)
             .into_iter()
@@ -431,8 +489,9 @@ impl ChatHandler {
         let prefix = self.stable_prefix(Intent::Chat);
         for (key, layout) in &mut self.sessions {
             if key.intent == Intent::Chat {
-                if layout.reconcile_memory_revocation(revision)
-                    | layout.reconcile_memory_lifetime(now_ms, next_expiry)
+                if self.personal_context
+                    && (layout.reconcile_memory_revocation(revision)
+                        | layout.reconcile_memory_lifetime(now_ms, next_expiry))
                 {
                     eprintln!("[记忆] 已撤回或纠正旧内容，本轮重建可见上下文；历史审计仍保留。");
                 }
@@ -443,18 +502,37 @@ impl ChatHandler {
             .ok()
             .and_then(chrono::DateTime::from_timestamp_millis)
             .ok_or_else(|| yunxi_bot_core::CoreError::Clock("对话时间超出有效范围".into()))?;
-        let semantic = self.semantic_chat_context(input, ledger.events(), now_ms);
-        let notices = continuity::recent_notices(ledger.events(), now_ms);
-        let volatile = format!(
-            "【本轮本机时间：{}；真实用户输入来源序号：{source_seq}】\n{notices}{semantic}\n{}",
-            now.with_timezone(&chrono::Local).to_rfc3339(),
+        let semantic = if self.personal_context {
+            self.semantic_chat_context(input, ledger.events(), now_ms)
+        } else {
+            String::new()
+        };
+        let notices = if self.personal_context {
+            continuity::recent_notices(ledger.events(), now_ms)
+        } else {
+            String::new()
+        };
+        let recalled = if self.personal_context {
             self.with_recalled_memory(input)
+        } else {
+            input.to_string()
+        };
+        let volatile = format!(
+            "【本轮本机时间：{}；真实用户输入来源序号：{source_seq}】\n{notices}{semantic}\n{recalled}",
+            now.with_timezone(&chrono::Local).to_rfc3339()
         );
+        // 本机小模型的首 token 与显存都更紧，聊天给它更小的输出预算；
+        // 工作代理仍保留完整的 4096，避免任务说明被截断。
+        let max_tokens = if routing.spec.provider == "local" {
+            1024
+        } else {
+            CHAT_MAX_TOKENS
+        };
         self.converse(
             routing,
             Intent::Chat,
             yunxi_bot_core::think::Message::user_with_images(volatile, images),
-            CHAT_MAX_TOKENS,
+            max_tokens,
             records,
         )
         .map(|out| out.text)
@@ -901,13 +979,15 @@ impl ChatHandler {
         // 顺序是**人格 → 画像 → 记忆 → 项目规则**：先"我是谁"，
         // 再"你是谁"，再"我记得什么"，最后"这个项目的约定"。
         // 从最稳定到最具体，读起来顺，也符合注意力从远到近的分布。
-        if !self.profile_block.is_empty() {
-            out.push_str("\n\n");
-            out.push_str(&self.profile_block);
-        }
-        if !self.memory_block.is_empty() {
-            out.push_str("\n\n");
-            out.push_str(&self.memory_block);
+        if self.personal_context {
+            if !self.profile_block.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&self.profile_block);
+            }
+            if !self.memory_block.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&self.memory_block);
+            }
         }
         let rules_text = self.project_rules.render();
         if !rules_text.is_empty() {
@@ -915,7 +995,15 @@ impl ChatHandler {
             out.push_str(&rules_text);
         }
         out.push_str("\n\n# 本阶段输出协议\n");
-        out.push_str(&intent.system());
+        if intent == Intent::Chat {
+            if let Some(protocol) = &self.chat_protocol_override {
+                out.push_str(protocol);
+            } else {
+                out.push_str(&intent.system());
+            }
+        } else {
+            out.push_str(&intent.system());
+        }
         if matches!(intent, Intent::Plan | Intent::Options) {
             out.push_str("\n\n以下仅供规划判断可行性，本轮不执行工具：\n");
             out.push_str(&yunxi_bot_core::prompts::tool_catalog(&self.tools.specs()));
@@ -1219,7 +1307,9 @@ impl ChatHandler {
                 Thinking::ServerDefault => None,
                 other => Some(other),
             });
-        if intent == Intent::Chat {
+        // 本机聊天不跑二次审阅：它会再调用一次小模型，既慢，又容易把
+        // 主回复已经产生的正文随审阅失败一起丢掉。
+        if intent == Intent::Chat && routing.spec.provider != "local" {
             runner = runner.with_deferred_questions().with_reply_review(format!(
                 "{}\n\n{}\n\n{}",
                 self.persona, self.profile_block, self.memory_block
@@ -2046,7 +2136,12 @@ mod chat_session_tests {
             let url = format!("http://{}/v1", listener.local_addr().unwrap());
             let wire = std::thread::spawn(move || {
                 let mut bodies = Vec::new();
-                for request_index in 0..if intent == Intent::Chat { 2 } else { 1 } {
+                // 本机聊天不跑二次审阅，所以只有一次请求。
+                for request_index in 0..if intent == Intent::Chat && spec.provider != "local" {
+                    2
+                } else {
+                    1
+                } {
                     let (mut stream, _) = listener.accept().unwrap();
                     stream
                         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -2079,7 +2174,7 @@ mod chat_session_tests {
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
                     bodies.push(body);
                 }
-                if intent == Intent::Chat {
+                if intent == Intent::Chat && spec.provider != "local" {
                     assert!(bodies[1].get("tools").is_none());
                 }
                 bodies.remove(0)
@@ -2168,8 +2263,54 @@ mod chat_session_tests {
                     "工具参数不能沿用服务端的随机采样默认值"
                 );
             }
-            assert_eq!(records.len(), if intent == Intent::Chat { 2 } else { 1 });
+            assert_eq!(
+                records.len(),
+                if intent == Intent::Chat && route.spec.provider != "local" {
+                    2
+                } else {
+                    1
+                }
+            );
         }
+    }
+
+    #[test]
+    fn work_identity_and_protocol_are_separate_from_companion() {
+        let mut h = handler()
+            .with_identity("工作助理", "只处理明确任务，不进行陪伴。")
+            .with_chat_protocol("WORK_PROTOCOL_SENTINEL")
+            .without_personal_context();
+        h.profile_block = "PROFILE_MARKER".into();
+        h.memory_block = "MEMORY_MARKER".into();
+        let prefix = h.expected_chat_prefix();
+        assert!(prefix.contains("工作助理"));
+        assert!(prefix.contains("WORK_PROTOCOL_SENTINEL"));
+        assert!(!prefix.contains("PROFILE_MARKER"));
+        assert!(!prefix.contains("MEMORY_MARKER"));
+    }
+
+    #[test]
+    fn route_for_spec_forces_the_selected_adapter() {
+        let h = handler();
+        let cloud = h
+            .route_for_spec(
+                "你好",
+                ReasoningEffort::Auto,
+                ModelSpec::DEEPSEEK_FLASH,
+                yunxi_bot_core::think::TaskKind::Generation,
+            )
+            .unwrap();
+        assert_eq!(cloud.spec.provider, "deepseek");
+        let local = h
+            .route_for_spec(
+                "你好",
+                ReasoningEffort::Auto,
+                ModelSpec::LOCAL_CHAT,
+                yunxi_bot_core::think::TaskKind::Conversation,
+            )
+            .unwrap();
+        assert_eq!(local.spec.provider, "local");
+        assert_eq!(local.kind, yunxi_bot_core::think::TaskKind::Conversation);
     }
 
     #[test]

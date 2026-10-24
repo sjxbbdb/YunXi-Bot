@@ -32,7 +32,7 @@ DeepSeek 凭证放在该数据目录的 `secrets/deepseek.key`（Mac 权限 0600
 curl http://127.0.0.1:17870/health
 ```
 
-聊天先由 Laya 建议回复模式；DeepSeek 根据连续对话提出工具调用，闲聊标签不会撤掉工具，执行仍通过统一审批链路。聊天和任务都调用 `deepseek-flash`。
+聊天先由 Laya 分类：聊天走本机 MLX（默认 Qwen3.5-9B，可切 Gemma 4 26B），任务走 `deepseek-flash`；两条链路使用不同系统提示词与独立会话。工作代理只接收任务正文，不加载画像/记忆/私聊历史。
 分类失败会停止本轮。默认闲聊不开思考，任务规划/分析按类型开启，显式开关优先。远端失败不会自动启动本地生成权重。
 Laya 通过 PyTorch MPS 运行；向量编码器使用 CPU。`do/resume --provider local` 已拒绝，避免轻量模式重新加载大模型。
 
@@ -48,8 +48,7 @@ Laya 通过 PyTorch MPS 运行；向量编码器使用 CPU。`do/resume --provid
 首个需要向量的任务或搜索自动拉起服务，日志在数据目录 `embedding-sidecar.log`。加载失败明确报告。
 任务上下文和知识库边界见 [任务上下文与知识库](任务上下文与知识库.md)，当前实测见 [轻量运行架构](轻量运行架构.md)。
 
-Gemma/Qwen 的已下载权重保留在磁盘，不进入主流程。仅实验时使用 `./安装Mac环境.command --local-model` 准备 MLX 与 Qwen3.5-9B，
-或手动 `./启动本地模型.command` / `think --provider local`。这会重新占用生成模型内存；不属于默认运行方式。
+Gemma/Qwen 现在是**陪伴代理的默认生成后端**。使用前运行 `./启动本地模型.command`（默认 Qwen3.5-9B；`YUNXI_COMPANION_MODEL=gemma` 切 Gemma 4 26B）。本机模型未启动时聊天会明确报错，不会回落到云端。
 
 ## 通知中心
 
