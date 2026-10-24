@@ -71,9 +71,150 @@ pub(crate) fn generation_budget_used(events: &[Event], now: u64) -> usize {
         .count()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateAction {
+    Store,
+    Skip,
+}
+
+/// Laya 门控：只判断“这轮是否值得进入长期记忆”，不做抽取。
+fn gate_memory(decider: &dyn Decider, source: &Event) -> (GateAction, String, bool) {
+    use yunxi_bot_core::decide::{DecisionRequest, Question};
+
+    let text = source.data["text"].as_str().unwrap_or("").trim();
+    if text.is_empty() {
+        return (GateAction::Skip, "empty".into(), false);
+    }
+    if contains_secret(text) {
+        return (GateAction::Skip, "sensitive_secret".into(), false);
+    }
+
+    let question = Question::choice(
+        "memory_action",
+        "这一轮陪伴对话是否值得写入长期记忆？只判断是否存储，不生成记忆正文。\
+         示例：'我对花生过敏'→store；'我喜欢你叫我杂鱼弟弟'→store；\
+         '我以后想叫你姐姐'→store；'我下周三去杭州'→store；\
+         '今天好累'→skip；'在吗'→skip。",
+        &[
+            (
+                "store",
+                "包含使用者的稳定事实、偏好、关系约定、明确要求记住的事，或以后会影响陪伴方式的经历",
+            ),
+            (
+                "skip",
+                "寒暄、临时情绪、重复内容、第三方隐私、密码/密钥/身份证等敏感信息、没有长期价值的闲聊",
+            ),
+        ],
+    );
+    let req = DecisionRequest::new(
+        serde_json::json!({
+            "owner_text": text,
+            "kind": "conversation",
+        }),
+        vec![question],
+    );
+    let cue = has_memory_cue(text);
+    match decider.decide(&req) {
+        Ok(result) => match result.choice("memory_action") {
+            Some("store") => (GateAction::Store, "laya_store".into(), false),
+            Some("skip") if cue => (GateAction::Store, "laya_skip_but_memory_cue".into(), false),
+            Some("skip") => (GateAction::Skip, "laya_skip".into(), false),
+            _ if cue => (
+                GateAction::Store,
+                "laya_invalid_but_memory_cue".into(),
+                true,
+            ),
+            _ => (GateAction::Skip, "laya_invalid_choice".into(), true),
+        },
+        Err(_) if cue => (
+            GateAction::Store,
+            "laya_unavailable_but_memory_cue".into(),
+            true,
+        ),
+        Err(e) => (GateAction::Skip, format!("laya_unavailable:{e}"), true),
+    }
+}
+
+/// 明确的一人称长期信息线索。不是替代 Laya，而是兜住小模型漏判。
+fn has_memory_cue(text: &str) -> bool {
+    [
+        "记住",
+        "以后",
+        "下次",
+        "我喜欢",
+        "我不喜欢",
+        "别叫",
+        "叫我",
+        "过敏",
+        "不能吃",
+        "我叫",
+        "我的生日",
+        "我住",
+        "我下",
+        "我要",
+        "我决定",
+        "说好",
+        "约定",
+        "答应我",
+        "讨厌",
+        "害怕",
+        "习惯",
+        "希望",
+        "受不了",
+        "想要",
+        "需要",
+        "怕",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue))
+}
+
+fn contains_secret(text: &str) -> bool {
+    [
+        "密码",
+        "密钥",
+        "私钥",
+        "身份证",
+        "银行卡",
+        "信用卡",
+        "验证码",
+        "token",
+        "secret",
+        "password",
+        "api key",
+        "助记词",
+    ]
+    .iter()
+    .any(|word| text.to_ascii_lowercase().contains(word))
+}
+
+/// 写入后立即在本地重建记忆向量；失败不影响记忆本身，召回时会再试。
+fn warm_memory_vectors(home: &std::path::Path) -> Result<(), String> {
+    use yunxi_bot_core::{memory::Memory, retrieval};
+    crate::ensure_embedding_running()?;
+    let ledger = yunxi_bot_core::ledger::Ledger::open(home.join("ledger.jsonl"))
+        .map_err(|e| e.to_string())?;
+    let now = yunxi_bot_core::now_millis().map_err(|e| e.to_string())?;
+    let memory = Memory::from_events(ledger.events());
+    let passages = retrieval::memory_passages(&memory, now, None);
+    if passages.is_empty() {
+        return Ok(());
+    }
+    retrieval::search(
+        home,
+        "memory",
+        &passages,
+        "记忆索引",
+        &retrieval::endpoint(),
+    )?;
+    Ok(())
+}
+
 pub struct CompanionWorker {
     home: PathBuf,
     thinker: Option<Arc<dyn Thinker>>,
+    /// 记忆门控：Laya 判断这轮是否值得写入长期记忆。
+    decider: Option<Arc<dyn Decider>>,
     running: Option<mpsc::Receiver<Completed>>,
     last_poll: u64,
 }
@@ -82,9 +223,16 @@ impl CompanionWorker {
         Self {
             home,
             thinker: thinker.map(|t| Arc::new(t) as Arc<dyn Thinker>),
+            decider: None,
             running: None,
             last_poll: 0,
         }
+    }
+
+    /// 挂上 Laya 门控；没有门控时保持旧的“直接提炼”行为（仅测试/兼容）。
+    pub fn with_decider(mut self, decider: Arc<dyn Decider>) -> Self {
+        self.decider = Some(decider);
+        self
     }
     pub fn poll<D: Decider>(
         &mut self,
@@ -115,11 +263,38 @@ impl CompanionWorker {
                             finish_bubble(&self.home, ledger, notifier, bubble, now)?
                         }
                         ResultKind::Memory(batch) => {
+                            let source_seq = batch.source_seq;
                             let n = c::save_consolidation(ledger, batch, now)?;
                             if n > 0 {
-                                println!(
-                                    "[陪伴] 整理了{n}条待确认记忆，可用 memory --pending 查看。"
-                                );
+                                if self.decider.is_some() {
+                                    // Laya 已判定值得存；本地模型抽取出的候选
+                                    // 直接写入，并重建记忆向量，避免只写不读。
+                                    let ids: Vec<String> = c::pending(ledger.events(), now)?
+                                        .into_iter()
+                                        .filter(|candidate| candidate.source_seq == source_seq)
+                                        .map(|candidate| candidate.id)
+                                        .collect();
+                                    for id in &ids {
+                                        c::resolve(ledger, id, true, now)?;
+                                    }
+                                    let _ = yunxi_bot_core::retrieval::clear_cache(
+                                        &self.home, "memory",
+                                    );
+                                    match warm_memory_vectors(&self.home) {
+                                        Ok(()) => println!(
+                                            "[陪伴] 已自动写入 {} 条记忆并完成本地向量化。",
+                                            ids.len()
+                                        ),
+                                        Err(e) => println!(
+                                            "[陪伴] 已自动写入 {} 条记忆；向量化暂不可用：{e}",
+                                            ids.len()
+                                        ),
+                                    }
+                                } else {
+                                    println!(
+                                        "[陪伴] 整理了{n}条待确认记忆，可用 memory --pending 查看。"
+                                    );
+                                }
                             }
                         }
                         ResultKind::Followup(generated) => {
@@ -263,6 +438,41 @@ impl CompanionWorker {
             return Ok(());
         }
         if let Some(source) = c::next_source(ledger.events(), now) {
+            // 先用 Laya 判断“值不值得存”。不可用/低置信默认跳过，
+            // 绝不因为本地判断失败而改用云端提炼。
+            let (action, gate_reason, degraded) = match self.decider.as_deref() {
+                Some(decider) => gate_memory(decider, &source),
+                None => (GateAction::Store, "no_gate".into(), false),
+            };
+            if action == GateAction::Skip {
+                ledger
+                    .append(
+                        EventKind::InfoTriaged,
+                        None,
+                        serde_json::json!({
+                            "source":"companion_memory",
+                            "source_seq":source.seq,
+                            "phase":"gate_skip",
+                            "degraded":degraded,
+                            "reason":gate_reason,
+                        }),
+                    )
+                    .map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+            ledger
+                .append(
+                    EventKind::InfoTriaged,
+                    None,
+                    serde_json::json!({
+                        "source":"companion_memory_gate",
+                        "source_seq":source.seq,
+                        "phase":"gate_store",
+                        "degraded":false,
+                        "reason":gate_reason,
+                    }),
+                )
+                .map_err(|e| e.to_string())?;
             let events = ledger.events().to_vec();
             let (tx, rx) = mpsc::channel();
             self.running = Some(rx);
@@ -1688,5 +1898,57 @@ mod native_acceptance {
             "Native delete completed for the two synthetic objects.\n",
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod t3_gate_tests {
+    use super::*;
+    use yunxi_bot_core::decide::StubDecider;
+
+    fn source(text: &str) -> Event {
+        Event {
+            seq: 7,
+            at: 1_700_000_000_000,
+            kind: EventKind::ConversationObserved,
+            span: None,
+            job: None,
+            data: serde_json::json!({"text": text, "eligible": true}),
+        }
+    }
+
+    #[test]
+    fn laya_store_is_the_only_path_to_memory() {
+        let decider = StubDecider::succeeding().with_choice("memory_action", "store");
+        let (action, reason, degraded) = gate_memory(&decider, &source("我以后想叫你姐姐。"));
+        assert_eq!(action, GateAction::Store);
+        assert!(!degraded);
+        assert_eq!(reason, "laya_store");
+    }
+
+    #[test]
+    fn laya_skip_and_invalid_choice_fail_closed() {
+        let skip = StubDecider::succeeding().with_choice("memory_action", "skip");
+        let (action, _, degraded) = gate_memory(&skip, &source("今天好累。"));
+        assert_eq!(action, GateAction::Skip);
+        assert!(!degraded);
+
+        let invalid = StubDecider::succeeding().with_choice("memory_action", "maybe");
+        let (action, reason, degraded) = gate_memory(&invalid, &source("在吗"));
+        assert_eq!(action, GateAction::Skip);
+        assert!(degraded);
+        assert_eq!(reason, "laya_invalid_choice");
+    }
+
+    #[test]
+    fn memory_cues_survive_laya_skip_but_secrets_never_do() {
+        let skip = StubDecider::succeeding().with_choice("memory_action", "skip");
+        let (action, reason, _) = gate_memory(&skip, &source("我以后想叫你姐姐。"));
+        assert_eq!(action, GateAction::Store);
+        assert_eq!(reason, "laya_skip_but_memory_cue");
+
+        let (action, reason, _) = gate_memory(&skip, &source("我的密码是 abc123。"));
+        assert_eq!(action, GateAction::Skip);
+        assert_eq!(reason, "sensitive_secret");
     }
 }

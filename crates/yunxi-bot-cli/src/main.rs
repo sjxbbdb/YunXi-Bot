@@ -1086,22 +1086,24 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         ensure_decider_running();
     }
 
+    let decision_endpoint = flag(args, "--endpoint")
+        .unwrap_or("http://127.0.0.1:17870/decide")
+        .to_string();
     let mut engine = if need_engine {
         use yunxi_bot_core::agent::agent_engine;
         use yunxi_bot_core::decide::LayaDecider;
-        let endpoint = flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide");
         if agent_on {
             println!("  Agent  : 开启（每60秒检查跟进/记忆；每15分钟Laya判断冒泡）");
         }
-        println!("  判断   : {endpoint}（本地）");
-        Some(agent_engine(LayaDecider::new(endpoint)))
+        println!("  判断   : {decision_endpoint}（本地）");
+        Some(agent_engine(LayaDecider::new(decision_endpoint.clone())))
     } else {
         None
     };
     let thinker = if agent_on {
         match yunxi_bot_core::think::client::OpenAiThinker::from_home(
             &agent_home,
-            ModelSpec::DEEPSEEK_FLASH.thinker_config(),
+            ModelSpec::LOCAL_GEMMA.thinker_config(),
         ) {
             Ok(t) => {
                 use yunxi_bot_core::think::Thinker as _;
@@ -1119,8 +1121,14 @@ fn cmd_daemon(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let mut startup_care = args.iter().any(|a| a == "--startup-care").then(|| {
         startup_care::StartupCare::new(agent_home.clone(), tooling::policy_from_args(args))
     });
-    let mut companion_worker =
-        agent_on.then(|| companion_runtime::CompanionWorker::new(agent_home.clone(), thinker));
+    let companion_decider: std::sync::Arc<dyn yunxi_bot_core::decide::Decider> =
+        std::sync::Arc::new(yunxi_bot_core::decide::LayaDecider::new(
+            decision_endpoint.clone(),
+        ));
+    let mut companion_worker = agent_on.then(|| {
+        companion_runtime::CompanionWorker::new(agent_home.clone(), thinker)
+            .with_decider(companion_decider)
+    });
     println!();
 
     // —— 助理巡览的组件 ——
