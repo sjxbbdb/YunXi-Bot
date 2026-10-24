@@ -1412,6 +1412,12 @@ impl ChatHandler {
             Intent::Chat => &chat_tools,
         };
         let mut runner = ToolRunner::new(tools, self.policy.clone(), &mut *ap, ctx)
+            // Qwen 模板不接受中途 system；工具定义已经通过 tools= 传入。
+            .without_tool_catalog_if(
+                intent == Intent::Chat
+                    && routing.spec.provider == "local"
+                    && routing.spec.model.contains("Qwen"),
+            )
             .with_max_rounds(if tools.get("computer_act").is_some() {
                 32
             } else {

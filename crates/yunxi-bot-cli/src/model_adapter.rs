@@ -20,20 +20,22 @@ pub struct ModelAdapter {
 }
 
 impl ModelAdapter {
-    /// 陪伴代理：默认 Gemma 4 26B-A4B；`YUNXI_COMPANION_MODEL=qwen` 切到 Qwen3.5-9B。
+    /// 陪伴代理：默认 Qwen3.5-9B；`YUNXI_COMPANION_MODEL=gemma` 切到 Gemma 4 26B-A4B。
     pub fn companion() -> Self {
         let env = std::env::var("YUNXI_COMPANION_MODEL").unwrap_or_default();
         let (spec, label) = match env.as_str() {
+            "gemma" | "gemma4" => (ModelSpec::LOCAL_GEMMA, "Gemma 4 26B-A4B（本机）"),
             "qwen" | "qwen3.5" => (ModelSpec::LOCAL_CHAT, "Qwen3.5-9B（本机）"),
             "qwen38" | "qwen3.8" => (ModelSpec::LOCAL_QWEN38, "Qwen3.8-27B（本机）"),
             "qwen38u" | "uncensored" => (
                 ModelSpec::LOCAL_QWEN38_UNCENSORED,
                 "Qwen3.8-27B Uncensored（本机）",
             ),
-            _ => (ModelSpec::LOCAL_GEMMA, "Gemma 4 26B-A4B（本机）"),
+            _ => (ModelSpec::LOCAL_CHAT, "Qwen3.5-9B（本机）"),
         };
-        // Qwen3.8 的本地工具协议尚未实测；先走自动召回，测完再决定是否挂工具。
-        let tools = spec.model == ModelSpec::LOCAL_GEMMA.model;
+        // Gemma 与 Qwen3.5-9B 的本地工具协议都已实测；Qwen3.8 uncensored 仍不挂工具。
+        let tools =
+            spec.model == ModelSpec::LOCAL_GEMMA.model || spec.model == ModelSpec::LOCAL_CHAT.model;
         Self {
             role: "companion",
             label,
@@ -93,12 +95,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn companion_defaults_to_local_gemma() {
+    fn companion_defaults_to_qwen_chat() {
         let adapter = ModelAdapter::companion();
         assert!(adapter.local);
         assert!(adapter.tools);
         assert_eq!(adapter.spec.provider, "local");
-        assert_eq!(adapter.spec.model, "gemma-4-26B-A4B-it-qat-4bit");
+        assert_eq!(adapter.spec.model, "Qwen3.5-9B-4bit");
     }
 
     #[test]

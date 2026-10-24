@@ -269,6 +269,9 @@ pub struct ToolRunner<'a> {
     /// `None` 表示不指定（不发这个字段），**不是"关"**。
     thinking: Option<crate::think::Thinking>,
     defer_questions: bool,
+    /// 是否把工具目录作为第二条 system 消息插入。Qwen 模板要求 system 只能在
+    /// 最前，工具定义又已经通过 `tools=` 传入；本地链路要关掉。
+    include_tool_catalog: bool,
     /// 工具调用的去处。`None` 表示不记录——**测试与纯计算场景的显式选择**。
     sink: Option<std::sync::Arc<dyn ToolCallSink>>,
     /// 正文增量的去处。`None` 表示不流式（一次性拿到完整正文）。
@@ -412,6 +415,7 @@ impl<'a> ToolRunner<'a> {
             ctx,
             thinking: None,
             defer_questions: false,
+            include_tool_catalog: true,
             sink: None,
             on_delta: None,
             // **不挂就是不记。** 默认塞一本"丢掉一切"的假台账会更坏：
@@ -424,6 +428,20 @@ impl<'a> ToolRunner<'a> {
     }
 
     /// 配合 AskUserTool::deferred 让出当前轮，同批动作不能使用尚未得到的答案。
+    /// 不插入工具目录 system 消息；工具定义仍通过请求的 `tools` 字段传入。
+    pub fn without_tool_catalog(mut self) -> Self {
+        self.include_tool_catalog = false;
+        self
+    }
+
+    /// 条件版本，避免在 Handler 里写两套 builder。
+    pub fn without_tool_catalog_if(mut self, skip: bool) -> Self {
+        if skip {
+            self.include_tool_catalog = false;
+        }
+        self
+    }
+
     pub fn with_deferred_questions(mut self) -> Self {
         self.defer_questions = true;
         self
@@ -558,7 +576,7 @@ impl<'a> ToolRunner<'a> {
             }
             // 不存入历史；下一次调用按当前注册表替换整份目录。
             // 纯规划没有执行工具，不能用空目录否定其后续执行阶段的能力参考。
-            if !specs.is_empty() {
+            if self.include_tool_catalog && !specs.is_empty() {
                 messages.insert(1, Message::system(catalog.clone()));
             }
             if let Some(material) = progress.evidence_message() {

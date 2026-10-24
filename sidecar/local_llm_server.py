@@ -1258,8 +1258,6 @@ class Handler(BaseHTTPRequestHandler):
                 for t in tools
             )):
                 raise ValueError("tools 必须是带 function.name 的数组")
-            if tools and _model_name == "Qwen3.5-9B-4bit":
-                raise ValueError("本地 Qwen 仅提供聊天，不接受工具；助理任务请路由 DeepSeek")
         except Exception as e:  # noqa: BLE001
             self._send(400, {"error": f"bad request: {e}"})
             return

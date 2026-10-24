@@ -56,24 +56,39 @@ def render_prompt(tokenizer, messages, tools, thinking, reminder):
     if tools and (reminder not in prompt or any(
         tool["function"]["name"] not in prompt for tool in tools
     )):
-        raise ValueError("Gemma 模板未包含完整工具说明")
+        raise ValueError("聊天模板未包含完整工具说明")
     return prompt
 
 
-def parse_call(body, tools):
+def parse_call(body, tools, family="gemma"):
     if not tools:
         raise ValueError("本轮没有工具权限，拒绝模型生成的调用")
+    allowed = {tool["function"]["name"] for tool in tools or []}
+    if family == "qwen":
+        from mlx_lm.tool_parsers import qwen3_coder
+
+        call = qwen3_coder.parse_tool_call(body.strip(), tools)
+        if not isinstance(call, dict):
+            raise ValueError("Qwen 工具调用不是 JSON 对象")
+        name = call.get("name")
+        args = call.get("arguments", {})
+        if name not in allowed or not isinstance(args, dict):
+            raise ValueError("Qwen 返回未知工具或非法参数")
+        return [(name, json.dumps(args, ensure_ascii=False, allow_nan=False))]
     from mlx_lm.tool_parsers import gemma4
 
     # 上游解析器用 finditer，会忽略调用前后的坏数据；必须先要求完整匹配。
-    # 此私有语法随 mlx-lm==0.32.0 固定，升级时由碎片/坏调用测试守住。
     if not gemma4._tool_call_regex.fullmatch(body.strip()):
         raise ValueError("Gemma 工具调用不完整或含多余内容")
     call = gemma4.parse_tool_call(body)
-    allowed = {tool["function"]["name"] for tool in tools or []}
     if call["name"] not in allowed or not isinstance(call["arguments"], dict):
         raise ValueError("Gemma 返回未知工具或非法参数")
     return [(call["name"], json.dumps(call["arguments"], ensure_ascii=False, allow_nan=False))]
+
+
+def _tool_family(tokenizer) -> str:
+    name = str(getattr(tokenizer, "name_or_path", "")).lower()
+    return "qwen" if "qwen" in name else "gemma"
 
 
 def split_stream(pieces, tokenizer, prompt, tools, thinking=True):
@@ -100,7 +115,7 @@ def split_stream(pieces, tokenizer, prompt, tools, thinking=True):
                         buffer = buffer[-hold:] if hold else ""
                     break
                 body, buffer = buffer[:pos], buffer[pos + len(end):]
-                yield state, parse_call(body, tools) if state == "tool_call" else body
+                yield state, parse_call(body, tools, _tool_family(tokenizer)) if state == "tool_call" else body
                 state, end = "delta", None
                 continue
             found = [(buffer.find(m), m) for m in markers if m in buffer]
