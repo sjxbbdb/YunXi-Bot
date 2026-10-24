@@ -77,10 +77,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_chat_protocol_has_no_tool_or_task_instructions() {
+    fn local_chat_protocol_is_read_only_and_tool_scoped() {
         let p = local_chat_protocol();
-        assert!(p.contains("没有工具"));
-        assert!(p.contains("不要输出工具调用"));
+        assert!(p.contains("memory_search"));
+        assert!(p.contains("knowledge_search"));
+        assert!(p.contains("只读"));
+        assert!(p.contains("没有写入"));
         assert!(!p.contains("mail_send"));
         assert!(!p.contains("WORK_PROTOCOL"));
     }
