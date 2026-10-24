@@ -67,6 +67,73 @@ pub struct RecallSource {
 /// 生成决策选项用的系统提示词。
 pub const OPTIONS_SYSTEM: &str = yunxi_bot_core::prompts::OPTIONS;
 
+/// 只从用户明确说出的“我叫 X / 以后叫我 X”里取名字；不猜、不补全。
+fn extract_explicit_name(input: &str) -> Option<String> {
+    for marker in ["以后你就叫我", "以后叫我", "以后叫", "我叫", "叫我"] {
+        if let Some(pos) = input.find(marker) {
+            let rest = input[pos + marker.len()..].trim_start();
+            let name: String = rest
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !"，。,.!?！？、；;：:".contains(*c))
+                .take(20)
+                .collect();
+            if name.is_empty()
+                || name.starts_with("什么")
+                || name.starts_with("啥")
+                || name.starts_with("哪")
+                || name.starts_with("谁")
+                || name == "我"
+            {
+                continue;
+            }
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn asks_user_name(input: &str) -> bool {
+    ["我叫什么", "我叫啥", "我的名字", "我叫什么名字"]
+        .iter()
+        .any(|cue| input.contains(cue))
+}
+
+fn asks_past_memory(input: &str) -> bool {
+    [
+        "还记得",
+        "记得",
+        "上次",
+        "以前",
+        "之前",
+        "我说过",
+        "我告诉过你",
+        "你忘了",
+    ]
+    .iter()
+    .any(|cue| input.contains(cue))
+}
+
+fn asks_realtime_info(input: &str) -> bool {
+    [
+        "天气",
+        "气温",
+        "下雨",
+        "新闻",
+        "股价",
+        "股票",
+        "汇率",
+        "房价",
+        "票价",
+        "比分",
+        "赛事",
+        "最新版本",
+        "今天几号",
+        "现在几点",
+    ]
+    .iter()
+    .any(|cue| input.contains(cue))
+}
+
 /// 问题/查资料类输入才触发知识召回；闲聊不硬塞知识库。
 fn knowledge_recall_gate(input: &str) -> bool {
     [
@@ -184,6 +251,8 @@ pub struct ChatHandler {
     local_tools_enabled: bool,
     /// 本轮召回来源；每轮开始清空。
     last_recall: Vec<RecallSource>,
+    /// 用户在**本会话**明确说出的名字。只由确定性解析写入，不交给模型猜。
+    explicit_user_name: Option<String>,
     /// 对话会话的稳定前缀。**提前算好**——载入会话时要拿它和存档里的
     /// 指纹比，而"先建会话再比"会覆盖掉存档里的指纹。
     /// 常驻记忆段（构造时定下）。**单独存着**，因为它要拼进稳定前缀，
@@ -344,6 +413,7 @@ impl ChatHandler {
             include_project_rules: true,
             local_tools_enabled: false,
             last_recall: Vec::new(),
+            explicit_user_name: None,
             tools: ToolRegistry::new(),
             approver: std::sync::Arc::new(std::sync::Mutex::new(RefusingApprover)),
             decider: None,
@@ -567,6 +637,19 @@ impl ChatHandler {
         })?;
         let source_seq = continuity::observe_user(&mut ledger, input)
             .map_err(|e| TaskError::NeedsHuman { reason: e })?;
+        // 身份是确定性事实：只从用户明确说出的句子写入，直接由外层应答。
+        if let Some(name) = extract_explicit_name(input) {
+            self.explicit_user_name = Some(name.clone());
+            if !asks_user_name(input) {
+                return Ok(format!("好，{name}。记住了。"));
+            }
+        }
+        if asks_user_name(input) {
+            return Ok(match &self.explicit_user_name {
+                Some(name) => format!("你叫{name}。"),
+                None => "这边没有你的名字记录。你愿意现在告诉我吗？".to_string(),
+            });
+        }
         if self.personal_context {
             self.refresh_identity(&Memory::from_events(ledger.events()))
                 .map_err(|e| TaskError::NeedsHuman { reason: e })?;
@@ -613,6 +696,23 @@ impl ChatHandler {
         let work_knowledge = self.work_knowledge_context(input);
         let companion_knowledge = self.companion_knowledge_context(input);
         let knowledge = format!("{work_knowledge}{companion_knowledge}");
+        // 外部事实守卫：不交给模型自由生成。
+        if asks_past_memory(input)
+            && !self
+                .last_recall
+                .iter()
+                .any(|source| source.kind == "memory")
+        {
+            return Ok("这边没有关于这件事的记忆记录。你愿意现在告诉我吗？".to_string());
+        }
+        if asks_realtime_info(input)
+            && !self
+                .last_recall
+                .iter()
+                .any(|source| source.kind == "knowledge")
+        {
+            return Ok("本机陪伴没有联网工具，实时信息我无法核实。".to_string());
+        }
         let notices = if self.personal_context {
             continuity::recent_notices(ledger.events(), now_ms)
         } else {
@@ -623,14 +723,27 @@ impl ChatHandler {
         } else {
             input.to_string()
         };
+        let evidence = if self.last_recall.is_empty() {
+            "【长期证据：无。没有检索到长期记忆或知识；不要声称记得、上次说过、以前发生过。只能依据本会话历史。】"
+        } else {
+            "【长期证据：仅限上文列出的记忆/知识来源；不要补写未列出的过去。】"
+        };
         let volatile = format!(
-            "【本轮本机时间：{}；真实用户输入来源序号：{source_seq}】\n{notices}{semantic}{knowledge}\n{recalled}",
+            "【本轮本机时间：{}；真实用户输入来源序号：{source_seq}】\n{evidence}\n【联网能力：无。实时信息无法核实，不要猜。】\n{notices}{semantic}{knowledge}\n{recalled}",
             now.with_timezone(&chrono::Local).to_rfc3339()
         );
         // 本机小模型的首 token 与显存都更紧，聊天给它更小的输出预算；
         // 工作代理仍保留完整的 4096，避免任务说明被截断。
         let max_tokens = if routing.spec.provider == "local" {
-            1024
+            // thinking 模式才需要更大预算；默认聊天保持原预算，避免卡死。
+            if std::env::var("YUNXI_LOCAL_THINKING")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+            {
+                4096
+            } else {
+                1024
+            }
         } else {
             CHAT_MAX_TOKENS
         };
@@ -1411,6 +1524,11 @@ impl ChatHandler {
             Intent::Step => &self.tools,
             Intent::Chat => &chat_tools,
         };
+        let local_chat = intent == Intent::Chat && routing.spec.provider == "local";
+        let local_thinking = local_chat
+            && std::env::var("YUNXI_LOCAL_THINKING")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
         let mut runner = ToolRunner::new(tools, self.policy.clone(), &mut *ap, ctx)
             // Qwen 模板不接受中途 system；工具定义已经通过 tools= 传入。
             .without_tool_catalog_if(
@@ -1425,10 +1543,17 @@ impl ChatHandler {
             })
             // **把路由的思考决定带进工具循环。** 忘了这一步，"复杂任务开思考"
             // 就只在没有工具的那条路径上成立——而几乎每条路径都有工具。
-            .with_thinking(match routing.thinking_field() {
-                Thinking::ServerDefault => None,
-                other => Some(other),
-            });
+            .with_thinking(
+                match if local_thinking {
+                    // 显式开启才进入 thinking；默认关闭，否则 9B+完整人格会耗尽输出预算。
+                    Thinking::Enabled
+                } else {
+                    routing.thinking_field()
+                } {
+                    Thinking::ServerDefault => None,
+                    other => Some(other),
+                },
+            );
         // 本机聊天不跑二次审阅：它会再调用一次小模型，既慢，又容易把
         // 主回复已经产生的正文随审阅失败一起丢掉。
         if intent == Intent::Chat && routing.spec.provider != "local" {
@@ -2529,6 +2654,23 @@ mod chat_session_tests {
         assert!(prefix.contains("WORK_PROTOCOL_SENTINEL"));
         assert!(!prefix.contains("PROFILE_MARKER"));
         assert!(!prefix.contains("MEMORY_MARKER"));
+    }
+
+    #[test]
+    fn explicit_name_is_extracted_without_guessing() {
+        assert_eq!(extract_explicit_name("我叫阿岚。"), Some("阿岚".into()));
+        assert_eq!(extract_explicit_name("以后叫我小岚。"), Some("小岚".into()));
+        assert_eq!(extract_explicit_name("我叫什么？"), None);
+        assert_eq!(extract_explicit_name("今天有点累"), None);
+    }
+
+    #[test]
+    fn external_guards_only_fire_on_their_own_intent() {
+        assert!(asks_user_name("我叫什么？"));
+        assert!(asks_past_memory("你还记得我讨厌香菜吗？"));
+        assert!(asks_realtime_info("北京今天天气怎么样？"));
+        assert!(!asks_realtime_info("今天有点累"));
+        assert!(!asks_past_memory("今天有点累"));
     }
 
     #[test]
