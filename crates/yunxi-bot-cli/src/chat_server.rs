@@ -112,10 +112,10 @@ fn start_local_model(home: &std::path::Path) -> LocalModelGuard {
         return LocalModelGuard(None);
     }
     let env_model = std::env::var("YUNXI_COMPANION_MODEL").unwrap_or_default();
-    let model = if matches!(env_model.as_str(), "gemma" | "gemma4") {
-        "gemma-4-26B-A4B-it-qat-4bit"
-    } else {
+    let model = if matches!(env_model.as_str(), "qwen" | "qwen3.5") {
         "Qwen3.5-9B-4bit"
+    } else {
+        "gemma-4-26B-A4B-it-qat-4bit"
     };
     let log = std::fs::File::create(home.join("local-model.log"))
         .map(std::process::Stdio::from)
@@ -195,6 +195,7 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         crate::chat_handler::default_rules(),
     )
     .with_chat_protocol(yunxi_bot_core::prompts::local_chat_protocol())
+    .without_project_rules()
     .with_decider(decider.clone());
 
     let mut tool_descriptions: Vec<ToolDescription> = Vec::new();

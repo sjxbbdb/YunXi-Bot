@@ -20,12 +20,12 @@ pub struct ModelAdapter {
 }
 
 impl ModelAdapter {
-    /// 陪伴代理：默认 Qwen3.5-9B；`YUNXI_COMPANION_MODEL=gemma` 切到 Gemma 4 26B。
+    /// 陪伴代理：默认 Gemma 4 26B-A4B；`YUNXI_COMPANION_MODEL=qwen` 切到 Qwen3.5-9B。
     pub fn companion() -> Self {
         let env = std::env::var("YUNXI_COMPANION_MODEL").unwrap_or_default();
         let (spec, label) = match env.as_str() {
-            "gemma" | "gemma4" => (ModelSpec::LOCAL_GEMMA, "Gemma 4 26B-A4B（本机）"),
-            _ => (ModelSpec::LOCAL_CHAT, "Qwen3.5-9B（本机）"),
+            "qwen" | "qwen3.5" => (ModelSpec::LOCAL_CHAT, "Qwen3.5-9B（本机）"),
+            _ => (ModelSpec::LOCAL_GEMMA, "Gemma 4 26B-A4B（本机）"),
         };
         Self {
             role: "companion",
@@ -53,11 +53,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn companion_defaults_to_local_qwen() {
+    fn companion_defaults_to_local_gemma() {
         let adapter = ModelAdapter::companion();
         assert!(adapter.local);
         assert!(!adapter.tools);
         assert_eq!(adapter.spec.provider, "local");
+        assert_eq!(adapter.spec.model, "gemma-4-26B-A4B-it-qat-4bit");
     }
 
     #[test]

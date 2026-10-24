@@ -127,6 +127,8 @@ pub struct ChatHandler {
     chat_protocol_override: Option<String>,
     /// 是否注入使用者的画像/记忆/召回。工作代理必须为 false。
     personal_context: bool,
+    /// 是否把项目规则拼进稳定前缀。工作使用；本机陪伴闲聊不需要。
+    include_project_rules: bool,
     /// 对话会话的稳定前缀。**提前算好**——载入会话时要拿它和存档里的
     /// 指纹比，而"先建会话再比"会覆盖掉存档里的指纹。
     /// 常驻记忆段（构造时定下）。**单独存着**，因为它要拼进稳定前缀，
@@ -284,6 +286,7 @@ impl ChatHandler {
             persona_defaults,
             chat_protocol_override: None,
             personal_context: true,
+            include_project_rules: true,
             tools: ToolRegistry::new(),
             approver: std::sync::Arc::new(std::sync::Mutex::new(RefusingApprover)),
             decider: None,
@@ -364,6 +367,13 @@ impl ChatHandler {
     /// 替换 Chat 意图的固定协议；工作代理用专业协议，陪伴代理不设置。
     pub fn with_chat_protocol(mut self, protocol: impl Into<String>) -> Self {
         self.chat_protocol_override = Some(protocol.into());
+        self
+    }
+
+    /// 本机陪伴不拼项目规则（AGENTS.md 等）；这些规则服务编码任务，
+    /// 对闲聊只会占用前缀并干扰人格。
+    pub fn without_project_rules(mut self) -> Self {
+        self.include_project_rules = false;
         self
     }
 
@@ -1016,10 +1026,12 @@ impl ChatHandler {
                 out.push_str(&self.memory_block);
             }
         }
-        let rules_text = self.project_rules.render();
-        if !rules_text.is_empty() {
-            out.push_str("\n\n");
-            out.push_str(&rules_text);
+        if self.include_project_rules {
+            let rules_text = self.project_rules.render();
+            if !rules_text.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(&rules_text);
+            }
         }
         out.push_str("\n\n# 本阶段输出协议\n");
         if intent == Intent::Chat {
