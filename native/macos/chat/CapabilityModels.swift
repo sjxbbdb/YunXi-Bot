@@ -172,7 +172,16 @@ struct ServiceInfo: Codable, Identifiable {
     let listening: Bool
 }
 
+struct CompanionInfo: Codable {
+    let localListening: Bool
+    let localModelState: String
+    let lastMemoryAt: Double?
+    let lastKnowledgeAt: Double?
+    let pendingMemories: Int
+}
+
 struct SystemInfo: Codable {
+    let companion: CompanionInfo?
     let daemon: DaemonInfo
     let autostart: AutostartInfo
     let services: [ServiceInfo]

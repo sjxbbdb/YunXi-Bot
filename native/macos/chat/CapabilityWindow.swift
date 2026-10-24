@@ -379,6 +379,14 @@ final class SettingsWindowController: NSWindowController, NSOutlineViewDataSourc
             row("值守进程", (c.system.daemon.alive ? "运行中" : "未运行") + (c.system.daemon.pid.map { " · pid \($0)" } ?? "")),
             row("登录自启", c.system.autostart.registered ? "已注册" : "未注册"),
         ])
+        if let companion = c.system.companion {
+            addGroup("本机陪伴", rows: [
+                row("本机模型", companion.localModelState),
+                row("上次记忆整理", timestamp(companion.lastMemoryAt)),
+                row("上次知识入库", timestamp(companion.lastKnowledgeAt)),
+                row("待确认记忆", "\(companion.pendingMemories) 条"),
+            ])
+        }
         addGroup("本地服务", rows: c.system.services.map { service in
             row(service.name, service.listening ? "已监听 : \(service.port)" : "未启动（按需）")
         })
@@ -476,6 +484,11 @@ final class SettingsWindowController: NSWindowController, NSOutlineViewDataSourc
         button.bezelStyle = .rounded
         button.controlSize = .small
         return button
+    }
+
+    private func timestamp(_ millis: Double?) -> String {
+        guard let millis else { return "还没有" }
+        return Self.dateFormatter.string(from: Date(timeIntervalSince1970: millis / 1000))
     }
 
     private func bytes(_ value: Int) -> String {

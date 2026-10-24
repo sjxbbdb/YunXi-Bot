@@ -575,6 +575,11 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 match result {
                     Ok(reply) => {
                         turns += 1;
+                        let recall = if is_chat {
+                            companion.last_recall()
+                        } else {
+                            Vec::new()
+                        };
                         if is_chat {
                             if let Err(e) =
                                 crate::chat::persist(&companion, &store, &session_id, turns, 0)
@@ -599,6 +604,20 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                         write_event(
                             json!({"type":"reply","text":reply,"session":session_id,"turns":turns}),
                         );
+                        if !recall.is_empty() {
+                            let items: Vec<Value> = recall
+                                .into_iter()
+                                .map(|item| {
+                                    json!({
+                                        "kind": item.kind,
+                                        "id": item.id,
+                                        "source": item.source,
+                                        "score": item.score,
+                                    })
+                                })
+                                .collect();
+                            write_event(json!({"type":"recall","items":items}));
+                        }
                         write_event(sessions_event(&home, &store));
                     }
                     Err(e) => {
@@ -983,6 +1002,38 @@ fn capabilities_event(ctx: &CapabilityContext<'_>) -> Value {
         })
         .unwrap_or(0);
     let mail_configured = home.join("mac-mail.json").exists();
+    let local_listening = port_listening(17872);
+    let local_model_state = if !local_listening {
+        "未启动"
+    } else {
+        match yunxi_bot_core::decide::http::get_json("http://127.0.0.1:17872/health", 800) {
+            Ok(raw) => match serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|v| v["status"].as_str().map(str::to_string))
+                .as_deref()
+            {
+                Some("ok") => "已就绪",
+                Some("idle") => "已闲置（权重已释放）",
+                Some("loading") => "加载中",
+                _ => "监听中",
+            },
+            Err(_) => "监听中",
+        }
+    };
+    let last_memory_at = events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::InfoTriaged && e.data["source"] == "companion_memory")
+        .map(|e| e.at);
+    let last_knowledge_at = events
+        .iter()
+        .rev()
+        .find(|e| {
+            e.kind == EventKind::InfoTriaged
+                && e.data["source"] == "companion_knowledge"
+                && e.data["phase"] == "imported"
+        })
+        .map(|e| e.at);
     let services = vec![
         json!({"name": "Laya 决策服务", "port": 17870, "listening": port_listening(17870)}),
         json!({"name": "EmbeddingGemma 2", "port": 17873, "listening": port_listening(17873)}),
@@ -1053,6 +1104,13 @@ fn capabilities_event(ctx: &CapabilityContext<'_>) -> Value {
                 "currency": "CNY",
             },
             "system": {
+                "companion": {
+                    "local_listening": local_listening,
+                    "local_model_state": local_model_state,
+                    "last_memory_at": last_memory_at,
+                    "last_knowledge_at": last_knowledge_at,
+                    "pending_memories": pending.len(),
+                },
                 "daemon": {
                     "pid": daemon_pid,
                     "alive": daemon_alive,

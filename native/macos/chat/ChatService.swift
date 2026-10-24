@@ -20,6 +20,13 @@ struct ChatSession: Identifiable, Equatable {
 }
 
 /// 等待用户决定的工具审批。
+struct RecallItem: Decodable {
+    let kind: String
+    let id: String
+    let source: String
+    let score: Double
+}
+
 struct PendingApproval: Identifiable, Equatable {
     let id: Int
     let tool: String
@@ -244,6 +251,26 @@ final class ChatService: ObservableObject {
             modelInfo = (local ? "本机 · " : "云端 · ") + model + (thinking ? " · 思考" : "")
         case "reply":
             finishReply(object["text"] as? String ?? "")
+        case "recall":
+            let rawItems = object["items"] as? [[String: Any]] ?? []
+            let items = rawItems.compactMap { item -> RecallItem? in
+                guard let kind = item["kind"] as? String,
+                      let id = item["id"] as? String,
+                      let source = item["source"] as? String else { return nil }
+                return RecallItem(kind: kind, id: id, source: source, score: item["score"] as? Double ?? 0)
+            }
+            if !items.isEmpty {
+                let lines = items.prefix(5).map { item in
+                    let label = item.kind == "memory" ? "记忆" : "知识"
+                    let source = item.source.split(separator: "/").last.map(String.init) ?? item.source
+                    return "\(label) · \(source) · \(item.id)"
+                }
+                messages.append(ChatMessage(
+                    role: .system,
+                    text: "本轮召回：\n" + lines.joined(separator: "\n"),
+                    at: Date()
+                ))
+            }
         case "error":
             busy = false
             streamingID = nil
