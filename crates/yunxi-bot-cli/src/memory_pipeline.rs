@@ -11,7 +11,10 @@ use yunxi_bot_core::decide::Decider;
 use yunxi_bot_core::think::Thinker;
 use yunxi_bot_core::{EventKind, Ledger};
 
-use crate::companion_runtime::{GateAction, gate_memory, warm_memory_vectors};
+use crate::companion_runtime::{
+    GateAction, KnowledgeAction, clean_knowledge_text, gate_knowledge, gate_memory,
+    warm_knowledge_vectors, warm_memory_vectors,
+};
 
 #[derive(Debug)]
 pub enum MemoryOutcome {
@@ -25,6 +28,8 @@ pub enum MemoryOutcome {
     Skipped,
     /// 已写入并尝试向量化。
     Stored { count: usize, vectorized: bool },
+    /// 已写入知识库并尝试向量化。
+    KnowledgeStored { id: String, vectorized: bool },
     /// 抽取失败；来源保留给下次重试。
     Failed(String),
 }
@@ -107,6 +112,55 @@ impl MemoryPipeline {
                 "reason":reason,
             }),
         );
+        let (knowledge_action, knowledge_reason, knowledge_degraded) =
+            gate_knowledge(&*self.decider, &source);
+        let _ = ledger.append(
+            EventKind::InfoTriaged,
+            None,
+            serde_json::json!({
+                "source":"companion_knowledge_gate",
+                "source_seq":source.seq,
+                "phase":"gate_store",
+                "degraded":knowledge_degraded,
+                "reason":knowledge_reason,
+            }),
+        );
+        if knowledge_action == KnowledgeAction::Knowledge {
+            let text = clean_knowledge_text(source.data["text"].as_str().unwrap_or(""));
+            let label = format!("conversation#{}", source.seq);
+            let id = match yunxi_bot_core::retrieval::import_text(&self.home, &label, &text) {
+                Ok(id) => id,
+                Err(e) => return MemoryOutcome::Failed(format!("知识入库失败: {e}")),
+            };
+            let _ = ledger.append(
+                EventKind::InfoTriaged,
+                None,
+                serde_json::json!({
+                    "source":"companion_knowledge",
+                    "source_seq":source.seq,
+                    "phase":"imported",
+                    "id":id,
+                    "degraded":false,
+                    "reason":knowledge_reason,
+                }),
+            );
+            // 标记该对话已处理，避免下一轮又被记忆流水线捡起。
+            let _ = ledger.append(
+                EventKind::InfoTriaged,
+                None,
+                serde_json::json!({
+                    "source":"companion_memory",
+                    "source_seq":source.seq,
+                    "phase":"gate_knowledge",
+                    "degraded":false,
+                    "reason":knowledge_reason,
+                }),
+            );
+            let _ = yunxi_bot_core::retrieval::clear_cache(&self.home, "knowledge");
+            let vectorized = warm_knowledge_vectors(&self.home).is_ok();
+            return MemoryOutcome::KnowledgeStored { id, vectorized };
+        }
+
         let batch = yunxi_bot_core::continuity::consolidate(&*self.thinker, &source, &events, now);
         let source_seq = batch.source_seq;
         let n = match yunxi_bot_core::continuity::save_consolidation(&mut ledger, batch, now) {

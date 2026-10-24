@@ -129,6 +129,44 @@ pub fn import_document(home: &Path, path: &Path) -> Result<String, String> {
     Ok(id)
 }
 
+/// 把一段对话中抽出的知识写成知识副本。
+///
+/// 来源必须是稳定标识（例如 `conversation#42`）；同内容已在库中时直接返回原 id，
+/// 同一来源不允许被两段不同内容覆盖。这样自动入库可去重、可追溯。
+pub fn import_text(home: &Path, source: &str, text: &str) -> Result<String, String> {
+    if source.trim().is_empty() {
+        return Err("知识来源不能为空".into());
+    }
+    if text.trim().is_empty() {
+        return Err("知识内容为空".into());
+    }
+    if text.len() > 2 * 1024 * 1024 {
+        return Err("知识内容超过2MiB".into());
+    }
+    let normalized = text.trim();
+    // 同内容跨来源去重：不重复占用向量和召回槽。
+    for (id, doc) in documents(home)? {
+        if doc.text.trim() == normalized {
+            return Ok(id);
+        }
+    }
+    let id = source_id(source);
+    let target = home.join("knowledge/documents").join(format!("{id}.json"));
+    if target.exists() {
+        let existing: Document = read_json(&target)?;
+        return Err(format!("知识来源已存在且内容不同：{}", existing.source));
+    }
+    write_json(
+        &target,
+        &Document {
+            version: 1,
+            source: source.to_string(),
+            text: normalized.to_string(),
+        },
+    )?;
+    Ok(id)
+}
+
 pub fn documents(home: &Path) -> Result<Vec<(String, Document)>, String> {
     let dir = home.join("knowledge/documents");
     let mut files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
@@ -538,6 +576,20 @@ mod tests {
         remove_document(&p, &id).unwrap();
         assert_eq!(std::fs::read_to_string(src).unwrap(), "更新");
         assert!(documents(&p).unwrap().is_empty());
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn conversation_knowledge_is_deduped_and_source_protected() {
+        let p = temp("conversation-knowledge");
+        let first = import_text(&p, "conversation#7", "HTTP 默认端口是 80。").unwrap();
+        assert_eq!(
+            first,
+            import_text(&p, "conversation#8", "HTTP 默认端口是 80。").unwrap()
+        );
+        assert_eq!(documents(&p).unwrap().len(), 1);
+        assert!(import_text(&p, "conversation#7", "不同的知识").is_err());
+        assert_eq!(documents(&p).unwrap()[0].1.source, "conversation#7");
         std::fs::remove_dir_all(p).unwrap();
     }
 }

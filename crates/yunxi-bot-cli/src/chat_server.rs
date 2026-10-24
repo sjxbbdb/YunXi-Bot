@@ -230,6 +230,16 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                                     }
                                 );
                             }
+                            MemoryOutcome::KnowledgeStored { id, vectorized } => {
+                                eprintln!(
+                                    "[陪伴知识] 空闲整理写入知识 {id}，向量化{}",
+                                    if vectorized {
+                                        "完成"
+                                    } else {
+                                        "失败（下次召回重试）"
+                                    }
+                                );
+                            }
                             MemoryOutcome::Failed(e) => eprintln!("[陪伴记忆] 空闲整理失败：{e}"),
                             // Idle/Busy/Unavailable 都是等待，不刷日志。
                             _ => {}

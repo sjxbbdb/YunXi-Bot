@@ -188,6 +188,128 @@ fn contains_secret(text: &str) -> bool {
     .any(|word| text.to_ascii_lowercase().contains(word))
 }
 
+/// 第二轮门控：Store 的内容该进个人记忆，还是可复用知识库。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KnowledgeAction {
+    Memory,
+    Knowledge,
+}
+
+pub(crate) fn gate_knowledge(
+    decider: &dyn Decider,
+    source: &Event,
+) -> (KnowledgeAction, String, bool) {
+    use yunxi_bot_core::decide::{DecisionRequest, Question};
+
+    let text = source.data["text"].as_str().unwrap_or("").trim();
+    if text.is_empty() {
+        return (KnowledgeAction::Memory, "empty".into(), false);
+    }
+    let explicit_knowledge = [
+        "知识库",
+        "知识",
+        "资料",
+        "文档",
+        "以后查",
+        "查资料",
+        "教程",
+        "原理",
+        "定义",
+        "步骤",
+        "怎么设置",
+        "配置说明",
+        "端口",
+        "协议",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue));
+    let question = Question::choice(
+        "knowledge_action",
+        "这条值得保存的内容，是使用者的个人记忆，还是可复用的知识库资料？\
+         示例：'我对花生过敏'→memory；'我喜欢你叫我姐姐'→memory；\
+         'HTTP 默认端口是 80'→knowledge；'记住这个知识：部署步骤是……'→knowledge。",
+        &[
+            (
+                "memory",
+                "关于使用者本人或其关系的稳定事实、偏好、约定、经历",
+            ),
+            (
+                "knowledge",
+                "可脱离这个人复用的事实、定义、步骤、教程、外部资料或明确要求存入知识库的内容",
+            ),
+        ],
+    );
+    let req = DecisionRequest::new(
+        serde_json::json!({"owner_text": text, "kind": "conversation"}),
+        vec![question],
+    );
+    match decider.decide(&req) {
+        Ok(result) => match result.choice("knowledge_action") {
+            Some("knowledge") => (KnowledgeAction::Knowledge, "laya_knowledge".into(), false),
+            Some("memory") if explicit_knowledge => (
+                KnowledgeAction::Knowledge,
+                "laya_memory_but_explicit_knowledge_cue".into(),
+                false,
+            ),
+            Some("memory") => (KnowledgeAction::Memory, "laya_memory".into(), false),
+            _ if explicit_knowledge => (
+                KnowledgeAction::Knowledge,
+                "laya_invalid_but_explicit_knowledge_cue".into(),
+                true,
+            ),
+            _ => (KnowledgeAction::Memory, "laya_invalid_memory".into(), true),
+        },
+        Err(_) if explicit_knowledge => (
+            KnowledgeAction::Knowledge,
+            "laya_unavailable_but_explicit_knowledge_cue".into(),
+            true,
+        ),
+        Err(e) => (
+            KnowledgeAction::Memory,
+            format!("laya_unavailable:{e}"),
+            true,
+        ),
+    }
+}
+
+/// 去掉“记住这个知识：”这类指令前缀，知识库只保存知识本体。
+pub(crate) fn clean_knowledge_text(text: &str) -> String {
+    let mut out = text.trim();
+    for prefix in [
+        "记住这个知识：",
+        "记住这个知识:",
+        "记到知识库：",
+        "记到知识库:",
+        "存到知识库：",
+        "存到知识库:",
+        "把下面这个知识记住：",
+        "这个知识：",
+    ] {
+        if let Some(rest) = out.strip_prefix(prefix) {
+            out = rest.trim();
+            break;
+        }
+    }
+    out.to_string()
+}
+
+pub(crate) fn warm_knowledge_vectors(home: &std::path::Path) -> Result<(), String> {
+    use yunxi_bot_core::retrieval;
+    crate::ensure_embedding_running()?;
+    let passages = retrieval::knowledge_passages(home)?;
+    if passages.is_empty() {
+        return Ok(());
+    }
+    retrieval::search(
+        home,
+        "knowledge",
+        &passages,
+        "知识索引",
+        &retrieval::endpoint(),
+    )?;
+    Ok(())
+}
+
 /// 写入后立即在本地重建记忆向量；失败不影响记忆本身，召回时会再试。
 pub(crate) fn warm_memory_vectors(home: &std::path::Path) -> Result<(), String> {
     use yunxi_bot_core::{memory::Memory, retrieval};
@@ -480,6 +602,61 @@ impl CompanionWorker {
                 Ok(lock) => lock,
                 Err(_) => return Ok(()),
             };
+            // 第二轮：Store 的内容是个人记忆还是可复用知识？
+            let (knowledge_action, knowledge_reason, knowledge_degraded) =
+                match self.decider.as_deref() {
+                    Some(decider) => gate_knowledge(decider, &source),
+                    None => (KnowledgeAction::Memory, "no_decider".into(), false),
+                };
+            ledger
+                .append(
+                    EventKind::InfoTriaged,
+                    None,
+                    serde_json::json!({
+                        "source":"companion_knowledge_gate",
+                        "source_seq":source.seq,
+                        "phase":"gate_store",
+                        "degraded":knowledge_degraded,
+                        "reason":knowledge_reason,
+                    }),
+                )
+                .map_err(|e| e.to_string())?;
+            if knowledge_action == KnowledgeAction::Knowledge {
+                let text = clean_knowledge_text(source.data["text"].as_str().unwrap_or(""));
+                let label = format!("conversation#{}", source.seq);
+                let id = yunxi_bot_core::retrieval::import_text(&self.home, &label, &text)
+                    .map_err(|e| format!("知识入库失败: {e}"))?;
+                ledger
+                    .append(
+                        EventKind::InfoTriaged,
+                        None,
+                        serde_json::json!({
+                            "source":"companion_knowledge",
+                            "source_seq":source.seq,
+                            "phase":"imported",
+                            "id":id,
+                            "degraded":false,
+                            "reason":knowledge_reason,
+                        }),
+                    )
+                    .map_err(|e| e.to_string())?;
+                ledger
+                    .append(
+                        EventKind::InfoTriaged,
+                        None,
+                        serde_json::json!({
+                            "source":"companion_memory",
+                            "source_seq":source.seq,
+                            "phase":"gate_knowledge",
+                            "degraded":false,
+                            "reason":knowledge_reason,
+                        }),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let _ = yunxi_bot_core::retrieval::clear_cache(&self.home, "knowledge");
+                let _ = warm_knowledge_vectors(&self.home);
+                return Ok(());
+            }
             let events = ledger.events().to_vec();
             let (tx, rx) = mpsc::channel();
             self.running = Some(rx);
@@ -1946,6 +2123,19 @@ mod t3_gate_tests {
         assert_eq!(action, GateAction::Skip);
         assert!(degraded);
         assert_eq!(reason, "laya_invalid_choice");
+    }
+
+    #[test]
+    fn knowledge_is_separated_from_personal_memory() {
+        let memory = StubDecider::succeeding().with_choice("knowledge_action", "memory");
+        let (action, _, _) = gate_knowledge(&memory, &source("记住这个知识：HTTP 默认端口是 80。"));
+        assert_eq!(action, KnowledgeAction::Knowledge);
+        let (action, _, _) = gate_knowledge(&memory, &source("我喜欢你叫我姐姐。"));
+        assert_eq!(action, KnowledgeAction::Memory);
+
+        let knowledge = StubDecider::succeeding().with_choice("knowledge_action", "knowledge");
+        let (action, _, _) = gate_knowledge(&knowledge, &source("HTTP 默认端口是 80。"));
+        assert_eq!(action, KnowledgeAction::Knowledge);
     }
 
     #[test]

@@ -284,8 +284,35 @@ pub fn next_source(events: &[Event], now: u64) -> Option<Event> {
         .cloned()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractionItem {
+    source_seq: u64,
+    kind: MemoryKind,
+    text: String,
+    quote: String,
+    supersedes: Option<String>,
+    expires_at: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractionBatch {
+    candidates: Vec<ExtractionItem>,
+}
+
+/// 本地模型常带 Markdown 围栏或前后解释；先取最外层 JSON，再严格反序列化。
+fn parse_extraction(raw: &str) -> Result<ExtractionBatch, String> {
+    let start = raw.find('{').ok_or("记忆提炼没有JSON")?;
+    let end = raw.rfind('}').ok_or("记忆提炼JSON不完整")?;
+    if end <= start {
+        return Err("记忆提炼JSON为空".into());
+    }
+    serde_json::from_str(&raw[start..=end]).map_err(|_| "记忆提炼返回非约定JSON".into())
+}
+
 pub fn consolidate(
-    thinker: &impl Thinker,
+    thinker: &dyn Thinker,
     source: &Event,
     events: &[Event],
     now: u64,
@@ -304,27 +331,40 @@ pub fn consolidate(
         let response = thinker
             .think(&req)
             .map_err(|_| "记忆提炼模型调用失败".to_string())?;
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Item {
-            source_seq: u64,
-            kind: MemoryKind,
-            text: String,
-            quote: String,
-            supersedes: Option<String>,
-            expires_at: Option<u64>,
+        let repair = || -> Result<ExtractionBatch, String> {
+            let req = ThinkRequest::new(vec![
+                Message::system("你是JSON格式修复器。只输出约定JSON，不解释、不添加内容。"),
+                Message::user(format!(
+                    "把下面的模型输出修复为：{{\"candidates\":[{{\"source_seq\":{},\"kind\":\"fact|preference|relationship|event\",\"text\":\"...\",\"quote\":\"...\",\"supersedes\":null,\"expires_at\":null}}]}}。\n只保留有依据的候选。原始输出：\n{}",
+                    source.seq,
+                    response.content.chars().take(8000).collect::<String>()
+                )),
+            ])
+            .with_max_tokens(1400)
+            .with_temperature(0.0)
+            .with_thinking(Thinking::Disabled);
+            let repaired = thinker
+                .think(&req)
+                .map_err(|_| "记忆提炼修复模型调用失败".to_string())?;
+            parse_extraction(&repaired.content)
+        };
+        let mut batch = match parse_extraction(&response.content) {
+            Ok(batch) => batch,
+            Err(first_error) => match repair() {
+                Ok(batch) => batch,
+                Err(_) => return Err(first_error),
+            },
+        };
+        if batch.candidates.is_empty()
+            && response.content.trim() != "{\"candidates\":[]}"
+            && let Ok(repaired) = repair()
+        {
+            batch = repaired;
         }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Batch {
-            candidates: Vec<Item>,
-        }
-        let batch: Batch =
-            serde_json::from_str(&response.content).map_err(|_| "记忆提炼返回非约定JSON")?;
         if batch.candidates.len() > 4 {
             return Err("记忆候选数量超限".into());
         }
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<Candidate> = Vec::new();
         for (index, c) in batch.candidates.into_iter().enumerate() {
             if c.source_seq != source.seq {
                 return Err("模型引用了别的输入".into());
