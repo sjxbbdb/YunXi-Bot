@@ -280,6 +280,13 @@ impl ModelSpec {
         ..Self::LOCAL_QWEN
     };
 
+    /// Qwen3.8 27B 4bit：质量档本地聊天候选，体积约 16GB。
+    pub const LOCAL_QWEN38: Self = Self {
+        model: "Qwen3.8-27B-4bit",
+        thinking: Thinking::Enabled,
+        ..Self::LOCAL_QWEN
+    };
+
     #[cfg(target_os = "macos")]
     pub const LOCAL: Self = Self::LOCAL_CHAT;
     #[cfg(not(target_os = "macos"))]

@@ -9,6 +9,8 @@ fi
 MODEL="${YUNXI_COMPANION_MODEL:-gemma-4-26B-A4B-it-qat-4bit}"
 if [[ "$MODEL" == "qwen" || "$MODEL" == "qwen3.5" ]]; then
     MODEL="Qwen3.5-9B-4bit"
+elif [[ "$MODEL" == "qwen38" || "$MODEL" == "qwen3.8" ]]; then
+    MODEL="Qwen3.8-27B-4bit"
 elif [[ "$MODEL" == "gemma" || "$MODEL" == "gemma4" ]]; then
     MODEL="gemma-4-26B-A4B-it-qat-4bit"
 fi

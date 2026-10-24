@@ -113,10 +113,10 @@ fn start_local_model(home: &std::path::Path) -> LocalModelGuard {
         return LocalModelGuard(None);
     }
     let env_model = std::env::var("YUNXI_COMPANION_MODEL").unwrap_or_default();
-    let model = if matches!(env_model.as_str(), "qwen" | "qwen3.5") {
-        "Qwen3.5-9B-4bit"
-    } else {
-        "gemma-4-26B-A4B-it-qat-4bit"
+    let model = match env_model.as_str() {
+        "qwen" | "qwen3.5" => "Qwen3.5-9B-4bit",
+        "qwen38" | "qwen3.8" => "Qwen3.8-27B-4bit",
+        _ => "gemma-4-26B-A4B-it-qat-4bit",
     };
     let log = std::fs::File::create(home.join("local-model.log"))
         .map(std::process::Stdio::from)
