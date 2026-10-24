@@ -845,6 +845,10 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, N
         service.$status.receive(on: RunLoop.main).sink { [weak self] status in
             self?.window.subtitle = status
         }.store(in: &cancellables)
+        service.$modelInfo.receive(on: RunLoop.main).sink { [weak self] info in
+            guard let self, !info.isEmpty else { return }
+            self.window.subtitle = info
+        }.store(in: &cancellables)
         service.$effort.receive(on: RunLoop.main).sink { [weak self] effort in
             let index = ["auto": 0, "on": 1, "off": 2][effort] ?? 0
             self?.effortPopup?.selectItem(at: index)

@@ -70,7 +70,7 @@ final class ChatService: ObservableObject {
 
         let p = Process()
         p.executableURL = bin
-        p.arguments = ["chat-server", "--resume"]
+        p.arguments = ["chat-server", "--resume", "--auto-local"]
         p.currentDirectoryURL = repo
         var env = ProcessInfo.processInfo.environment
         env["YUNXI_BOT_HOME"] = dataDir.path
@@ -240,7 +240,8 @@ final class ChatService: ObservableObject {
         case "route":
             let model = object["model"] as? String ?? ""
             let thinking = object["thinking"] as? Bool ?? false
-            modelInfo = model + (thinking ? " · 思考" : "")
+            let local = object["local"] as? Bool ?? false
+            modelInfo = (local ? "本机 · " : "云端 · ") + model + (thinking ? " · 思考" : "")
         case "reply":
             finishReply(object["text"] as? String ?? "")
         case "error":

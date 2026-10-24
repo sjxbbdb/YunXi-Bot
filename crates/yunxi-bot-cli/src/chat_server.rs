@@ -61,6 +61,96 @@ use crate::chat_handler::ChatHandler;
 use crate::model_adapter::ModelAdapter;
 use crate::task_classifier::{InputKind, TaskClassifier, strip_command};
 
+/// 由 App 传入 `--auto-local` 时，启动本机陪伴模型并等待健康。
+///
+/// 只负责“拉起来并等端口”，不替 ChatHandler 做路由；模型缺失/启动失败
+/// 只打印原因，随后照常 ready，聊天会给出明确的“本机未启动”错误。
+struct LocalModelGuard(Option<std::process::Child>);
+
+impl Drop for LocalModelGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn local_model_ready() -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], 17872)),
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
+fn start_local_model(home: &std::path::Path) -> LocalModelGuard {
+    if local_model_ready() {
+        return LocalModelGuard(None);
+    }
+    let root = std::env::var("YUNXI_REPO_ROOT")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let python = root.join(".venv-mlx/bin/python");
+    let script = root.join("sidecar/local_llm_server.py");
+    if !python.is_file() || !script.is_file() {
+        eprintln!(
+            "[本机模型] 缺少 {} 或 {}；请先运行 安装Mac环境.command --local-model",
+            python.display(),
+            script.display()
+        );
+        return LocalModelGuard(None);
+    }
+    let env_model = std::env::var("YUNXI_COMPANION_MODEL").unwrap_or_default();
+    let model = if matches!(env_model.as_str(), "gemma" | "gemma4") {
+        "gemma-4-26B-A4B-it-qat-4bit"
+    } else {
+        "Qwen3.5-9B-4bit"
+    };
+    let log = std::fs::File::create(home.join("local-model.log"))
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
+    let child = std::process::Command::new(&python)
+        .arg(&script)
+        .args([
+            "--model", model, "--device", "mlx", "--port", "17872", "--warmup",
+        ])
+        .current_dir(&root)
+        .env("YUNXI_BOT_HOME", home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(log)
+        .spawn();
+    match child {
+        Ok(child) => {
+            let mut guard = LocalModelGuard(Some(child));
+            eprintln!("[本机模型] 正在加载 {model}…");
+            for _ in 0..240 {
+                if local_model_ready() {
+                    eprintln!("[本机模型] 已就绪");
+                    return guard;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if guard
+                    .0
+                    .as_mut()
+                    .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+                {
+                    break;
+                }
+            }
+            eprintln!("[本机模型] 未在 120 秒内就绪；聊天会显示本机模型未启动，不会上云。");
+            guard
+        }
+        Err(e) => {
+            eprintln!("[本机模型] 启动失败：{e}");
+            LocalModelGuard(None)
+        }
+    }
+}
+
 /// 启动本地聊天服务。
 pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let home = crate::default_home();
@@ -74,6 +164,12 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     if crate::flag(args, "--endpoint").is_none() {
         crate::ensure_decider_running();
     }
+    // 只有 App 显式传 `--auto-local` 才自动拉起；CLI 仍可手动控制内存。
+    let _local_model_guard = if args.iter().any(|a| a == "--auto-local") {
+        start_local_model(&home)
+    } else {
+        LocalModelGuard(None)
+    };
 
     // —— 窗口内审批：读线程把 UI 的决定送回来 ——
     let approvals = ApprovalBridge::new();
