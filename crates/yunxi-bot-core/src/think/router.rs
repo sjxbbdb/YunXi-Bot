@@ -313,6 +313,11 @@ impl ModelSpec {
             // 本地侧车：不读密钥文件，而且只认回环地址
             "local" => ThinkerConfig::local(self.base_url, self.model),
             "deepseek" => ThinkerConfig::deepseek(),
+            // 自定义 OpenAI 兼容云端：密钥放 secrets/openai.key，base_url/model 由适配器提供。
+            "openai-compatible" => ThinkerConfig {
+                key_source: super::client::KeySource::File("openai.key"),
+                ..ThinkerConfig::deepseek()
+            },
             // 未知 provider 不借用其他服务的凭证；远端会被回环守卫拒绝。
             _ => ThinkerConfig {
                 key_source: super::client::KeySource::Loopback,

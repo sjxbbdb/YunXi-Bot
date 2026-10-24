@@ -37,12 +37,45 @@ impl ModelAdapter {
         }
     }
 
-    /// 工作代理：DeepSeek Flash。只允许云端；本地模型不承担任务。
+    /// 工作代理：默认 DeepSeek Flash；设置 `YUNXI_WORK_BASE_URL` 和
+    /// `YUNXI_WORK_MODEL` 时切到任意 OpenAI 兼容云端端点，密钥放
+    /// `data/secrets/openai.key`。这样市面模型不必改 Handler。
     pub fn work() -> Self {
+        let base = std::env::var("YUNXI_WORK_BASE_URL").ok();
+        let model = std::env::var("YUNXI_WORK_MODEL").ok();
+        if let (Some(base), Some(model)) = (base, model)
+            && !base.trim().is_empty()
+            && !model.trim().is_empty()
+        {
+            return Self::cloud_openai_compatible(base.trim(), model.trim());
+        }
         Self {
             role: "work",
             label: "DeepSeek Flash（云端）",
             spec: ModelSpec::DEEPSEEK_FLASH,
+            local: false,
+            tools: true,
+        }
+    }
+
+    /// 构造一个 OpenAI 兼容云端适配器；用于测试和动态配置。
+    pub fn cloud_openai_compatible(base_url: &str, model: &str) -> Self {
+        let base_url: &'static str = Box::leak(base_url.to_string().into_boxed_str());
+        let model: &'static str = Box::leak(model.to_string().into_boxed_str());
+        let label: &'static str = Box::leak(format!("{model}（OpenAI 兼容云端）").into_boxed_str());
+        Self {
+            role: "work",
+            label,
+            spec: ModelSpec {
+                tier: yunxi_bot_core::think::router::Tier::Deep,
+                provider: "openai-compatible",
+                base_url,
+                model,
+                price: yunxi_bot_core::think::cost::PriceTable::DEEPSEEK_FLASH,
+                rpm: 60,
+                thinking: yunxi_bot_core::think::Thinking::Enabled,
+                key_hint: "secrets/openai.key 或 YUNXI_BOT_HOME/secrets/openai.key",
+            },
             local: false,
             tools: true,
         }
@@ -60,6 +93,17 @@ mod tests {
         assert!(adapter.tools);
         assert_eq!(adapter.spec.provider, "local");
         assert_eq!(adapter.spec.model, "gemma-4-26B-A4B-it-qat-4bit");
+    }
+
+    #[test]
+    fn custom_cloud_adapter_keeps_openai_compatible_metadata() {
+        let adapter =
+            ModelAdapter::cloud_openai_compatible("https://api.example.com/v1", "some-model");
+        assert!(!adapter.local);
+        assert!(adapter.tools);
+        assert_eq!(adapter.spec.provider, "openai-compatible");
+        assert_eq!(adapter.spec.model, "some-model");
+        assert_eq!(adapter.spec.base_url, "https://api.example.com/v1");
     }
 
     #[test]
