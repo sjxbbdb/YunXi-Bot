@@ -251,7 +251,7 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         }
     }
 
-    let companion = ChatHandler::new(
+    let mut companion = ChatHandler::new(
         home.clone(),
         "云熙",
         crate::chat_handler::DEFAULT_PERSONA,
@@ -259,7 +259,15 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     )
     .with_chat_protocol(yunxi_bot_core::prompts::local_chat_protocol())
     .without_project_rules()
+    .with_policy(crate::tooling::policy_from_args(args))
+    .with_sink(crate::tool_sink_or_warn())
     .with_decider(decider.clone());
+    if companion_adapter.tools {
+        match crate::tooling::companion_read_only(&home) {
+            Ok(tools) => companion = companion.with_tools(tools).with_local_tools(),
+            Err(e) => eprintln!("[陪伴工具] 只读检索工具不可用：{e}"),
+        }
+    }
 
     let mut tool_descriptions: Vec<ToolDescription> = Vec::new();
     let mut mcp_count = 0usize;

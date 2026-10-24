@@ -27,12 +27,13 @@ impl ModelAdapter {
             "qwen" | "qwen3.5" => (ModelSpec::LOCAL_CHAT, "Qwen3.5-9B（本机）"),
             _ => (ModelSpec::LOCAL_GEMMA, "Gemma 4 26B-A4B（本机）"),
         };
+        let tools = spec.model == ModelSpec::LOCAL_GEMMA.model;
         Self {
             role: "companion",
             label,
             spec,
             local: true,
-            tools: false,
+            tools,
         }
     }
 
@@ -56,7 +57,7 @@ mod tests {
     fn companion_defaults_to_local_gemma() {
         let adapter = ModelAdapter::companion();
         assert!(adapter.local);
-        assert!(!adapter.tools);
+        assert!(adapter.tools);
         assert_eq!(adapter.spec.provider, "local");
         assert_eq!(adapter.spec.model, "gemma-4-26B-A4B-it-qat-4bit");
     }

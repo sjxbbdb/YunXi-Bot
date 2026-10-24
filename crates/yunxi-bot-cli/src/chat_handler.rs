@@ -171,6 +171,8 @@ pub struct ChatHandler {
     personal_context: bool,
     /// 是否把项目规则拼进稳定前缀。工作使用；本机陪伴闲聊不需要。
     include_project_rules: bool,
+    /// 本机 Chat 是否允许只读工具。默认关闭；ChatServer 只挂检索工具后显式开启。
+    local_tools_enabled: bool,
     /// 对话会话的稳定前缀。**提前算好**——载入会话时要拿它和存档里的
     /// 指纹比，而"先建会话再比"会覆盖掉存档里的指纹。
     /// 常驻记忆段（构造时定下）。**单独存着**，因为它要拼进稳定前缀，
@@ -329,6 +331,7 @@ impl ChatHandler {
             chat_protocol_override: None,
             personal_context: true,
             include_project_rules: true,
+            local_tools_enabled: false,
             tools: ToolRegistry::new(),
             approver: std::sync::Arc::new(std::sync::Mutex::new(RefusingApprover)),
             decider: None,
@@ -409,6 +412,13 @@ impl ChatHandler {
     /// 替换 Chat 意图的固定协议；工作代理用专业协议，陪伴代理不设置。
     pub fn with_chat_protocol(mut self, protocol: impl Into<String>) -> Self {
         self.chat_protocol_override = Some(protocol.into());
+        self
+    }
+
+    /// 允许本机 Chat 使用已经装配好的工具；只应由 ChatServer 在只读检索
+    /// registry 上调用，避免通用 Handler 误把写入工具带进本机链路。
+    pub fn with_local_tools(mut self) -> Self {
+        self.local_tools_enabled = true;
         self
     }
 
@@ -1377,6 +1387,9 @@ impl ChatHandler {
         }
         let tools = match intent {
             Intent::Plan | Intent::Options => &no_tools,
+            Intent::Chat if routing.spec.provider == "local" && self.local_tools_enabled => {
+                &self.tools
+            }
             Intent::Chat if routing.spec.provider == "local" => &no_tools,
             Intent::Step => &self.tools,
             Intent::Chat => &chat_tools,

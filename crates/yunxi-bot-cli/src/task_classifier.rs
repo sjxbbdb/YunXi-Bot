@@ -58,6 +58,26 @@ impl TaskClassifier {
                 model: None,
             });
         }
+        // 只读检索工具属于陪伴链路；不要因为“查一下”被误分到云端任务。
+        if [
+            "memory_search",
+            "knowledge_search",
+            "查记忆",
+            "查知识库",
+            "检索记忆",
+            "检索知识",
+            "回忆一下",
+        ]
+        .iter()
+        .any(|cue| trimmed.contains(cue))
+        {
+            self.record(false, "只读检索属于本机聊天", None)?;
+            return Ok(Classification {
+                kind: InputKind::Chat,
+                reason: "只读检索属于本机聊天".into(),
+                model: None,
+            });
+        }
 
         let router = ModelRouter::default();
         let verdict = router.classify_input(&*self.decider, text);
@@ -163,6 +183,14 @@ mod tests {
         let (c, dir) = classifier(Some("task"));
         let out = c.classify("帮我把这个文件改成 UTF-8").unwrap();
         assert_eq!(out.kind, InputKind::Task);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retrieval_tool_names_stay_on_the_local_companion_path() {
+        let (c, dir) = classifier(Some("task"));
+        let out = c.classify("请用 knowledge_search 查一下资料").unwrap();
+        assert_eq!(out.kind, InputKind::Chat);
         let _ = std::fs::remove_dir_all(dir);
     }
 

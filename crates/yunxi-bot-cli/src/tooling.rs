@@ -340,6 +340,71 @@ impl yunxi_bot_core::tool::Tool for MailReviewPending {
     }
 }
 
+/// 只读记忆检索：给本机陪伴模型用，不写入、不联网。
+struct MemorySearch(std::path::PathBuf);
+
+impl yunxi_bot_core::tool::Tool for MemorySearch {
+    fn name(&self) -> &str {
+        "memory_search"
+    }
+    fn description(&self) -> &str {
+        "语义搜索使用者已经确认的本地长期记忆，返回最多3个相关条目及来源序号。只读；不写入、不修改权限。"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"query":{"type":"string","maxLength":2000}},"required":["query"],"additionalProperties":false})
+    }
+    fn capability(&self) -> yunxi_bot_core::tool::Capability {
+        yunxi_bot_core::tool::Capability::ReadOnly
+    }
+    fn call(
+        &self,
+        args: &serde_json::Value,
+        _: &mut yunxi_bot_core::tool::ToolContext,
+    ) -> Result<yunxi_bot_core::tool::ToolOutput, yunxi_bot_core::tool::ToolError> {
+        use yunxi_bot_core::tool::{ToolError, ToolOutput};
+        let query = args
+            .as_object()
+            .filter(|v| v.len() == 1)
+            .and_then(|v| v.get("query"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty() && s.chars().count() <= 2000)
+            .ok_or_else(|| ToolError::BadArgs {
+                detail: "只接受 query 参数（1–2000 字）".into(),
+            })?;
+        let ledger =
+            yunxi_bot_core::ledger::Ledger::open(self.0.join("ledger.jsonl")).map_err(|e| {
+                ToolError::Failed {
+                    detail: format!("记忆台账不可用: {e}"),
+                }
+            })?;
+        let now = yunxi_bot_core::now_millis().map_err(|e| ToolError::Failed {
+            detail: e.to_string(),
+        })?;
+        let memory = yunxi_bot_core::memory::Memory::from_events(ledger.events());
+        let passages = yunxi_bot_core::retrieval::memory_passages(&memory, now, None);
+        if passages.is_empty() {
+            return Ok(ToolOutput::read("本地记忆库还是空的。不要据此编造过去。"));
+        }
+        crate::ensure_embedding_running().map_err(|e| ToolError::Failed { detail: e })?;
+        let hits = yunxi_bot_core::retrieval::search(
+            &self.0,
+            "memory",
+            &passages,
+            query,
+            &yunxi_bot_core::retrieval::endpoint(),
+        )
+        .map_err(|e| ToolError::Failed { detail: e })?;
+        let selected: Vec<_> = hits.into_iter().take(3).collect();
+        if selected.is_empty() {
+            return Ok(ToolOutput::read("没有找到相关记忆；不要据此编造过去。"));
+        }
+        Ok(ToolOutput::read(yunxi_bot_core::retrieval::render(
+            &selected,
+            "记忆检索结果",
+        )))
+    }
+}
+
 struct KnowledgeSearch(std::path::PathBuf);
 
 impl yunxi_bot_core::tool::Tool for KnowledgeSearch {
@@ -399,6 +464,18 @@ impl yunxi_bot_core::tool::Tool for KnowledgeSearch {
             .map(ToolOutput::read)
             .map_err(|detail| ToolError::Failed { detail })
     }
+}
+
+/// 陪伴侧只读工具：只允许查记忆/知识，不开放文件、命令、网络、写入。
+pub(crate) fn companion_read_only(home: &Path) -> Result<ToolRegistry, String> {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Arc::new(MemorySearch(home.to_path_buf())))
+        .map_err(|e| e.to_string())?;
+    registry
+        .register(Arc::new(KnowledgeSearch(home.to_path_buf())))
+        .map_err(|e| e.to_string())?;
+    Ok(registry)
 }
 
 /// 在基础工具之上再接上 MCP（如果配了的话）。
@@ -835,5 +912,30 @@ mod tests {
             a.lock().unwrap().approve(&req),
             yunxi_bot_core::tool::Approval::Deny
         );
+    }
+}
+
+#[cfg(test)]
+mod companion_tool_tests {
+    use super::*;
+
+    #[test]
+    fn companion_read_only_exposes_only_retrieval() {
+        let home =
+            std::env::temp_dir().join(format!("yunxi-companion-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let registry = companion_read_only(&home).unwrap();
+        let mut names = registry.names();
+        names.sort();
+        assert_eq!(names, vec!["knowledge_search", "memory_search"]);
+        for name in names {
+            let tool = registry.get(name).unwrap();
+            assert_eq!(
+                tool.capability(),
+                yunxi_bot_core::tool::Capability::ReadOnly
+            );
+        }
+        let _ = std::fs::remove_dir_all(home);
     }
 }
