@@ -4,7 +4,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-CONTEXT_LIMIT = 32768
+CONTEXT_LIMIT = 81920
 _worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yunxi-mlx")
 
 

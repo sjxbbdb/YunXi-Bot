@@ -151,9 +151,12 @@ mod tests {
     use yunxi_bot_core::decide::StubDecider;
 
     fn classifier(choice: Option<&str>) -> (TaskClassifier, PathBuf) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "yunxi-classifier-{}-{}",
+            "yunxi-classifier-{}-{}-{}",
             std::process::id(),
+            serial,
             choice.unwrap_or("none")
         ));
         let _ = std::fs::remove_dir_all(&dir);

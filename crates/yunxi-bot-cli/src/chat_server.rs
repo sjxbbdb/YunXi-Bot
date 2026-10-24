@@ -320,8 +320,8 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     // 本机 Qwen3.5-9B 的 MLX 侧车按 32k 上下文配置；人格前缀较大，
     // 不能沿用云端的 64k 预算——否则会话不压缩，请求会直接被侧车拒绝。
     let mut local_budget = ContextBudget::for_model(ModelSpec::LOCAL_CHAT.model);
-    local_budget.window_tokens = 32768;
-    local_budget.reserve_for_reply = 32768 / 8;
+    local_budget.window_tokens = 81920;
+    local_budget.reserve_for_reply = 10240;
 
     let mut ledger = Ledger::open(crate::ledger_path())?;
     // 工作代理的模型调用/压缩事件写工作台账，和陪伴台账分开。
