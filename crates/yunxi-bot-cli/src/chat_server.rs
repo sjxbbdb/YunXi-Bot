@@ -116,6 +116,7 @@ fn start_local_model(home: &std::path::Path) -> LocalModelGuard {
     let model = match env_model.as_str() {
         "qwen" | "qwen3.5" => "Qwen3.5-9B-4bit",
         "qwen38" | "qwen3.8" => "Qwen3.8-27B-4bit",
+        "qwen38u" | "uncensored" => "Qwen3.8-27B-Uncensored-4bit",
         _ => "gemma-4-26B-A4B-it-qat-4bit",
     };
     let log = std::fs::File::create(home.join("local-model.log"))

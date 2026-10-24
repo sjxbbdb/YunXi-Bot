@@ -287,6 +287,13 @@ impl ModelSpec {
         ..Self::LOCAL_QWEN
     };
 
+    /// Qwen3.8 27B 的社区 uncensored MLX 4bit；仅供本地私密陪伴。
+    pub const LOCAL_QWEN38_UNCENSORED: Self = Self {
+        model: "Qwen3.8-27B-Uncensored-4bit",
+        thinking: Thinking::Enabled,
+        ..Self::LOCAL_QWEN
+    };
+
     #[cfg(target_os = "macos")]
     pub const LOCAL: Self = Self::LOCAL_CHAT;
     #[cfg(not(target_os = "macos"))]

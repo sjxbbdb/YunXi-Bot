@@ -15,6 +15,7 @@ MODELS = {
     "gemma": "gemma-4-26B-A4B-it-qat-4bit",
     "qwen": "Qwen3.5-9B-4bit",
     "qwen38": "Qwen3.8-27B-4bit",
+    "qwen38u": "Qwen3.8-27B-Uncensored-4bit",
 }
 
 
@@ -133,9 +134,9 @@ def bench(name):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", choices=["gemma", "qwen", "qwen38", "both", "all"], default="both")
+    ap.add_argument("--model", choices=["gemma", "qwen", "qwen38", "qwen38u", "both", "all"], default="both")
     args = ap.parse_args()
-    names = ["gemma", "qwen"] if args.model == "both" else (["gemma", "qwen", "qwen38"] if args.model == "all" else [args.model])
+    names = ["gemma", "qwen"] if args.model == "both" else (["gemma", "qwen", "qwen38", "qwen38u"] if args.model == "all" else [args.model])
     results = []
     for name in names:
         print(f"== {name} ==", flush=True)

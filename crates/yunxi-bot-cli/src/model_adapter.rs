@@ -26,6 +26,10 @@ impl ModelAdapter {
         let (spec, label) = match env.as_str() {
             "qwen" | "qwen3.5" => (ModelSpec::LOCAL_CHAT, "Qwen3.5-9B（本机）"),
             "qwen38" | "qwen3.8" => (ModelSpec::LOCAL_QWEN38, "Qwen3.8-27B（本机）"),
+            "qwen38u" | "uncensored" => (
+                ModelSpec::LOCAL_QWEN38_UNCENSORED,
+                "Qwen3.8-27B Uncensored（本机）",
+            ),
             _ => (ModelSpec::LOCAL_GEMMA, "Gemma 4 26B-A4B（本机）"),
         };
         // Qwen3.8 的本地工具协议尚未实测；先走自动召回，测完再决定是否挂工具。
