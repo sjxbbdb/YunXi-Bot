@@ -58,6 +58,7 @@ use yunxi_bot_core::tool::runner::{Approval, ApprovalRequest, Approver};
 use yunxi_bot_core::{EventKind, Ledger};
 
 use crate::chat_handler::ChatHandler;
+use crate::memory_pipeline::{MemoryOutcome, MemoryPipeline};
 use crate::model_adapter::ModelAdapter;
 use crate::task_classifier::{InputKind, TaskClassifier, strip_command};
 
@@ -161,6 +162,15 @@ fn start_local_model(home: &std::path::Path) -> LocalModelGuard {
     }
 }
 
+/// 无输入多久触发一次本地记忆整理；0 关闭。
+fn memory_idle_seconds() -> Option<u64> {
+    let seconds = std::env::var("YUNXI_MEMORY_IDLE_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(600);
+    (seconds > 0).then_some(seconds)
+}
+
 /// 启动本地聊天服务。
 pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let home = crate::default_home();
@@ -187,6 +197,49 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let classifier = TaskClassifier::new(decider.clone(), crate::ledger_path());
     let companion_adapter = ModelAdapter::companion();
     let work_adapter = ModelAdapter::work();
+    let last_input = Arc::new(AtomicU64::new(yunxi_bot_core::now_millis().unwrap_or(0)));
+    if let Some(idle_seconds) = memory_idle_seconds() {
+        match yunxi_bot_core::think::client::OpenAiThinker::from_home(
+            &home,
+            ModelSpec::LOCAL_GEMMA.thinker_config(),
+        ) {
+            Ok(thinker) => {
+                let pipeline = Arc::new(MemoryPipeline::new(
+                    home.clone(),
+                    Arc::new(thinker),
+                    decider.clone(),
+                ));
+                let last_input = Arc::clone(&last_input);
+                eprintln!("[陪伴记忆] 空闲整理已启动：{idle_seconds} 秒无输入触发");
+                std::thread::spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        let now = yunxi_bot_core::now_millis().unwrap_or(0);
+                        let last = last_input.load(Ordering::Relaxed);
+                        if now.saturating_sub(last) < idle_seconds.saturating_mul(1000) {
+                            continue;
+                        }
+                        match pipeline.process_next() {
+                            MemoryOutcome::Stored { count, vectorized } => {
+                                eprintln!(
+                                    "[陪伴记忆] 空闲整理写入 {count} 条，向量化{}",
+                                    if vectorized {
+                                        "完成"
+                                    } else {
+                                        "失败（下次召回重试）"
+                                    }
+                                );
+                            }
+                            MemoryOutcome::Failed(e) => eprintln!("[陪伴记忆] 空闲整理失败：{e}"),
+                            // Idle/Busy/Unavailable 都是等待，不刷日志。
+                            _ => {}
+                        }
+                    }
+                });
+            }
+            Err(e) => eprintln!("[陪伴记忆] 无法初始化本地整理模型：{e}"),
+        }
+    }
 
     let companion = ChatHandler::new(
         home.clone(),
@@ -391,6 +444,7 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 mcp_problems: &mcp_problems,
             })),
             "chat" => {
+                last_input.store(yunxi_bot_core::now_millis().unwrap_or(0), Ordering::Relaxed);
                 let raw = req["text"].as_str().unwrap_or("").trim().to_string();
                 if raw.is_empty() {
                     write_event(json!({"type":"error","message":"空消息"}));

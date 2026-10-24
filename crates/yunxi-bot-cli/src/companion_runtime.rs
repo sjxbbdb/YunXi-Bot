@@ -72,13 +72,13 @@ pub(crate) fn generation_budget_used(events: &[Event], now: u64) -> usize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GateAction {
+pub(crate) enum GateAction {
     Store,
     Skip,
 }
 
 /// Laya 门控：只判断“这轮是否值得进入长期记忆”，不做抽取。
-fn gate_memory(decider: &dyn Decider, source: &Event) -> (GateAction, String, bool) {
+pub(crate) fn gate_memory(decider: &dyn Decider, source: &Event) -> (GateAction, String, bool) {
     use yunxi_bot_core::decide::{DecisionRequest, Question};
 
     let text = source.data["text"].as_str().unwrap_or("").trim();
@@ -189,7 +189,7 @@ fn contains_secret(text: &str) -> bool {
 }
 
 /// 写入后立即在本地重建记忆向量；失败不影响记忆本身，召回时会再试。
-fn warm_memory_vectors(home: &std::path::Path) -> Result<(), String> {
+pub(crate) fn warm_memory_vectors(home: &std::path::Path) -> Result<(), String> {
     use yunxi_bot_core::{memory::Memory, retrieval};
     crate::ensure_embedding_running()?;
     let ledger = yunxi_bot_core::ledger::Ledger::open(home.join("ledger.jsonl"))
@@ -473,10 +473,18 @@ impl CompanionWorker {
                     }),
                 )
                 .map_err(|e| e.to_string())?;
+            // 与 chat-server 空闲整理共用一把跨进程锁；拿不到就等下一轮。
+            let memory_lock = match yunxi_bot_core::instance::InstanceLock::acquire(
+                self.home.join("memory.lock"),
+            ) {
+                Ok(lock) => lock,
+                Err(_) => return Ok(()),
+            };
             let events = ledger.events().to_vec();
             let (tx, rx) = mpsc::channel();
             self.running = Some(rx);
             std::thread::spawn(move || {
+                let _memory_lock = memory_lock;
                 let meter = Meter {
                     inner: thinker,
                     calls: Mutex::new(Vec::new()),

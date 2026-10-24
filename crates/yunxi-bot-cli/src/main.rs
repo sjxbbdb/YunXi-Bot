@@ -16,6 +16,7 @@ mod chat_handler;
 mod chat_server;
 mod companion_runtime;
 mod detach;
+mod memory_pipeline;
 mod model_adapter;
 #[cfg(all(test, target_os = "macos"))]
 mod recorded_travel;
