@@ -134,6 +134,31 @@ fn asks_realtime_info(input: &str) -> bool {
     .any(|cue| input.contains(cue))
 }
 
+/// 本机 thinking 策略：Gemma 默认开；Qwen 默认关；环境变量可强制。
+fn local_thinking_enabled(model: &str) -> bool {
+    match std::env::var("YUNXI_LOCAL_THINKING") {
+        Ok(value) if value == "0" || value.eq_ignore_ascii_case("false") => false,
+        Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => true,
+        _ => model.contains("gemma"),
+    }
+}
+
+/// 剥掉模型复述的内部证据标记；这些只给模型看，不该出现在回复里。
+fn strip_internal_evidence(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let line = line.trim();
+            !line.starts_with("长期证据：")
+                && !line.starts_with("联网能力：")
+                && !line.starts_with("【长期证据")
+                && !line.starts_with("【联网能力")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 /// 问题/查资料类输入才触发知识召回；闲聊不硬塞知识库。
 fn knowledge_recall_gate(input: &str) -> bool {
     [
@@ -736,10 +761,7 @@ impl ChatHandler {
         // 工作代理仍保留完整的 4096，避免任务说明被截断。
         let max_tokens = if routing.spec.provider == "local" {
             // thinking 模式才需要更大预算；默认聊天保持原预算，避免卡死。
-            if std::env::var("YUNXI_LOCAL_THINKING")
-                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                .unwrap_or(false)
-            {
+            if local_thinking_enabled(routing.spec.model) {
                 4096
             } else {
                 1024
@@ -754,7 +776,7 @@ impl ChatHandler {
             max_tokens,
             records,
         )
-        .map(|out| out.text)
+        .map(|out| strip_internal_evidence(&out.text))
     }
 
     /// 一回合的**脱敏**召回诊断。
@@ -1525,10 +1547,7 @@ impl ChatHandler {
             Intent::Chat => &chat_tools,
         };
         let local_chat = intent == Intent::Chat && routing.spec.provider == "local";
-        let local_thinking = local_chat
-            && std::env::var("YUNXI_LOCAL_THINKING")
-                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+        let local_thinking = local_chat && local_thinking_enabled(routing.spec.model);
         let mut runner = ToolRunner::new(tools, self.policy.clone(), &mut *ap, ctx)
             // Qwen 模板不接受中途 system；工具定义已经通过 tools= 传入。
             .without_tool_catalog_if(
