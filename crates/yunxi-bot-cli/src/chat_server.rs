@@ -112,13 +112,8 @@ fn start_local_model(home: &std::path::Path) -> LocalModelGuard {
         );
         return LocalModelGuard(None);
     }
-    let env_model = std::env::var("YUNXI_COMPANION_MODEL").unwrap_or_default();
-    let model = match env_model.as_str() {
-        "qwen" | "qwen3.5" => "Qwen3.5-9B-4bit",
-        "qwen38" | "qwen3.8" => "Qwen3.8-27B-4bit",
-        "qwen38u" | "uncensored" => "Qwen3.8-27B-Uncensored-4bit",
-        _ => "gemma-4-26B-A4B-it-qat-4bit",
-    };
+    // 单一来源：适配器表；不要再在这里复制一份模型名映射。
+    let model = ModelAdapter::companion().spec.model;
     let log = std::fs::File::create(home.join("local-model.log"))
         .map(std::process::Stdio::from)
         .unwrap_or_else(|_| std::process::Stdio::null());
@@ -196,7 +191,8 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
         crate::flag(args, "--endpoint").unwrap_or("http://127.0.0.1:17870/decide"),
     ));
     let classifier = TaskClassifier::new(decider.clone(), crate::ledger_path());
-    let companion_adapter = ModelAdapter::companion();
+    let companion_adapter = ModelAdapter::companion_for(&home)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let work_adapter = ModelAdapter::work();
     let last_input = Arc::new(AtomicU64::new(yunxi_bot_core::now_millis().unwrap_or(0)));
     if let Some(idle_seconds) = memory_idle_seconds() {
