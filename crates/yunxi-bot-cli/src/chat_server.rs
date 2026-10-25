@@ -529,7 +529,11 @@ pub fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
                 write_event(json!({
                     "type":"route",
                     "model":routing.spec.model,
-                    "thinking":routing.thinking,
+                    "thinking":if is_chat && companion_adapter.local {
+                        crate::chat_handler::local_thinking_enabled(routing.spec.model)
+                    } else {
+                        routing.thinking
+                    },
                     "mode":if is_chat { "chat" } else { "task" },
                     "agent":if is_chat { companion_adapter.role } else { work_adapter.role },
                     "adapter":if is_chat { companion_adapter.label } else { work_adapter.label },

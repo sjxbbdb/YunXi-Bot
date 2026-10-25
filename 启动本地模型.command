@@ -6,7 +6,7 @@ if [[ ! -x "$ROOT/.venv-mlx/bin/python" ]]; then
     echo "请先运行 安装Mac环境.command --local-model。" >&2
     exit 2
 fi
-MODEL="${YUNXI_COMPANION_MODEL:-Qwen3.5-9B-4bit}"
+MODEL="${YUNXI_COMPANION_MODEL:-gemma-4-26B-A4B-it-qat-4bit}"
 if [[ "$MODEL" == "qwen" || "$MODEL" == "qwen3.5" ]]; then
     MODEL="Qwen3.5-9B-4bit"
 elif [[ "$MODEL" == "qwen38" || "$MODEL" == "qwen3.8" ]]; then
